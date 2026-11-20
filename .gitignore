@@ -1,0 +1,20 @@
+# build outputs
+/dist/
+/embedsync
+*.test
+*.out
+e2e-results.json
+integration-*.log
+
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+
+# benchmark downloads (SciFact is downloaded at run time, never committed)
+/bench/.data/
+
+# local
+.env
+.DS_Store

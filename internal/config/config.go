@@ -1,0 +1,476 @@
+// Package config loads and validates the embedsync YAML configuration.
+//
+// Credentials never live in the YAML file: every DSN is read from an
+// environment variable named by the *_env fields.
+package config
+
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
+)
+
+// Duration is a time.Duration that unmarshals from strings like "250ms".
+type Duration struct{ time.Duration }
+
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
+	var s string
+	if err := n.Decode(&s); err != nil {
+		return err
+	}
+	v, err := time.ParseDuration(s)
+	if err != nil {
+		return fmt.Errorf("invalid duration %q: %w", s, err)
+	}
+	d.Duration = v
+	return nil
+}
+
+// MarshalJSON renders a Duration as its string form.
+func (d Duration) MarshalJSON() ([]byte, error) { return json.Marshal(d.String()) }
+
+// ByteSize is an integer byte count that unmarshals from "512MiB", "2GiB" or plain integers.
+type ByteSize int64
+
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (b *ByteSize) UnmarshalYAML(n *yaml.Node) error {
+	var s string
+	if err := n.Decode(&s); err != nil {
+		return err
+	}
+	v, err := ParseByteSize(s)
+	if err != nil {
+		return err
+	}
+	*b = ByteSize(v)
+	return nil
+}
+
+// ParseByteSize parses sizes such as "1024", "64KiB", "512MiB", "4GiB".
+func ParseByteSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	units := []struct {
+		suffix string
+		mult   int64
+	}{{"TiB", 1 << 40}, {"GiB", 1 << 30}, {"MiB", 1 << 20}, {"KiB", 1 << 10}, {"B", 1}}
+	for _, u := range units {
+		if strings.HasSuffix(s, u.suffix) {
+			var n int64
+			if _, err := fmt.Sscanf(strings.TrimSuffix(s, u.suffix), "%d", &n); err != nil {
+				return 0, fmt.Errorf("invalid size %q", s)
+			}
+			return n * u.mult, nil
+		}
+	}
+	var n int64
+	if _, err := fmt.Sscanf(s, "%d", &n); err != nil {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	return n, nil
+}
+
+// Field maps a logical template field to a physical source column. Renaming a
+// physical column only requires updating Column; the transform fingerprint is
+// computed from logical names so existing embeddings stay valid.
+type Field struct {
+	Name   string `yaml:"name" json:"name"`
+	Column string `yaml:"column" json:"column"`
+}
+
+// Source describes the replicated table.
+type Source struct {
+	DSNEnv        string  `yaml:"dsn_env"`
+	ReplDSNEnv    string  `yaml:"replication_dsn_env"`
+	Table         string  `yaml:"table"`
+	Key           string  `yaml:"key"`
+	Fields        []Field `yaml:"fields"`
+	Publication   string  `yaml:"publication"`
+	Slot          string  `yaml:"slot"`
+	ControlSchema string  `yaml:"control_schema"`
+}
+
+// Sink describes the pgvector database.
+type Sink struct {
+	DSNEnv       string `yaml:"dsn_env"`
+	ReaderDSNEnv string `yaml:"reader_dsn_env"`
+	Schema       string `yaml:"schema"`
+	ReaderRole   string `yaml:"reader_role"`
+}
+
+// Transform controls rendering and chunking. Everything here is part of the
+// transform fingerprint.
+type Transform struct {
+	Template     string `yaml:"template" json:"template"`
+	ChunkWords   int    `yaml:"chunk_words" json:"chunk_words"`
+	ChunkOverlap int    `yaml:"chunk_overlap" json:"chunk_overlap"`
+}
+
+// Retry controls exponential backoff with full jitter.
+type Retry struct {
+	InitialBackoff Duration `yaml:"initial_backoff"`
+	MaxBackoff     Duration `yaml:"max_backoff"`
+}
+
+// Embedder configures the HTTP embedding service client.
+type Embedder struct {
+	URL               string   `yaml:"url"`
+	URLEnv            string   `yaml:"url_env"`
+	Timeout           Duration `yaml:"timeout"`
+	BatchSize         int      `yaml:"batch_size"`
+	Concurrency       int      `yaml:"concurrency"`
+	RequestsPerSecond float64  `yaml:"requests_per_second"`
+	Burst             int      `yaml:"burst"`
+	Retry             Retry    `yaml:"retry"`
+}
+
+// HNSW holds pgvector HNSW index settings.
+type HNSW struct {
+	M              int `yaml:"m" json:"m"`
+	EFConstruction int `yaml:"ef_construction" json:"ef_construction"`
+	EFSearch       int `yaml:"ef_search" json:"ef_search"`
+}
+
+// Model is one embedding model that a generation can be built from.
+type Model struct {
+	Name           string `yaml:"name" json:"name"`
+	Revision       string `yaml:"revision" json:"revision"`
+	Dimension      int    `yaml:"dimension" json:"dimension"`
+	Distance       string `yaml:"distance" json:"distance"`
+	QueryPrefix    string `yaml:"query_prefix" json:"query_prefix"`
+	DocumentPrefix string `yaml:"document_prefix" json:"document_prefix"`
+	HNSW           HNSW   `yaml:"hnsw" json:"hnsw"`
+}
+
+// Pipeline bounds memory, batching and failure policy.
+type Pipeline struct {
+	MaxInflightUnits       int      `yaml:"max_inflight_units"`
+	TxQueue                int      `yaml:"tx_queue"`
+	MaxBatchTxns           int      `yaml:"max_batch_txns"`
+	MaxBatchDocs           int      `yaml:"max_batch_docs"`
+	MaxTransactionChanges  int      `yaml:"max_transaction_changes"`
+	MaxDocumentBytes       int      `yaml:"max_document_bytes"`
+	OnPoison               string   `yaml:"on_poison"`
+	IdleCheckpointInterval Duration `yaml:"idle_checkpoint_interval"`
+	StandbyInterval        Duration `yaml:"standby_interval"`
+	ShutdownTimeout        Duration `yaml:"shutdown_timeout"`
+	StallAfter             Duration `yaml:"stall_after"`
+}
+
+// Backfill controls watermark backfill windows.
+type Backfill struct {
+	BatchSize   int      `yaml:"batch_size"`
+	WindowPause Duration `yaml:"window_pause"`
+}
+
+// Gates are declared before running an evaluation; promotion requires all to pass.
+type Gates struct {
+	MinANNRecallAt10           float64 `yaml:"min_ann_recall_at_10" json:"min_ann_recall_at_10"`
+	NonInferiorityMarginNDCG   float64 `yaml:"noninferiority_margin_ndcg" json:"noninferiority_margin_ndcg"`
+	NonInferiorityMarginRecall float64 `yaml:"noninferiority_margin_recall" json:"noninferiority_margin_recall"`
+	BootstrapSamples           int     `yaml:"bootstrap_samples" json:"bootstrap_samples"`
+	ConfidenceLevel            float64 `yaml:"confidence_level" json:"confidence_level"`
+	Seed                       int64   `yaml:"seed" json:"seed"`
+	RequireZeroUnresolved      bool    `yaml:"require_zero_unresolved" json:"require_zero_unresolved"`
+}
+
+// Migration configures blue/green model switches.
+type Migration struct {
+	RollbackWindow Duration `yaml:"rollback_window"`
+	CatchupTimeout Duration `yaml:"catchup_timeout"`
+	Gates          Gates    `yaml:"gates"`
+	EvalQueries    string   `yaml:"eval_queries"`
+	EvalQrels      string   `yaml:"eval_qrels"`
+}
+
+// Metrics configures the HTTP listener for /metrics, /healthz, /status and /search.
+type Metrics struct {
+	Listen string `yaml:"listen"`
+}
+
+// Alerts holds thresholds exported as gauges so Prometheus rules and the
+// status command agree on what "bad" means.
+type Alerts struct {
+	FreshnessSeconds         float64  `yaml:"freshness_seconds"`
+	RetainedWALWarningBytes  ByteSize `yaml:"retained_wal_warning_bytes"`
+	RetainedWALCriticalBytes ByteSize `yaml:"retained_wal_critical_bytes"`
+}
+
+// Config is the whole embedsync.yaml.
+type Config struct {
+	Source            Source           `yaml:"source"`
+	Sink              Sink             `yaml:"sink"`
+	Transform         Transform        `yaml:"transform"`
+	Embedder          Embedder         `yaml:"embedder"`
+	Models            map[string]Model `yaml:"models"`
+	InitialGeneration string           `yaml:"initial_generation"`
+	Pipeline          Pipeline         `yaml:"pipeline"`
+	Backfill          Backfill         `yaml:"backfill"`
+	Migration         Migration        `yaml:"migration"`
+	Metrics           Metrics          `yaml:"metrics"`
+	Alerts            Alerts           `yaml:"alerts"`
+}
+
+var identRe = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
+var genRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,30}$`)
+
+// Load reads, defaults and validates a config file.
+func Load(path string) (*Config, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return Parse(b)
+}
+
+// Parse parses YAML bytes.
+func Parse(b []byte) (*Config, error) {
+	c := &Config{}
+	dec := yaml.NewDecoder(strings.NewReader(string(b)))
+	dec.KnownFields(true)
+	if err := dec.Decode(c); err != nil {
+		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	c.applyDefaults()
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+func (c *Config) applyDefaults() {
+	def := func(p *string, v string) {
+		if *p == "" {
+			*p = v
+		}
+	}
+	defI := func(p *int, v int) {
+		if *p == 0 {
+			*p = v
+		}
+	}
+	defD := func(p *Duration, v time.Duration) {
+		if p.Duration == 0 {
+			p.Duration = v
+		}
+	}
+	def(&c.Source.DSNEnv, "EMBEDSYNC_SOURCE_DSN")
+	def(&c.Source.ReplDSNEnv, c.Source.DSNEnv)
+	def(&c.Source.Publication, "embedsync_pub")
+	def(&c.Source.Slot, "embedsync_slot")
+	def(&c.Source.ControlSchema, "embedsync_control")
+	def(&c.Sink.DSNEnv, "EMBEDSYNC_SINK_DSN")
+	def(&c.Sink.Schema, "embedsync")
+	defI(&c.Transform.ChunkWords, 120)
+	defI(&c.Embedder.BatchSize, 32)
+	defI(&c.Embedder.Concurrency, 2)
+	defI(&c.Embedder.Burst, 4)
+	defD(&c.Embedder.Timeout, 30*time.Second)
+	defD(&c.Embedder.Retry.InitialBackoff, 200*time.Millisecond)
+	defD(&c.Embedder.Retry.MaxBackoff, 15*time.Second)
+	if c.Embedder.RequestsPerSecond == 0 {
+		c.Embedder.RequestsPerSecond = 50
+	}
+	for k, m := range c.Models {
+		def(&m.Distance, "cosine")
+		defI(&m.HNSW.M, 16)
+		defI(&m.HNSW.EFConstruction, 64)
+		defI(&m.HNSW.EFSearch, 100)
+		c.Models[k] = m
+	}
+	defI(&c.Pipeline.MaxInflightUnits, 8)
+	defI(&c.Pipeline.TxQueue, 64)
+	defI(&c.Pipeline.MaxBatchTxns, 256)
+	defI(&c.Pipeline.MaxBatchDocs, 256)
+	defI(&c.Pipeline.MaxTransactionChanges, 100000)
+	defI(&c.Pipeline.MaxDocumentBytes, 256*1024)
+	def(&c.Pipeline.OnPoison, "quarantine")
+	defD(&c.Pipeline.IdleCheckpointInterval, 10*time.Second)
+	defD(&c.Pipeline.StandbyInterval, 5*time.Second)
+	defD(&c.Pipeline.ShutdownTimeout, 30*time.Second)
+	defD(&c.Pipeline.StallAfter, 60*time.Second)
+	defI(&c.Backfill.BatchSize, 500)
+	defD(&c.Migration.RollbackWindow, 30*time.Minute)
+	defD(&c.Migration.CatchupTimeout, 10*time.Minute)
+	g := &c.Migration.Gates
+	if g.MinANNRecallAt10 == 0 {
+		g.MinANNRecallAt10 = 0.95
+	}
+	defI(&g.BootstrapSamples, 2000)
+	if g.ConfidenceLevel == 0 {
+		g.ConfidenceLevel = 0.95
+	}
+	if g.Seed == 0 {
+		g.Seed = 20261120
+	}
+	def(&c.Metrics.Listen, ":9187")
+	if c.Alerts.FreshnessSeconds == 0 {
+		c.Alerts.FreshnessSeconds = 10
+	}
+	if c.Alerts.RetainedWALWarningBytes == 0 {
+		c.Alerts.RetainedWALWarningBytes = 1 << 30
+	}
+	if c.Alerts.RetainedWALCriticalBytes == 0 {
+		c.Alerts.RetainedWALCriticalBytes = 4 << 30
+	}
+}
+
+// Validate checks invariants that would otherwise surface as runtime surprises.
+func (c *Config) Validate() error {
+	var errs []string
+	add := func(f string, a ...any) { errs = append(errs, fmt.Sprintf(f, a...)) }
+	schema, table, ok := strings.Cut(c.Source.Table, ".")
+	if !ok || !identRe.MatchString(schema) || !identRe.MatchString(table) {
+		add("source.table must be schema-qualified lowercase identifiers, got %q", c.Source.Table)
+	}
+	if !identRe.MatchString(c.Source.Key) {
+		add("source.key must be a lowercase identifier")
+	}
+	if len(c.Source.Fields) == 0 {
+		add("source.fields must list at least one allowlisted column")
+	}
+	seen := map[string]bool{}
+	for _, f := range c.Source.Fields {
+		if !identRe.MatchString(f.Name) || !identRe.MatchString(f.Column) {
+			add("source.fields entries need lowercase identifier name/column, got %+v", f)
+		}
+		if seen[f.Name] {
+			add("duplicate field %q", f.Name)
+		}
+		seen[f.Name] = true
+		if f.Column == c.Source.Key {
+			// allowed: key may also be rendered
+			continue
+		}
+	}
+	for _, s := range []string{c.Source.Publication, c.Source.Slot, c.Source.ControlSchema, c.Sink.Schema} {
+		if !identRe.MatchString(s) {
+			add("invalid identifier %q", s)
+		}
+	}
+	if c.Sink.ReaderRole != "" && !identRe.MatchString(c.Sink.ReaderRole) {
+		add("invalid sink.reader_role")
+	}
+	if c.Transform.Template == "" {
+		add("transform.template is required")
+	}
+	if c.Transform.ChunkWords < 8 {
+		add("transform.chunk_words must be >= 8")
+	}
+	if c.Transform.ChunkOverlap < 0 || c.Transform.ChunkOverlap >= c.Transform.ChunkWords {
+		add("transform.chunk_overlap must be in [0, chunk_words)")
+	}
+	if c.Embedder.URL == "" && c.Embedder.URLEnv == "" {
+		add("embedder.url or embedder.url_env is required")
+	}
+	if len(c.Models) == 0 {
+		add("at least one model is required")
+	}
+	for k, m := range c.Models {
+		if !genRe.MatchString(k) {
+			add("model key %q must match %s", k, genRe)
+		}
+		if m.Name == "" || m.Revision == "" {
+			add("model %s needs name and pinned revision", k)
+		}
+		if m.Dimension <= 0 || m.Dimension > 16000 {
+			add("model %s has invalid dimension", k)
+		}
+		if m.Distance != "cosine" && m.Distance != "l2" && m.Distance != "ip" {
+			add("model %s distance must be cosine, l2 or ip", k)
+		}
+	}
+	if _, ok := c.Models[c.InitialGeneration]; !ok {
+		add("initial_generation %q must name a model", c.InitialGeneration)
+	}
+	if c.Pipeline.OnPoison != "quarantine" && c.Pipeline.OnPoison != "pause" {
+		add("pipeline.on_poison must be quarantine or pause")
+	}
+	if c.Backfill.BatchSize < 1 || c.Backfill.BatchSize > 100000 {
+		add("backfill.batch_size out of range")
+	}
+	if c.Embedder.BatchSize < 1 || c.Embedder.Concurrency < 1 {
+		add("embedder batch_size and concurrency must be positive")
+	}
+	if len(errs) > 0 {
+		sort.Strings(errs)
+		return fmt.Errorf("invalid config:\n  - %s", strings.Join(errs, "\n  - "))
+	}
+	return nil
+}
+
+// SourceSchemaTable splits source.table.
+func (c *Config) SourceSchemaTable() (string, string) {
+	s, t, _ := strings.Cut(c.Source.Table, ".")
+	return s, t
+}
+
+// FieldColumns returns the physical allowlisted columns in config order.
+func (c *Config) FieldColumns() []string {
+	out := make([]string, 0, len(c.Source.Fields))
+	for _, f := range c.Source.Fields {
+		out = append(out, f.Column)
+	}
+	return out
+}
+
+// PublishedColumns is the key plus every allowlisted column, deduplicated.
+func (c *Config) PublishedColumns() []string {
+	out := []string{c.Source.Key}
+	for _, col := range c.FieldColumns() {
+		dup := false
+		for _, o := range out {
+			if o == col {
+				dup = true
+			}
+		}
+		if !dup {
+			out = append(out, col)
+		}
+	}
+	return out
+}
+
+// TransformFingerprint hashes everything that affects chunk text. Logical field
+// names (not physical columns) are included so a column rename is not a
+// re-embedding event.
+func (c *Config) TransformFingerprint() string {
+	names := make([]string, 0, len(c.Source.Fields))
+	for _, f := range c.Source.Fields {
+		names = append(names, f.Name)
+	}
+	payload, _ := json.Marshal(struct {
+		Fields    []string  `json:"fields"`
+		Transform Transform `json:"transform"`
+		Version   int       `json:"version"`
+	}{names, c.Transform, 1})
+	h := sha256.Sum256(payload)
+	return hex.EncodeToString(h[:16])
+}
+
+// Env returns the value of an environment variable or an error naming it.
+func Env(name string) (string, error) {
+	v := os.Getenv(name)
+	if v == "" {
+		return "", fmt.Errorf("environment variable %s is not set", name)
+	}
+	return v, nil
+}
+
+// EmbedderURL resolves the embedder URL, preferring the env override.
+func (c *Config) EmbedderURL() string {
+	if c.Embedder.URLEnv != "" {
+		if v := os.Getenv(c.Embedder.URLEnv); v != "" {
+			return v
+		}
+	}
+	return c.Embedder.URL
+}

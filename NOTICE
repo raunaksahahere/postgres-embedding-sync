@@ -1,0 +1,19 @@
+postgres-embedding-sync
+Copyright 2026 raunaksahahere
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party components used at run time (not redistributed in this repository):
+
+* Embedding models, downloaded from Hugging Face at the pinned revisions on first start:
+  - sentence-transformers/all-MiniLM-L6-v2 @ 1110a243fdf4706b3f48f1d95db1a4f5529b4d41 (Apache-2.0)
+  - BAAI/bge-small-en-v1.5 @ 5c38ec7c405ec4b44b94cc5a9bb96e735b38267a (MIT)
+  - sentence-transformers/paraphrase-MiniLM-L3-v2 @ 4ca70771034acceecb2e72475f72050fcdde4ddc (Apache-2.0)
+* Evaluation data: BEIR SciFact (Wadden et al., "Fact or Fiction: Verifying Scientific
+  Claims", EMNLP 2020; BEIR, Thakur et al., NeurIPS 2021 Datasets and Benchmarks), downloaded
+  by bench/ from huggingface.co/datasets/BeIR/scifact (revision
+  984eed826375f18d27936c4a32bf0f8491e3f414) and BeIR/scifact-qrels, verified by SHA-256.
+  Check the dataset's license terms before using it beyond evaluation; this repository
+  commits only aggregate results and query IDs, not the corpus.
+* Go and Python dependencies are listed with exact versions in go.sum, embedder/uv.lock and
+  bench/uv.lock under their own licenses.
