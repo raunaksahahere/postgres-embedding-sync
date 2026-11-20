@@ -1,0 +1,20 @@
+# Overlay for benchmarks: `docker compose -p embedsync-bench -f docker-compose.yml -f bench/compose.bench.yml ...`
+# The harness (bench/src/embedsync_bench) drives this; it uses its own ports and
+# config and shares the model cache volume with the quickstart.
+services:
+  postgres:
+    ports: !override ["127.0.0.1:${PG_PORT:-56432}:5432"]
+  embedder:
+    ports: !override ["127.0.0.1:${EMBEDDER_PORT:-58100}:8000"]
+  init:
+    volumes:
+      - ./bench/embedsync.bench.yaml:/etc/embedsync/embedsync.yaml:ro
+  embedsync:
+    volumes:
+      - ./bench/embedsync.bench.yaml:/etc/embedsync/embedsync.yaml:ro
+      - ${BENCH_EVAL_DIR:-./eval/fixtures/ci}:/etc/embedsync/eval:ro
+    ports: !override ["127.0.0.1:${EMBEDSYNC_PORT:-59287}:9187"]
+
+volumes:
+  hf-cache:
+    name: ${HF_CACHE_VOLUME:-embedsync_hf-cache}
