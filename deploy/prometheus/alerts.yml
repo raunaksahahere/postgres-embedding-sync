@@ -1,0 +1,65 @@
+# Thresholds come from embedsync_alert_threshold so config and alerts agree.
+groups:
+  - name: embedsync
+    rules:
+      - alert: EmbedsyncFreshnessSLO
+        expr: embedsync_freshness_lag_seconds > on() group_left embedsync_alert_threshold{name="freshness_seconds"}
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "Committed changes are not searchable within the freshness target"
+          description: "Oldest pending or quarantined change is {{ $value | humanizeDuration }} old."
+      - alert: EmbedsyncFreshnessP99
+        expr: histogram_quantile(0.99, sum(rate(embedsync_commit_to_searchable_seconds_bucket[5m])) by (le)) > on() group_left embedsync_alert_threshold{name="freshness_seconds"}
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "p99 commit-to-searchable latency above target"
+      - alert: EmbedsyncConsumerStalled
+        expr: embedsync_consumer_state{state="stalled"} == 1
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "Consumer has pending work but is not making progress (not merely idle)"
+      - alert: EmbedsyncPaused
+        expr: embedsync_consumer_state{state="paused"} == 1
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "Pipeline paused before acknowledging work (schema change, poison row with on_poison=pause, or startup check)"
+      - alert: EmbedsyncRetainedWALWarning
+        expr: embedsync_slot_retained_wal_bytes > on() group_left embedsync_alert_threshold{name="retained_wal_warning_bytes"}
+        for: 2m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Replication slot retains {{ $value | humanize1024 }}B of WAL"
+      - alert: EmbedsyncRetainedWALCritical
+        expr: embedsync_slot_retained_wal_bytes > on() group_left embedsync_alert_threshold{name="retained_wal_critical_bytes"}
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "Replication slot WAL retention critical; source disk at risk"
+      - alert: EmbedsyncSlotNearInvalidation
+        expr: embedsync_slot_safe_wal_bytes >= 0 and embedsync_slot_safe_wal_bytes < 256 * 1024 * 1024
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "Slot will be invalidated by max_slot_wal_keep_size soon; a rebuild would follow"
+      - alert: EmbedsyncSlotLost
+        expr: embedsync_slot_wal_status{status="lost"} == 1
+        for: 0m
+        labels: { severity: page }
+        annotations:
+          summary: "Replication slot invalidated; run embedsync rebuild --confirm"
+      - alert: EmbedsyncUnresolvedRows
+        expr: sum(embedsync_unresolved_rows) > 0
+        for: 10m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Quarantined rows are unresolved and block promotion"
+      - alert: EmbedsyncDown
+        expr: up{job="embedsync"} == 0
+        for: 1m
+        labels: { severity: page }
+        annotations:
+          summary: "embedsync metrics endpoint is down"

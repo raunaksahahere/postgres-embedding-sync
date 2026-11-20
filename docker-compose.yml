@@ -1,0 +1,110 @@
+# Quickstart: docker compose up -d --build   (see README)
+# Everything builds from this repository; no prebuilt or `latest` image is used.
+name: embedsync
+
+x-pg-env: &pgenv
+  EMBEDSYNC_SOURCE_DSN: postgres://embedsync_replicator:${EMBEDSYNC_REPLICATOR_PASSWORD:-demo-replicator}@postgres:5432/app?sslmode=disable
+  EMBEDSYNC_SINK_DSN: postgres://embedsync_sink:${EMBEDSYNC_SINK_PASSWORD:-demo-sink}@postgres:5432/app?sslmode=disable
+  EMBEDSYNC_READER_DSN: postgres://embedsync_reader:${EMBEDSYNC_READER_PASSWORD:-demo-reader}@postgres:5432/app?sslmode=disable
+  EMBEDSYNC_CONFIG: /etc/embedsync/embedsync.yaml
+
+services:
+  postgres:
+    # PostgreSQL 17 + pgvector 0.8.7, pinned by digest. PG 16/18 digests are in
+    # docs/operations.md (set PG_IMAGE to test another major).
+    image: ${PG_IMAGE:-pgvector/pgvector:0.8.7-pg17-bookworm@sha256:b513c48566e4777cd3370451400000c78eda6a08131d68f4c31d4a76f27bd8fd}
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-demo-admin}
+      EMBEDSYNC_REPLICATOR_PASSWORD: ${EMBEDSYNC_REPLICATOR_PASSWORD:-demo-replicator}
+      EMBEDSYNC_SINK_PASSWORD: ${EMBEDSYNC_SINK_PASSWORD:-demo-sink}
+      EMBEDSYNC_READER_PASSWORD: ${EMBEDSYNC_READER_PASSWORD:-demo-reader}
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_replication_slots=10
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_slot_wal_keep_size=2GB
+      - -c
+      - wal_sender_timeout=60s
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./deploy/postgres/10-roles-and-seed.sh:/docker-entrypoint-initdb.d/10-roles-and-seed.sh:ro
+      - ./examples/seed.sql:/docker-entrypoint-initdb.d/seed/seed.sql:ro
+    ports: ["127.0.0.1:${PG_PORT:-55432}:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d app"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  embedder:
+    build: ./embedder
+    environment:
+      EMBEDDER_MODELS: >-
+        sentence-transformers/all-MiniLM-L6-v2@1110a243fdf4706b3f48f1d95db1a4f5529b4d41,
+        BAAI/bge-small-en-v1.5@5c38ec7c405ec4b44b94cc5a9bb96e735b38267a,
+        sentence-transformers/paraphrase-MiniLM-L3-v2@4ca70771034acceecb2e72475f72050fcdde4ddc
+      HF_HUB_OFFLINE: ${HF_HUB_OFFLINE:-0}
+      EMBEDDER_THREADS: ${EMBEDDER_THREADS:-}   # torch CPU threads; empty = torch default
+      EMBEDDER_FAULT_REJECT_SUBSTRING: ${EMBEDDER_FAULT_REJECT_SUBSTRING:-}
+    volumes:
+      - hf-cache:/models
+    ports: ["127.0.0.1:${EMBEDDER_PORT:-58000}:8000"]
+
+  init:
+    build: .
+    command: ["init"]
+    environment:
+      <<: *pgenv
+      EMBEDSYNC_SOURCE_ADMIN_DSN: postgres://postgres:${POSTGRES_PASSWORD:-demo-admin}@postgres:5432/app?sslmode=disable
+      EMBEDSYNC_SINK_ADMIN_DSN: postgres://postgres:${POSTGRES_PASSWORD:-demo-admin}@postgres:5432/app?sslmode=disable
+    volumes:
+      - ./examples/embedsync.yaml:/etc/embedsync/embedsync.yaml:ro
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  embedsync:
+    build: .
+    command: ["run"]
+    environment: *pgenv
+    volumes:
+      - ./examples/embedsync.yaml:/etc/embedsync/embedsync.yaml:ro
+      - ./eval/fixtures/ci:/etc/embedsync/eval:ro
+    ports: ["127.0.0.1:${EMBEDSYNC_PORT:-59187}:9187"]
+    depends_on:
+      init: { condition: service_completed_successfully }
+      embedder: { condition: service_healthy }
+    restart: unless-stopped
+    stop_grace_period: 40s
+
+  prometheus:
+    image: prom/prometheus:v3.15.1@sha256:fa3302279710be2f21a8301ec17a8b4f2301fd829bd113839b3b6b02b6f191a2
+    command: ["--config.file=/etc/prometheus/prometheus.yml", "--storage.tsdb.retention.time=7d"]
+    volumes:
+      - ./deploy/prometheus:/etc/prometheus:ro
+    ports: ["127.0.0.1:${PROMETHEUS_PORT:-59090}:9090"]
+    profiles: ["observability"]
+
+  grafana:
+    image: grafana/grafana:13.2.6@sha256:b21409d7951ddcfd63a4b49083e4ef2cc35bc1437d071813bf82bfb238b00bca
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-demo-grafana}
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/embedsync.json
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deploy/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["127.0.0.1:${GRAFANA_PORT:-53000}:3000"]
+    profiles: ["observability"]
+
+volumes:
+  pgdata:
+  hf-cache:

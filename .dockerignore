@@ -1,0 +1,7 @@
+.git
+bench/data
+bench/results/raw
+eval/.venv
+embedder/.venv
+**/__pycache__
+dist

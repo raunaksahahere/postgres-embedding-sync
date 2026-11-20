@@ -1,0 +1,97 @@
+# embedsync configuration used by the Docker Compose quickstart.
+# Credentials never appear here: every *_env field names an environment variable.
+
+source:
+  dsn_env: EMBEDSYNC_SOURCE_DSN          # replicator role: SELECT on allowlisted columns + marker writes
+  replication_dsn_env: EMBEDSYNC_SOURCE_DSN
+  table: public.documents
+  key: id
+  fields:                                # the allowlist; only these columns are published and rendered
+    - { name: title, column: title }
+    - { name: body,  column: body }
+  publication: embedsync_pub
+  slot: embedsync_slot
+  control_schema: embedsync_control
+
+sink:
+  dsn_env: EMBEDSYNC_SINK_DSN            # sink role: owns schema embedsync
+  reader_dsn_env: EMBEDSYNC_READER_DSN   # reader role: SELECT on serving catalog and chunk tables
+  schema: embedsync
+  reader_role: embedsync_reader
+
+transform:
+  template: "{{.title}}\n\n{{.body}}"
+  chunk_words: 160
+  chunk_overlap: 24
+
+embedder:
+  url: http://embedder:8000
+  url_env: EMBEDSYNC_EMBEDDER_URL
+  timeout: 60s
+  batch_size: 32
+  concurrency: 2
+  requests_per_second: 40
+  burst: 4
+  retry: { initial_backoff: 200ms, max_backoff: 10s }
+
+# Each key can become a generation. Revisions are Hugging Face commit SHAs.
+models:
+  minilm:
+    name: sentence-transformers/all-MiniLM-L6-v2
+    revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+    dimension: 384
+    distance: cosine
+    hnsw: { m: 16, ef_construction: 64, ef_search: 100 }
+  bge:
+    name: BAAI/bge-small-en-v1.5
+    revision: 5c38ec7c405ec4b44b94cc5a9bb96e735b38267a
+    dimension: 384
+    distance: cosine
+    query_prefix: "Represent this sentence for searching relevant passages: "
+    hnsw: { m: 16, ef_construction: 64, ef_search: 100 }
+  minilm_l3:
+    name: sentence-transformers/paraphrase-MiniLM-L3-v2
+    revision: 4ca70771034acceecb2e72475f72050fcdde4ddc
+    dimension: 384
+    distance: cosine
+    hnsw: { m: 16, ef_construction: 64, ef_search: 100 }
+
+initial_generation: minilm
+
+pipeline:
+  tx_queue: 64
+  max_inflight_units: 8
+  max_batch_txns: 256
+  max_batch_docs: 256
+  max_transaction_changes: 100000
+  max_document_bytes: 262144
+  on_poison: quarantine
+  idle_checkpoint_interval: 10s
+  standby_interval: 5s
+  shutdown_timeout: 30s
+  stall_after: 60s
+
+backfill:
+  batch_size: 500
+
+migration:
+  rollback_window: 30m
+  catchup_timeout: 10m
+  eval_queries: /etc/embedsync/eval/queries.jsonl
+  eval_qrels: /etc/embedsync/eval/qrels.tsv
+  gates:                                  # declared before any evaluation is run
+    min_ann_recall_at_10: 0.95
+    noninferiority_margin_ndcg: 0.01
+    noninferiority_margin_recall: 0.01
+    bootstrap_samples: 2000
+    confidence_level: 0.95
+    seed: 20261120
+    require_zero_unresolved: true
+
+metrics:
+  listen: ":9187"
+
+alerts:
+  freshness_seconds: 10
+  retained_wal_warning_bytes: 512MiB
+  retained_wal_critical_bytes: 1536MiB
