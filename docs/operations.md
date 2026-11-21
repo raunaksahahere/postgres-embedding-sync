@@ -79,6 +79,12 @@ embedsync status              # reason and detail
   it. Run `embedsync backfill`, or set `REPLICA IDENTITY FULL` on the table.
 * `transaction_too_large` — one source transaction exceeds
   `pipeline.max_transaction_changes`; raise it and restart.
+* `fanout_limit` — one source transaction changes more documents of a view than its
+  `max_fanout_per_txn` (for example a tag renamed on every document). The transaction
+  was not acknowledged and nothing of it was applied; the detail names the view and the
+  transaction's LSN. Raise `max_fanout_per_txn` in the view and restart `run`: the
+  transaction is then applied whole. The limit is not part of the view fingerprint,
+  so changing it re-embeds nothing.
 * `identity_mismatch`, `slot_lost`, `slot_ahead` — see *Slot loss* below.
 * `startup_check` — catalog or configuration problem found at start; the detail names it.
 
@@ -89,6 +95,11 @@ embedsync dlq list                  # open records: generation, key, source LSN,
 embedsync dlq inspect --id 12
 embedsync dlq replay [--id 12]      # retries; skips records superseded by newer edits/deletes
 ```
+
+A view document is quarantined as a whole, keyed by its root key. Reasons specific to
+views: `too_many_children` (more rows than `max_children` in one child or link; raise
+the limit and `dlq replay`), plus the usual render error, `document_too_large` and
+embedder rejections. Replay assembles the document again from the sink's state.
 
 Quarantined rows have no chunks in that generation (search never serves an outdated
 version), count as unresolved in `status`, `/metrics` and `verify`, and block migration
@@ -128,6 +139,27 @@ a failover without synced slots, treat it as slot loss.
   migration rebuilds each chunk table's primary key, which takes a lock for a time
   proportional to the table; searches wait meanwhile. Downgrading after `init` is not
   supported (the old binary refuses to start on the upgraded checkpoint).
+* **From v0.3.0 to views**: stop `run`, install the new version, run
+  `embedsync init --admin-url <admin URL>` (or the admin DSN variables), then start
+  `run`. `init` applies `sink/0003_views.sql`: it adds `source_refs` and the backfill job
+  kind, and changes nothing else. Nothing is re-embedded and existing documents keep
+  serving. Until `init` runs, every command says the sink needs it. Downgrading after
+  `init` is not supported.
+* **Adding a view** (example: [`examples/embedsync-views.yaml`](../examples/embedsync-views.yaml)):
+  every table of the view needs the tenant column first in its primary key (and in its
+  references). Add the `views:` entry, run `embedsync init` (grants columns and adds
+  the tables to the publication) and restart `run`. embedsync queues one `state` job per
+  table, then one `render` job per live generation; documents appear once all state
+  jobs are done. A table can belong to only one pipeline or view, so a table already
+  synced as a pipeline cannot be reused. `embedsync status` lists the view (kind
+  `view`) and its tables (kind `view_table`, named `<view>:<table>`) and the jobs.
+  `embedsync backfill --pipeline <view>` re-scans all of its tables and re-renders.
+* **Changing a view**: the view fingerprint covers tables, keys, references, order,
+  fields (including physical column names) and the transform, but not `max_children` or
+  `max_fanout_per_txn`. Renaming a column of a view's table in the config, like any
+  other change to these, is a new generation (`embedsync migrate`); a pipeline's field
+  column is not part of its fingerprint, a view's is. Changing the two limits needs
+  only a restart.
 * **Adding a table** (example: [`examples/embedsync-multi.yaml`](../examples/embedsync-multi.yaml)):
   move the existing table under `pipelines:` with the name `default`
   (any other name would be a new, empty pipeline), add the new pipeline, run

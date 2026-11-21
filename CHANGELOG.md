@@ -1,5 +1,37 @@
 # Changelog
 
+## v0.4.0
+
+Document views: one document assembled from related tables.
+
+* **Views**: `views:` defines a root table, ordered child tables (`children`) and rows
+  reached through a link table (`links`, many-to-many). The template sees the root
+  fields and one list per child and link name. The rendered document is chunked like
+  any other. Every key and reference starts with a tenant column, and a table belongs to
+  one pipeline or view. See `examples/embedsync-views.yaml`.
+* **Consistency**: view tables are kept in `source_state` (plus the new `source_refs`)
+  and committed with the checkpoint; the stream path never reads the source. Each
+  affected document is rendered once per unit from the state after the unit, so a
+  section move, a tag rename or a multi-edit transaction ends as one final document.
+  Truncating a child, link or target table re-renders the documents that used it;
+  truncating the root table deletes the view's documents.
+* **Backfill kinds**: jobs are `embed`, `state` or `render`. A view first scans each
+  of its tables into state, then renders its documents per generation. A model
+  migration builds the view from state (render job only).
+  `embedsync backfill --pipeline <view>` queues both. `embedsync status` lists views
+  (`view`) and their tables (`view_table`).
+* **verify** assembles view documents from the source with SQL joins, independently of
+  the stream code. Child and link rows without a parent document are reported as
+  `view_orphan_rows`.
+* **Limits**: `max_children` (default 1000) quarantines a larger document as
+  `too_many_children`. `max_fanout_per_txn` (default 10000) pauses the pipeline
+  (`fanout_limit`) before acknowledging a transaction that changes more documents of a
+  view; raise it and restart. Neither is part of the view fingerprint.
+* **Upgrade**: stop `embedsync run`, install the new version, run
+  `embedsync init --admin-url <admin URL>`, then start `run`. It applies
+  `sink/0003_views.sql` (adds `source_refs` and the job kind; additive). Existing
+  documents are not re-embedded. Downgrading after `init` is not supported.
+
 ## v0.3.0
 
 Several tables in one process, and composite primary keys.

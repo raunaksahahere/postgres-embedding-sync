@@ -78,6 +78,83 @@ key types and column signature; `generations.pipelines` holds each pipeline's tr
 fingerprint. A pipeline added to the config is registered at the next start and
 backfilled into every live generation (one job per pipeline and generation).
 
+## Document views
+
+A view (`views:`) assembles one document per root row from child tables and linked
+target tables. Its tables are *components*, each presented to the rest of the system
+as a table pipeline: `<view>:root`, `<view>:<child>`, `<view>:<link>` (the link table)
+and `<view>:<link>.target`. They share the publication, relation checks, grants and
+backfill windows of ordinary pipelines. The document itself is the pipeline named
+`<view>`, so generations, chunk tables, the DLQ and search see it like any other.
+Rules: the tenant column is first in every key and reference, and each table has one
+consumer (a pipeline or one view component).
+
+**State.** The stream path never queries the source. A component row change is written
+to `source_state` (allowlisted fields only) and its references to `source_refs`
+(`pipeline, source_key, ref, ref_key`: a child's `parent`, a link's `parent` and
+`target`), in the sink transaction of the unit. Until the unit commits, the planner
+reads *overlay over sink*: uncommitted units' rows shadow the sink's, so the next unit
+can be planned before the previous one is durable.
+
+**Which documents a change dirties.**
+
+| changed row | dirty documents |
+|---|---|
+| root | itself, under the old and the new key |
+| child or link | the parent under the old and the new reference |
+| target | every document with a link row pointing at it |
+
+For a child or link the old reference is read from state before the overlay is
+updated, because pgoutput sends no old tuple for a non-key column under the default
+replica identity. A document is dirty under its key; deleting the root row renders a
+delete.
+
+**Render once.** At the end of a unit each dirty document is assembled from the
+overlay over the sink and rendered once, however many rows or transactions of the unit
+touched it, and written with the position of the last transaction that dirtied it.
+Rendering the final state also makes a transaction that moves a section and renames
+its tag come out as one document. The text is then chunked and embedded as for a
+pipeline.
+
+**Rendering rules** (`internal/viewdoc`). A child list is ordered by its `order_by`
+columns, then by the child key; a link list by the target's `order_by` fields, then by
+the target key. Order values compare by type: integers numerically, text bytewise
+(`COLLATE "C"`), uuids as canonical strings, date, timestamp and timestamptz as
+instants; NULLs sort last. Other order column types are rejected. The template gets the
+root fields and one list of field maps per child and link.
+
+**Backfill is two-phase.** A new view queues one `state` job per component (a watermark
+scan into `source_state` and `source_refs`, no embedding, no generation) and one
+`render` job per live generation. The job queue runs state jobs first, and nothing is
+rendered while any of the view's state jobs is active: the stream path marks documents
+dirty but defers rendering. A render job pages through the root keys of the state in
+key order, renders each window from the same overlay-over-sink state, and range-deletes
+the generation's other documents in the window, so deleted roots disappear. A model
+migration therefore needs only render jobs, and its coverage gate assembles the
+expected documents from the sink's state.
+
+**Truncate.** Truncating the root table clears the root state and deletes every
+document of the view. Truncating a child, link or target table first marks the
+documents that referenced its rows as dirty (computed before the rows are hidden), then
+clears that component's state.
+
+**Fan-out pause.** The planner counts the distinct documents a source transaction
+dirties in a view. Above `max_fanout_per_txn` it pauses with `fanout_limit` before
+acknowledging the transaction, so the transaction stays whole: it is applied in full
+once the limit is raised and `run` restarts, or not at all.
+
+**Quarantine.** A document with more than `max_children` rows in one child or link is
+quarantined as `too_many_children` (the DLQ record and the removal of its chunks are
+atomic, as for any poison input). Render errors and documents over
+`pipeline.max_document_bytes` are quarantined too. A DLQ replay rebuilds the document
+from state.
+
+**Verify.** `embedsync verify` reads every table and assembles each view document from
+the source with SQL joins and `ORDER BY` in the same snapshot, independently of the
+planner and `viewdoc`, then compares chunks with the sink. Child and link rows whose
+root row does not exist are left out of documents and reported as `view_orphan_rows`;
+links whose target row is missing are dropped.
+
 ## Idle vs. stalled
 
 Unpublished WAL (other tables, other databases' activity, checkpoints) does not produce

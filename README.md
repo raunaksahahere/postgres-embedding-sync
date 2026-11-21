@@ -37,8 +37,8 @@ while serving searches.
 
 * Go service (pgx, pglogrepl), a local CPU embedding service (sentence-transformers, pinned
   revisions, no API key), PostgreSQL 16, 17 or 18 with pgvector.
-* Status: **v0.3.0**: several tables per process (pipelines), composite primary keys,
-  single process. See [limitations](#limitations).
+* Status: **v0.4.0**: document views from related tables, several tables per process
+  (pipelines), composite primary keys, single process. See [limitations](#limitations).
 
 ```mermaid
 flowchart LR
@@ -104,6 +104,7 @@ Each row is covered by a named integration test against real PostgreSQL 16, 17 a
 | Secret columns next to the text | only allowlisted columns are published, granted and selected | none leave the source |
 | Switching to a worse model | candidate generation must pass coverage, catch-up and quality gates; rollback window | readers see 0 errors |
 | One transaction writes to several synced tables | all tables share one slot; a source transaction is applied in one sink transaction, even when its embeddings finish out of order | readers never see half of it |
+| A section is moved, a tag renamed, or several tables edited in one transaction (document views) | the document is assembled once from the state after the transaction and rewritten once; no live reads of the source | one final document, never a mix |
 
 ## Why embedsync
 
@@ -365,6 +366,74 @@ pipelines:
   and restart `run`. See [`examples/embedsync-multi.yaml`](examples/embedsync-multi.yaml)
   and [operations](docs/operations.md#upgrades).
 
+## Document views
+
+A *view* turns one root row plus related rows into one document. A knowledge base is the
+typical case: a `documents` row, its ordered `sections` (children), and its `tags`
+reached through a link table (many-to-many). The whole rendered document is chunked
+with the usual word chunker, so a search hit is a chunk of the assembled document and
+its `key` is the root key.
+
+```yaml
+views:
+  - name: kb
+    tenant: tenant_id
+    table: public.kb_documents
+    key: [tenant_id, id]
+    fields: [{name: title, column: title}]
+    children:
+      - name: sections
+        table: public.kb_sections
+        key: [tenant_id, id]
+        parent: [tenant_id, document_id]
+        order_by: [position]
+        fields: [{name: heading, column: heading}, {name: body, column: body}]
+    links:
+      - name: tags
+        table: public.kb_document_tags
+        key: [tenant_id, document_id, tag_id]
+        parent: [tenant_id, document_id]
+        target: [tenant_id, tag_id]
+        target_table: public.kb_tags
+        target_key: [tenant_id, id]
+        target_fields: [{name: name, column: name}]
+        order_by: [name]
+    transform:
+      template: "{{.title}}{{range .tags}} #{{.name}}{{end}}{{range .sections}}\n\n{{.heading}}\n{{.body}}{{end}}"
+    max_children: 500          # default 1000
+    max_fanout_per_txn: 10000  # default 10000
+```
+
+* **Template namespace**: the root `fields` (`{{.title}}`) plus one list per child and
+  link name (`{{.sections}}`, `{{.tags}}`). A child's list elements hold its `fields`; a
+  link's hold its `target_fields`. Root field, child and link names share this
+  namespace and must be distinct. NULL renders as the empty string.
+* **Order**: children by `order_by` columns, links by `order_by` target fields, ties by
+  key; NULLs last. Order columns may be integers, text/varchar, uuid, date, timestamp
+  or timestamptz.
+* **Rules**: the tenant column comes first in every key and every reference, so a join
+  can never cross tenants and there are no shared tag tables. A table belongs to
+  exactly one pipeline or view. If a fan-out limit is exceeded the pipeline pauses
+  instead of splitting a transaction.
+* **Consistency**: the stream path never queries the source. Every table's allowlisted
+  rows are kept in the sink (`source_state`, plus `source_refs` for the references),
+  committed with the checkpoint. Each affected document is rendered once per unit, from
+  the state after the whole unit (including units still in flight), so a multi-edit
+  transaction yields one final document. `embedsync verify` assembles every view
+  document from the source with SQL joins, independently of the stream code, and
+  compares it with the sink.
+* **Limits**: `max_children` (default 1000) caps rows per child or link in one document;
+  a larger document is quarantined as `too_many_children`. `max_fanout_per_txn`
+  (default 10000) caps the documents one source transaction may change in a view (a tag
+  renamed on every document); above it the pipeline pauses with `fanout_limit` before
+  acknowledging, and you raise the limit and restart. Neither limit changes the view
+  fingerprint.
+* **Backfill**: `embedsync backfill --pipeline kb` accepts a view name: it re-scans every
+  table of the view into state, then re-renders the view's documents.
+
+Full example: [`examples/embedsync-views.yaml`](examples/embedsync-views.yaml) (demo
+data in `examples/seed-views.sql`). Design: [architecture](docs/architecture.md#document-views).
+
 ## Commands
 
 
@@ -375,7 +444,7 @@ pipelines:
 | `embedsync model list \| add <owner/name[@rev]>` | list models, add one from Hugging Face |
 | `embedsync init [--admin-url URL]` | create control objects, publication and sink schema; apply upgrades (admin URL or admin DSNs) |
 | `embedsync run [--accept-schema-change]` | stream, backfill, serve `/metrics` `/status` `/search` `/readyz` |
-| `embedsync backfill [--generation G] [--pipeline P] [--wait]` | queue a watermark re-scan |
+| `embedsync backfill [--generation G] [--pipeline P] [--wait]` | queue a watermark re-scan (`--pipeline` also takes a view name) |
 | `embedsync status [--json]` | checkpoint, slot and retained WAL, generations, DLQ, migrations |
 | `embedsync migrate --to <model> [--gate-only] [--restart]` | build, gate and promote a generation |
 | `embedsync migrate status \| rollback \| finalize [--force]` | inspect gates, roll back, retire |
@@ -425,8 +494,11 @@ Postgres tables into pgvector with transactional guarantees.
 
 
 * One process per publication and slot; each synced table is a pipeline whose primary
-  key columns are int, text or uuid. A document comes from one row: no joins across
-  tables yet, no hybrid (lexical) search, no external vector stores. A pipeline's table
+  key columns are int, text or uuid. A pipeline's document comes from one row. A view
+  assembles one document from a root table, one level of children and links to one
+  target table each, all scoped to a tenant column; no deeper nesting, no joins across
+  tenants, no table shared by two pipelines or views, no arbitrary SQL joins. No hybrid
+  (lexical) search, no external vector stores. A pipeline's table
   and key cannot change in place, and removing a pipeline needs a new sink schema.
 * Throughput is bounded by the CPU embedding model (~70 short documents/s for
   all-MiniLM-L6-v2 on the benchmark laptop); sustained writes above that grow the
