@@ -145,7 +145,7 @@ func ExpectedViews(trs map[string]*transform.Transformer, m transform.ModelIdent
 // Generation compares a generation's chunk table with every standalone
 // pipeline's rows and every view's assembled documents.
 func Generation(ctx context.Context, q Querier, schema string, g *store.Generation, trs map[string]*transform.Transformer, rows Rows, views map[string]ViewDocs, maxDocBytes int) (*GenReport, error) {
-	m := transform.ModelIdentity{Name: g.ModelName, Revision: g.ModelRevision, DocumentPrefix: g.DocumentPrefix}
+	m := g.Encoder()
 	exp, poison, err := Expected(trs, m, rows, maxDocBytes)
 	if err != nil {
 		return nil, err

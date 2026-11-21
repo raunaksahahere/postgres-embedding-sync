@@ -67,7 +67,12 @@ func replayViewDoc(ctx context.Context, e *Env, d store.DLQEntry, g *store.Gener
 	}
 	vecs := map[int][]float32{}
 	if len(inputs) > 0 {
-		v, rej, err := e.Embed.Embed(ctx, embedclient.Request{Model: g.ModelName, Revision: g.ModelRevision, Kind: embedclient.Document, Inputs: inputs})
+		prov, err := e.Providers.For(g.Provider.Name, g.Provider.Kind)
+		if err != nil {
+			return err
+		}
+		v, rej, err := prov.Embed(ctx, embedclient.Request{Model: g.ModelName, Revision: g.ModelRevision, Kind: embedclient.Document, Inputs: inputs,
+			Dimensions: g.Provider.RequestDimensions, Expect: g.Dimension, InputType: g.Provider.DocumentInputType})
 		if err != nil {
 			return err
 		}

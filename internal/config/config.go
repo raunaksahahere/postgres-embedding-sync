@@ -173,6 +173,39 @@ type Embedder struct {
 	Retry             Retry    `yaml:"retry"`
 }
 
+// LocalProvider is the name of the built-in embedder (the embedder block).
+const LocalProvider = "local"
+
+// Pricing labels an estimated cost: a price per million tokens and where
+// that price was taken from (a URL and date, or "self-hosted").
+type Pricing struct {
+	USDPerMillionTokens float64 `yaml:"usd_per_million_tokens" json:"usd_per_million_tokens"`
+	Source              string  `yaml:"source" json:"source"`
+}
+
+// ProviderDef is an embedding endpoint other than the built-in embedder.
+// kind "openai" speaks the OpenAI embeddings API (OpenAI, Gemini's
+// OpenAI-compatible endpoint, NVIDIA API catalog, Ollama, vLLM, TEI);
+// kind "gemini" speaks Google's batchEmbedContents, which embeds documents
+// and queries with different task types (url defaults to the public API).
+// The API key is only ever read from the environment variable named here.
+type ProviderDef struct {
+	Kind              string   `yaml:"kind" json:"kind"`
+	URL               string   `yaml:"url" json:"url"`
+	URLEnv            string   `yaml:"url_env" json:"url_env,omitempty"`
+	APIKeyEnv         string   `yaml:"api_key_env" json:"api_key_env,omitempty"`
+	Timeout           Duration `yaml:"timeout" json:"timeout"`
+	BatchSize         int      `yaml:"batch_size" json:"batch_size"`
+	MaxBatchTokens    int      `yaml:"max_batch_tokens" json:"max_batch_tokens"`
+	Concurrency       int      `yaml:"concurrency" json:"concurrency"`
+	RequestsPerSecond float64  `yaml:"requests_per_second" json:"requests_per_second"`
+	Burst             int      `yaml:"burst" json:"burst"`
+	TokensPerMinute   int      `yaml:"tokens_per_minute" json:"tokens_per_minute"`
+	Retry             Retry    `yaml:"retry" json:"-"`
+	MaxRetryAfter     Duration `yaml:"max_retry_after" json:"max_retry_after"`
+	Pricing           Pricing  `yaml:"pricing" json:"pricing"`
+}
+
 // HNSW holds pgvector HNSW index settings.
 type HNSW struct {
 	M              int `yaml:"m" json:"m"`
@@ -189,6 +222,25 @@ type Model struct {
 	QueryPrefix    string `yaml:"query_prefix" json:"query_prefix"`
 	DocumentPrefix string `yaml:"document_prefix" json:"document_prefix"`
 	HNSW           HNSW   `yaml:"hnsw" json:"hnsw"`
+	// Provider names the endpoint that computes this model's vectors
+	// ("local" or empty: the built-in embedder; otherwise a providers key).
+	Provider string `yaml:"provider" json:"provider,omitempty"`
+	// RequestDimensions asks the provider for shorter vectors (OpenAI
+	// "dimensions"); 0 uses the model's native size, which must equal
+	// Dimension.
+	RequestDimensions int `yaml:"request_dimensions" json:"request_dimensions,omitempty"`
+	// QueryInputType and DocumentInputType are sent as the provider's
+	// input_type for queries and documents (e.g. "query" / "passage").
+	QueryInputType    string `yaml:"query_input_type" json:"query_input_type,omitempty"`
+	DocumentInputType string `yaml:"document_input_type" json:"document_input_type,omitempty"`
+}
+
+// ProviderName returns the model's provider ("local" when unset).
+func (m Model) ProviderName() string {
+	if m.Provider == "" {
+		return LocalProvider
+	}
+	return m.Provider
 }
 
 // Pipeline bounds memory, batching and failure policy.
@@ -247,19 +299,20 @@ type Alerts struct {
 
 // Config is the whole embedsync.yaml.
 type Config struct {
-	Source            Source           `yaml:"source"`
-	Pipelines         []PipelineDef    `yaml:"pipelines"`
-	Views             []ViewDef        `yaml:"views"`
-	Sink              Sink             `yaml:"sink"`
-	Transform         Transform        `yaml:"transform"`
-	Embedder          Embedder         `yaml:"embedder"`
-	Models            map[string]Model `yaml:"models"`
-	InitialGeneration string           `yaml:"initial_generation"`
-	Pipeline          Pipeline         `yaml:"pipeline"`
-	Backfill          Backfill         `yaml:"backfill"`
-	Migration         Migration        `yaml:"migration"`
-	Metrics           Metrics          `yaml:"metrics"`
-	Alerts            Alerts           `yaml:"alerts"`
+	Source            Source                 `yaml:"source"`
+	Pipelines         []PipelineDef          `yaml:"pipelines"`
+	Views             []ViewDef              `yaml:"views"`
+	Sink              Sink                   `yaml:"sink"`
+	Transform         Transform              `yaml:"transform"`
+	Embedder          Embedder               `yaml:"embedder"`
+	Models            map[string]Model       `yaml:"models"`
+	Providers         map[string]ProviderDef `yaml:"providers"`
+	InitialGeneration string                 `yaml:"initial_generation"`
+	Pipeline          Pipeline               `yaml:"pipeline"`
+	Backfill          Backfill               `yaml:"backfill"`
+	Migration         Migration              `yaml:"migration"`
+	Metrics           Metrics                `yaml:"metrics"`
+	Alerts            Alerts                 `yaml:"alerts"`
 }
 
 var identRe = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
@@ -338,6 +391,17 @@ func (c *Config) applyDefaults() {
 	defD(&c.Embedder.Retry.MaxBackoff, 15*time.Second)
 	if c.Embedder.RequestsPerSecond == 0 {
 		c.Embedder.RequestsPerSecond = 50
+	}
+	for k, p := range c.Providers {
+		def(&p.Kind, "openai")
+		defI(&p.BatchSize, 64)
+		defI(&p.Concurrency, 2)
+		defI(&p.Burst, 4)
+		defD(&p.Timeout, 60*time.Second)
+		defD(&p.Retry.InitialBackoff, 500*time.Millisecond)
+		defD(&p.Retry.MaxBackoff, 30*time.Second)
+		defD(&p.MaxRetryAfter, 60*time.Second)
+		c.Providers[k] = p
 	}
 	for k, m := range c.Models {
 		def(&m.Distance, "cosine")
@@ -464,7 +528,7 @@ func (c *Config) Validate() error {
 	if c.Sink.ReaderRole != "" && !identRe.MatchString(c.Sink.ReaderRole) {
 		add("invalid sink.reader_role")
 	}
-	if !c.Embedder.Managed && c.Embedder.URL == "" && c.Embedder.URLEnv == "" {
+	if !c.Embedder.Managed && c.Embedder.URL == "" && c.Embedder.URLEnv == "" && c.usesLocal() {
 		add("embedder.url or embedder.url_env is required (or embedder.managed: true)")
 	}
 	if len(c.Models) == 0 {
@@ -482,6 +546,33 @@ func (c *Config) Validate() error {
 		}
 		if m.Distance != "cosine" && m.Distance != "l2" && m.Distance != "ip" {
 			add("model %s distance must be cosine, l2 or ip", k)
+		}
+	}
+	for name, p := range c.Providers {
+		if name == LocalProvider || !genRe.MatchString(name) {
+			add("provider name %q must match %s and not be %q (the built-in embedder)", name, genRe, LocalProvider)
+		}
+		if p.Kind != "openai" && p.Kind != "gemini" {
+			add("provider %s: kind must be openai (OpenAI-compatible embeddings API) or gemini (Gemini batchEmbedContents with task types)", name)
+		}
+		if p.URL == "" && p.URLEnv == "" && p.Kind != "gemini" {
+			add("provider %s: url or url_env is required", name)
+		}
+		if p.BatchSize < 1 || p.Concurrency < 1 || p.RequestsPerSecond < 0 || p.TokensPerMinute < 0 || p.MaxBatchTokens < 0 {
+			add("provider %s: batch_size and concurrency must be positive; rate limits must not be negative", name)
+		}
+		if p.Pricing.USDPerMillionTokens < 0 || (p.Pricing.USDPerMillionTokens > 0 && p.Pricing.Source == "") {
+			add("provider %s: pricing.source must say where usd_per_million_tokens comes from (URL and date)", name)
+		}
+	}
+	for k, m := range c.Models {
+		if pn := m.ProviderName(); pn != LocalProvider {
+			if _, ok := c.Providers[pn]; !ok {
+				add("model %s uses provider %q, which is not configured", k, pn)
+			}
+		}
+		if m.RequestDimensions < 0 || (m.RequestDimensions > 0 && m.RequestDimensions != m.Dimension) {
+			add("model %s: request_dimensions must equal dimension when set", k)
 		}
 	}
 	if _, ok := c.Models[c.InitialGeneration]; !ok {
@@ -647,4 +738,27 @@ func (c *Config) EmbedderURL() string {
 		}
 	}
 	return c.Embedder.URL
+}
+
+// usesLocal reports whether any model uses the built-in embedder.
+func (c *Config) usesLocal() bool {
+	if len(c.Models) == 0 {
+		return true
+	}
+	for _, m := range c.Models {
+		if m.ProviderName() == LocalProvider {
+			return true
+		}
+	}
+	return false
+}
+
+// ProviderURL resolves a provider's base URL, preferring the env override.
+func (p ProviderDef) ProviderURL() string {
+	if p.URLEnv != "" {
+		if v := os.Getenv(p.URLEnv); v != "" {
+			return v
+		}
+	}
+	return p.URL
 }

@@ -132,6 +132,11 @@ type ModelIdentity struct {
 	Name           string
 	Revision       string
 	DocumentPrefix string
+	// Provider identifies a non-local embedding provider and its request
+	// settings ("" for the built-in embedder, which keeps the fingerprints
+	// of every existing chunk). The same model name served by another
+	// provider, or asked for other dimensions, must not share vectors.
+	Provider string
 }
 
 // Chunks renders, splits and fingerprints a document for one model.
@@ -157,5 +162,8 @@ func ChunkID(table, key string, no int) string {
 func Fingerprint(transformFP string, m ModelIdentity, text string) string {
 	h := sha256.New()
 	fmt.Fprintf(h, "v1\x00%s\x00%s\x00%s\x00%s\x00%s", transformFP, m.Name, m.Revision, m.DocumentPrefix, text)
+	if m.Provider != "" {
+		fmt.Fprintf(h, "\x00provider\x00%s", m.Provider)
+	}
 	return hex.EncodeToString(h.Sum(nil)[:20])
 }

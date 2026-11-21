@@ -1,6 +1,8 @@
 package transform
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
 )
@@ -83,5 +85,19 @@ func TestViewTemplate(t *testing.T) {
 	}
 	if _, err := NewView("view:kb", "{{range .sections}}{{.secret}}{{end}}", nil, map[string][]string{"sections": {"body"}}, 50, 5, "fp"); err == nil {
 		t.Fatal("a child field outside the allowlist must be rejected")
+	}
+}
+
+func TestFingerprintProviderIsolation(t *testing.T) {
+	local := ModelIdentity{Name: "m", Revision: "r", DocumentPrefix: "p: "}
+	// The built-in embedder's fingerprints must never change (existing chunks).
+	h := sha256.Sum256([]byte("v1\x00fp\x00m\x00r\x00p: \x00text"))
+	if got := Fingerprint("fp", local, "text"); got != hex.EncodeToString(h[:20]) {
+		t.Fatalf("local fingerprint formula changed: %s", got)
+	}
+	a := Fingerprint("fp", ModelIdentity{Name: "m", Revision: "r", Provider: "gem|gemini|768|"}, "text")
+	b := Fingerprint("fp", ModelIdentity{Name: "m", Revision: "r", Provider: "gem|gemini|3072|"}, "text")
+	if a == b || a == Fingerprint("fp", local, "text") {
+		t.Fatal("providers and request dimensions must not share vectors")
 	}
 }

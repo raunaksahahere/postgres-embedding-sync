@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/config"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/keys"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/transform"
 )
 
 // Consumer is the checkpoint row name for the single replication consumer.
@@ -66,12 +68,57 @@ type Generation struct {
 	IndexParams          config.HNSW            `json:"index_params"`
 	TransformFingerprint string                 `json:"transform_fingerprint"`
 	Pipelines            map[string]GenPipeline `json:"pipelines"`
+	Provider             ProviderIdentity       `json:"provider"`
 	ChunkTable           string                 `json:"chunk_table"`
 	State                string                 `json:"state"`
 	StreamFromLSN        *pglogrepl.LSN         `json:"stream_from_lsn,omitempty"`
 	CreatedAt            time.Time              `json:"created_at"`
 	PromotedAt           *time.Time             `json:"promoted_at,omitempty"`
 	Extra                json.RawMessage        `json:"-"`
+}
+
+// ProviderIdentity is how a generation's vectors were computed: which
+// configured provider, of which kind, at which endpoint (recorded without
+// credentials, for audit), and with which request settings. Queries against
+// the generation use the same provider and settings.
+type ProviderIdentity struct {
+	Name              string `json:"name"`
+	Kind              string `json:"kind"`
+	Endpoint          string `json:"endpoint,omitempty"`
+	RequestDimensions int    `json:"request_dimensions,omitempty"`
+	QueryInputType    string `json:"query_input_type,omitempty"`
+	DocumentInputType string `json:"document_input_type,omitempty"`
+}
+
+// Encoder is the identity chunk fingerprints use: the model, its document
+// prompt and, for a non-local provider, the provider and request settings.
+func (g *Generation) Encoder() transform.ModelIdentity {
+	m := transform.ModelIdentity{Name: g.ModelName, Revision: g.ModelRevision, DocumentPrefix: g.DocumentPrefix}
+	if p := g.Provider; p.Name != "" && p.Name != config.LocalProvider {
+		m.Provider = fmt.Sprintf("%s|%s|%d|%s", p.Name, p.Kind, p.RequestDimensions, p.DocumentInputType)
+	}
+	return m
+}
+
+// NewProviderIdentity describes how a configured model is embedded.
+func NewProviderIdentity(cfg *config.Config, m config.Model) ProviderIdentity {
+	id := ProviderIdentity{Name: m.ProviderName(), Kind: config.LocalProvider, RequestDimensions: m.RequestDimensions,
+		QueryInputType: m.QueryInputType, DocumentInputType: m.DocumentInputType}
+	if p, ok := cfg.Providers[id.Name]; ok {
+		id.Kind = p.Kind
+		id.Endpoint = redactURL(p.ProviderURL())
+	}
+	return id
+}
+
+// redactURL drops credentials and query parameters from an endpoint URL.
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	u.User, u.RawQuery, u.Fragment = nil, "", ""
+	return u.String()
 }
 
 // GenPipeline is what a generation records about one pipeline it covers.
@@ -253,15 +300,18 @@ func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
 }
 
 const genCols = `id, model_key, model_name, model_revision, dimension, distance, query_prefix, document_prefix, index_type,
-	index_params, transform_fingerprint, pipelines, chunk_table, state, stream_from_lsn::text, created_at, promoted_at`
+	index_params, transform_fingerprint, pipelines, chunk_table, state, stream_from_lsn::text, created_at, promoted_at, provider`
 
 func scanGen(row pgx.Row) (*Generation, error) {
 	var g Generation
-	var params, pipes []byte
+	var params, pipes, prov []byte
 	var lsn *string
 	if err := row.Scan(&g.ID, &g.ModelKey, &g.ModelName, &g.ModelRevision, &g.Dimension, &g.Distance, &g.QueryPrefix, &g.DocumentPrefix,
-		&g.IndexType, &params, &g.TransformFingerprint, &pipes, &g.ChunkTable, &g.State, &lsn, &g.CreatedAt, &g.PromotedAt); err != nil {
+		&g.IndexType, &params, &g.TransformFingerprint, &pipes, &g.ChunkTable, &g.State, &lsn, &g.CreatedAt, &g.PromotedAt, &prov); err != nil {
 		return nil, err
+	}
+	if err := json.Unmarshal(prov, &g.Provider); err != nil {
+		return nil, fmt.Errorf("generation %s provider: %w", g.ID, err)
 	}
 	_ = json.Unmarshal(params, &g.IndexParams)
 	g.Pipelines = map[string]GenPipeline{}
@@ -318,6 +368,7 @@ func NewGeneration(id, modelKey string, m config.Model, cfg *config.Config) (*Ge
 		ID: id, ModelKey: modelKey, ModelName: m.Name, ModelRevision: m.Revision, Dimension: m.Dimension,
 		Distance: m.Distance, QueryPrefix: m.QueryPrefix, DocumentPrefix: m.DocumentPrefix, IndexType: "hnsw",
 		IndexParams: m.HNSW, TransformFingerprint: cfg.CombinedFingerprint(), Pipelines: pipes, ChunkTable: "chunks_" + id, State: StatePending,
+		Provider: NewProviderIdentity(cfg, m),
 	}, nil
 }
 
@@ -374,6 +425,11 @@ func (g *Generation) MatchesModel(m config.Model, fps map[string]string) error {
 		return fmt.Errorf("generation %s dimension/distance differ from config", g.ID)
 	case g.DocumentPrefix != m.DocumentPrefix || g.QueryPrefix != m.QueryPrefix:
 		return fmt.Errorf("generation %s prompts differ from config", g.ID)
+	case g.Provider.Name != m.ProviderName() || g.Provider.RequestDimensions != m.RequestDimensions ||
+		g.Provider.QueryInputType != m.QueryInputType || g.Provider.DocumentInputType != m.DocumentInputType:
+		return fmt.Errorf("generation %s was embedded by provider %q (request_dimensions %d, input types %q/%q) but its model now says provider %q (%d, %q/%q); add a new model key and migrate",
+			g.ID, g.Provider.Name, g.Provider.RequestDimensions, g.Provider.DocumentInputType, g.Provider.QueryInputType,
+			m.ProviderName(), m.RequestDimensions, m.DocumentInputType, m.QueryInputType)
 	}
 	return nil
 }
@@ -395,13 +451,14 @@ func (g *Generation) MissingPipelines(fps map[string]string) []string {
 func (s *Store) CreateGeneration(ctx context.Context, g *Generation, readerRole string) error {
 	params, _ := json.Marshal(g.IndexParams)
 	pipes, _ := json.Marshal(g.Pipelines)
+	prov, _ := json.Marshal(g.Provider)
 	tbl := s.T(g.ChunkTable)
 	return pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `INSERT INTO `+s.T("generations")+` (id, model_key, model_name, model_revision, dimension, distance,
-			query_prefix, document_prefix, index_type, index_params, transform_fingerprint, pipelines, chunk_table, state)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+			query_prefix, document_prefix, index_type, index_params, transform_fingerprint, pipelines, chunk_table, state, provider)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
 			g.ID, g.ModelKey, g.ModelName, g.ModelRevision, g.Dimension, g.Distance, g.QueryPrefix, g.DocumentPrefix,
-			g.IndexType, params, g.TransformFingerprint, pipes, g.ChunkTable, StatePending); err != nil {
+			g.IndexType, params, g.TransformFingerprint, pipes, g.ChunkTable, StatePending, prov); err != nil {
 			return fmt.Errorf("insert generation: %w", err)
 		}
 		ddl := []string{

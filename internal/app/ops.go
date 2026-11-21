@@ -303,7 +303,12 @@ func ReplayDLQ(ctx context.Context, e *Env, id int64, out io.Writer) (*ReplayRes
 			}
 			vecs = map[string]string{}
 			if len(inputs) > 0 {
-				v, rej, err := e.Embed.Embed(ctx, embedclient.Request{Model: g.ModelName, Revision: g.ModelRevision, Kind: embedclient.Document, Inputs: inputs})
+				prov, err := e.Providers.For(g.Provider.Name, g.Provider.Kind)
+				if err != nil {
+					return res, err
+				}
+				v, rej, err := prov.Embed(ctx, embedclient.Request{Model: g.ModelName, Revision: g.ModelRevision, Kind: embedclient.Document, Inputs: inputs,
+					Dimensions: g.Provider.RequestDimensions, Expect: g.Dimension, InputType: g.Provider.DocumentInputType})
 				if err != nil {
 					return res, err
 				}

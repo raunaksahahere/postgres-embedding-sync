@@ -389,8 +389,8 @@ func cmdMigrate(ctx context.Context, args []string) error {
 		return err
 	}
 	defer e.Close()
-	m := &migrate.Migrator{Cfg: e.Cfg, Store: e.Store, Source: e.Source, Trs: e.Trs(), Log: e.Log, Embed: e.Embed, Out: os.Stdout,
-		Searcher: &search.Searcher{Pool: e.Store.Pool, Schema: e.Cfg.Sink.Schema, Client: e.Embed}}
+	m := &migrate.Migrator{Cfg: e.Cfg, Store: e.Store, Source: e.Source, Trs: e.Trs(), Log: e.Log, Embed: e.Providers, Out: os.Stdout,
+		Searcher: &search.Searcher{Pool: e.Store.Pool, Schema: e.Cfg.Sink.Schema, Providers: e.Providers}}
 	if *c.json {
 		m.Out = os.Stderr
 	}
@@ -462,7 +462,7 @@ func cmdSearch(ctx context.Context, args []string) error {
 			pool = rs.Pool
 		}
 	}
-	s := &search.Searcher{Pool: pool, Schema: e.Cfg.Sink.Schema, Client: e.Embed}
+	s := &search.Searcher{Pool: pool, Schema: e.Cfg.Sink.Schema, Providers: e.Providers}
 	q := c.fs.Arg(0)
 	for _, a := range c.fs.Args()[1:] {
 		q += " " + a

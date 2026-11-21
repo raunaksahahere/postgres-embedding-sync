@@ -18,13 +18,17 @@ import (
 
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/embedclient"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/metrics"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/store"
 )
 
-// Searcher runs queries.
+// Searcher runs queries. The query vector comes from the provider that
+// built the searched generation (as recorded with it), with the same
+// request settings, so promotion and rollback switch providers together
+// with the index.
 type Searcher struct {
-	Pool   *pgxpool.Pool
-	Schema string
-	Client *embedclient.Client
+	Pool      *pgxpool.Pool
+	Schema    string
+	Providers *embedclient.Set
 }
 
 // Options control one search.
@@ -50,6 +54,7 @@ type Result struct {
 	Generation string  `json:"generation"`
 	Model      string  `json:"model"`
 	Revision   string  `json:"revision"`
+	Provider   string  `json:"provider"`
 	Exact      bool    `json:"exact"`
 	Hits       []Hit   `json:"hits"`
 	EmbedMS    float64 `json:"embed_ms"`
@@ -59,6 +64,7 @@ type Result struct {
 type genRow struct {
 	id, model, revision, prefix, table, distance string
 	dim, efSearch                                int
+	provider                                     store.ProviderIdentity
 }
 
 func (s *Searcher) loadGen(ctx context.Context, id string) (*genRow, error) {
@@ -66,7 +72,7 @@ func (s *Searcher) loadGen(ctx context.Context, id string) (*genRow, error) {
 	var params struct {
 		EFSearch int `json:"ef_search"`
 	}
-	q := `SELECT g.id, g.model_name, g.model_revision, g.query_prefix, g.chunk_table, g.distance, g.dimension, g.index_params
+	q := `SELECT g.id, g.model_name, g.model_revision, g.query_prefix, g.chunk_table, g.distance, g.dimension, g.index_params, g.provider
 		FROM ` + pgx.Identifier{s.Schema, "generations"}.Sanitize() + ` g `
 	var row pgx.Row
 	if id == "" {
@@ -74,7 +80,7 @@ func (s *Searcher) loadGen(ctx context.Context, id string) (*genRow, error) {
 	} else {
 		row = s.Pool.QueryRow(ctx, q+`WHERE g.id = $1`, id)
 	}
-	if err := row.Scan(&g.id, &g.model, &g.revision, &g.prefix, &g.table, &g.distance, &g.dim, &params); err != nil {
+	if err := row.Scan(&g.id, &g.model, &g.revision, &g.prefix, &g.table, &g.distance, &g.dim, &params, &g.provider); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("generation %q not found", id)
 		}
@@ -106,14 +112,18 @@ func (s *Searcher) Search(ctx context.Context, query string, o Options) (res *Re
 	if err != nil {
 		return nil, err
 	}
+	prov, err := s.Providers.For(g.provider.Name, g.provider.Kind)
+	if err != nil {
+		return nil, err
+	}
 	var resp *embedclient.Response
 	for attempt := 0; attempt < 3; attempt++ {
-		resp, err = s.Client.EmbedOnce(ctx, embedclient.Request{Model: g.model, Revision: g.revision, Kind: embedclient.Query, Inputs: []string{g.prefix + query}})
+		resp, err = prov.EmbedOnce(ctx, g.queryRequest(query))
 		var tr *embedclient.TransientError
 		if err == nil || !errors.As(err, &tr) {
 			break
 		}
-		time.Sleep(s.Client.Backoff(attempt))
+		time.Sleep(prov.Backoff(attempt))
 	}
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
@@ -127,7 +137,7 @@ func (s *Searcher) Search(ctx context.Context, query string, o Options) (res *Re
 	if err != nil {
 		return nil, err
 	}
-	return &Result{Generation: g.id, Model: g.model, Revision: g.revision, Exact: o.Exact, Hits: hits,
+	return &Result{Generation: g.id, Model: g.model, Revision: g.revision, Provider: g.provider.Name, Exact: o.Exact, Hits: hits,
 		EmbedMS: float64(embedDone.Sub(start).Microseconds()) / 1000, QueryMS: float64(time.Since(embedDone).Microseconds()) / 1000}, nil
 }
 
@@ -151,13 +161,38 @@ func (s *Searcher) SearchVectorIn(ctx context.Context, parent pgx.Tx, genID, vec
 	return s.query(ctx, parent, g, vec, k, exact)
 }
 
-// QueryEncoder returns the encoder identity and prompt for a generation.
-func (s *Searcher) QueryEncoder(ctx context.Context, genID string) (model, revision, prefix string, dim int, err error) {
+func (g *genRow) queryRequest(texts ...string) embedclient.Request {
+	in := make([]string, len(texts))
+	for i, t := range texts {
+		in[i] = g.prefix + t
+	}
+	return embedclient.Request{Model: g.model, Revision: g.revision, Kind: embedclient.Query, Inputs: in,
+		Dimensions: g.provider.RequestDimensions, Expect: g.dim, InputType: g.provider.QueryInputType}
+}
+
+// QueryEncoder is how a generation's queries are embedded.
+type QueryEncoder struct {
+	Model, Revision string
+	Dim             int
+	Provider        embedclient.Provider
+	g               *genRow
+}
+
+// Request builds the provider request for query texts (prompt applied).
+func (q *QueryEncoder) Request(texts ...string) embedclient.Request { return q.g.queryRequest(texts...) }
+
+// Encoder returns how a generation's queries are embedded: its model,
+// prompt, provider and request settings.
+func (s *Searcher) Encoder(ctx context.Context, genID string) (*QueryEncoder, error) {
 	g, err := s.loadGen(ctx, genID)
 	if err != nil {
-		return "", "", "", 0, err
+		return nil, err
 	}
-	return g.model, g.revision, g.prefix, g.dim, nil
+	prov, err := s.Providers.For(g.provider.Name, g.provider.Kind)
+	if err != nil {
+		return nil, err
+	}
+	return &QueryEncoder{Model: g.model, Revision: g.revision, Dim: g.dim, Provider: prov, g: g}, nil
 }
 
 func (s *Searcher) query(ctx context.Context, parent pgx.Tx, g *genRow, vec string, k int, exact bool) ([]Hit, error) {

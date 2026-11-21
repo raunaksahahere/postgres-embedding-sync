@@ -13,7 +13,6 @@ import (
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/config"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/dbinit"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/embedclient"
-	"github.com/raunaksahahere/postgres-embedding-sync/internal/metrics"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/pipeline"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/store"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/transform"
@@ -25,7 +24,9 @@ type Env struct {
 	Log    *slog.Logger
 	Store  *store.Store
 	Source *pgxpool.Pool
-	Embed  *embedclient.Client
+	Embed  *embedclient.Client // the built-in embedder ("local")
+	// Providers resolves the provider each generation was built with.
+	Providers *embedclient.Set
 	// Pipes holds every configured pipeline's transformer. Key codecs are
 	// filled in by `run` from the source catalog.
 	Pipes pipeline.Specs
@@ -97,14 +98,21 @@ func Open(ctx context.Context, cfg *config.Config, log *slog.Logger, needSource 
 		e.Close()
 		return nil, err
 	}
+	tel := &telemetry{}
 	e.Embed = embedclient.New(cfg.EmbedderURL(), cfg.Embedder.Timeout.Duration, cfg.Embedder.RequestsPerSecond, cfg.Embedder.Burst,
 		cfg.Embedder.Retry.InitialBackoff.Duration, cfg.Embedder.Retry.MaxBackoff.Duration, embedclient.Hooks{
-			OnRetry: func(string) { metrics.Retries.WithLabelValues("embedder").Inc() },
+			OnRetry: func(reason string) { tel.Retry(config.LocalProvider, "unavailable", 0) },
 			OnRequest: func(outcome string, d time.Duration, n int) {
-				metrics.EmbedRequests.WithLabelValues(outcome).Inc()
-				metrics.EmbedRequestSeconds.Observe(d.Seconds())
+				tel.Request(config.LocalProvider, outcome, d, n)
+				if outcome == "ok" {
+					tel.Embedded(config.LocalProvider, n, embedclient.Usage{})
+				}
 			},
 		})
+	if e.Providers, err = buildProviders(cfg, e.Embed); err != nil {
+		e.Close()
+		return nil, err
+	}
 	return e, nil
 }
 
@@ -120,5 +128,5 @@ func (e *Env) Close() {
 
 // ModelIdentity returns the encoder identity used in fingerprints.
 func ModelIdentity(g *store.Generation) transform.ModelIdentity {
-	return transform.ModelIdentity{Name: g.ModelName, Revision: g.ModelRevision, DocumentPrefix: g.DocumentPrefix}
+	return g.Encoder()
 }

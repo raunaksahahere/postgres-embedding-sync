@@ -58,20 +58,19 @@ func (c *vectorCache) put(fp, vec string) {
 // forwarded immediately so several can embed concurrently; the committer
 // waits for each unit's ready channel in order.
 type EmbedStage struct {
-	Client    *embedclient.Client
+	Providers *embedclient.Set
 	Store     *store.Store
 	Specs     Specs
 	BatchSize int
 	Log       *slog.Logger
 
-	sem   chan struct{}
 	cache *vectorCache
 }
 
-// NewEmbedStage bounds concurrent embedding requests.
-func NewEmbedStage(c *embedclient.Client, st *store.Store, specs Specs, batch, concurrency int, log *slog.Logger) *EmbedStage {
-	return &EmbedStage{Client: c, Store: st, Specs: specs, BatchSize: batch, Log: log,
-		sem: make(chan struct{}, concurrency), cache: newVectorCache(4096)}
+// NewEmbedStage embeds through each generation's provider; the providers
+// bound their own concurrency and batch sizes.
+func NewEmbedStage(ps *embedclient.Set, st *store.Store, specs Specs, batch int, log *slog.Logger) *EmbedStage {
+	return &EmbedStage{Providers: ps, Store: st, Specs: specs, BatchSize: batch, Log: log, cache: newVectorCache(4096)}
 }
 
 // Run forwards units from in to out after dispatching their embedding work.
@@ -91,6 +90,7 @@ func (e *EmbedStage) Run(ctx context.Context, in <-chan *Unit, out chan<- *Unit)
 
 type job struct {
 	gen    *GenInfo
+	prov   embedclient.Provider
 	fps    []string
 	inputs []string
 }
@@ -145,9 +145,16 @@ func (e *EmbedStage) dispatch(ctx context.Context, u *Unit) {
 			}
 			missing = rest
 		}
-		for i := 0; i < len(missing); i += e.BatchSize {
-			end := min(i+e.BatchSize, len(missing))
-			j := job{gen: gi}
+		prov, err := e.Providers.For(gi.Gen.Provider.Name, gi.Gen.Provider.Kind)
+		if err != nil {
+			u.err = err
+			close(u.ready)
+			return
+		}
+		batch := max(1, min(e.BatchSize, prov.MaxBatch()))
+		for i := 0; i < len(missing); i += batch {
+			end := min(i+batch, len(missing))
+			j := job{gen: gi, prov: prov}
 			for _, fp := range missing[i:end] {
 				j.fps = append(j.fps, fp)
 				j.inputs = append(j.inputs, gi.Model.DocumentPrefix+need[fp])
@@ -165,17 +172,18 @@ func (e *EmbedStage) dispatch(ctx context.Context, u *Unit) {
 		wg.Add(1)
 		go func(j job) {
 			defer wg.Done()
-			select {
-			case e.sem <- struct{}{}:
-			case <-ctx.Done():
+			release, err := e.Providers.Slot(ctx, j.prov.Name())
+			if err != nil {
 				mu.Lock()
-				u.err = ctx.Err()
+				u.err = err
 				mu.Unlock()
 				return
 			}
-			defer func() { <-e.sem }()
-			vecs, rejected, err := e.Client.Embed(ctx, embedclient.Request{
-				Model: j.gen.Gen.ModelName, Revision: j.gen.Gen.ModelRevision, Kind: embedclient.Document, Inputs: j.inputs})
+			defer release()
+			g := j.gen.Gen
+			vecs, rejected, err := j.prov.Embed(ctx, embedclient.Request{
+				Model: g.ModelName, Revision: g.ModelRevision, Kind: embedclient.Document, Inputs: j.inputs,
+				Dimensions: g.Provider.RequestDimensions, Expect: g.Dimension, InputType: g.Provider.DocumentInputType})
 			mu.Lock()
 			defer mu.Unlock()
 			if err != nil {

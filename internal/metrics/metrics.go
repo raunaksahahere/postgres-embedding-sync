@@ -41,6 +41,31 @@ var (
 	EmbedRequestSeconds = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: "embedsync_embed_request_seconds", Help: "Embedding request latency.",
 		Buckets: prometheus.ExponentialBuckets(0.01, 2, 12)})
+	// ProviderRequests counts embedding requests per provider and outcome
+	// (ok, rejected, throttled, unavailable, invalid, error).
+	ProviderRequests = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "embedsync_provider_requests_total", Help: "Embedding requests per provider and outcome."}, []string{"provider", "outcome"})
+	// ProviderRequestSeconds is per-provider request latency.
+	ProviderRequestSeconds = prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Name: "embedsync_provider_request_seconds", Help: "Embedding request latency per provider.",
+		Buckets: []float64{.01, .025, .05, .1, .25, .5, 1, 2.5, 5, 10, 30}}, []string{"provider"})
+	// ProviderRetries counts retries per provider and reason; ProviderRetryWait sums the waits.
+	ProviderRetries = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "embedsync_provider_retries_total", Help: "Embedding retries per provider and reason (throttled, unavailable, invalid)."}, []string{"provider", "reason"})
+	ProviderRetryWait = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "embedsync_provider_retry_wait_seconds_total", Help: "Time spent waiting before embedding retries (incl. Retry-After)."}, []string{"provider"})
+	// ProviderInputs counts inputs embedded per provider.
+	ProviderInputs = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "embedsync_provider_inputs_total", Help: "Inputs embedded per provider."}, []string{"provider"})
+	// ProviderTokens counts tokens per provider; source is reported (by the
+	// provider) or estimated (input bytes / 4).
+	ProviderTokens = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "embedsync_provider_tokens_total", Help: "Embedding tokens per provider (reported by the provider or estimated)."}, []string{"provider", "source"})
+	// ProviderCost is an ESTIMATED cost: tokens x the configured price,
+	// labelled with the pricing source the price was taken from.
+	ProviderCost = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "embedsync_provider_estimated_cost_usd_total", Help: "ESTIMATED embedding cost in USD (tokens x configured price per million); see pricing_source."},
+		[]string{"provider", "pricing_source"})
 	// Retries counts retried operations.
 	Retries = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "embedsync_retries_total", Help: "Retried operations by component."}, []string{"component"})
@@ -123,7 +148,7 @@ var (
 func init() {
 	Registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		CommitToSearchable, SourceTransactions, Changes, DocsApplied, Embeddings, EmbeddingsSkipped, EmbedRequests,
-		EmbedRequestSeconds, Retries, Quarantined, QueueDepth, PendingTransactions, OldestPendingAge, FreshnessLag,
+		EmbedRequestSeconds, ProviderRequests, ProviderRequestSeconds, ProviderRetries, ProviderRetryWait, ProviderInputs, ProviderTokens, ProviderCost, Retries, Quarantined, QueueDepth, PendingTransactions, OldestPendingAge, FreshnessLag,
 		CheckpointLSN, ServerWALEnd, RetainedWAL, ConfirmedLag, SlotSafeWAL, SlotActive, SlotWALStatus, Unresolved,
 		ConsumerState, LastMessageAge, LastProgressAge, SinkCommitSeconds, BackfillRows, BackfillWindows, GenerationInfo, Serving,
 		AlertThreshold, SearchRequests, SearchSeconds)

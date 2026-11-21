@@ -2,6 +2,7 @@ package embedclient
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -65,3 +66,57 @@ func (c *Client) Name() string { return "local" }
 // MaxBatch implements Provider. The built-in embedder accepts any batch the
 // pipeline forms (embedder.batch_size bounds it).
 func (c *Client) MaxBatch() int { return 1 << 20 }
+
+// Set holds every configured provider. Callers resolve the provider that
+// built a generation by the name and kind recorded with it, so a query is
+// always embedded by the same endpoint and settings as the documents.
+type Set struct {
+	byName map[string]Provider
+	kinds  map[string]string
+	conc   map[string]chan struct{}
+}
+
+// NewSet creates an empty set.
+func NewSet() *Set {
+	return &Set{byName: map[string]Provider{}, kinds: map[string]string{}, conc: map[string]chan struct{}{}}
+}
+
+// Add registers a provider of a kind with a concurrency bound (concurrent
+// requests across the pipeline).
+func (s *Set) Add(p Provider, kind string, concurrency int) {
+	s.byName[p.Name()] = p
+	s.kinds[p.Name()] = kind
+	s.conc[p.Name()] = make(chan struct{}, max(concurrency, 1))
+}
+
+// For returns the provider a generation was built with. A provider that is
+// no longer configured, or is now configured with another kind, is an
+// error: its vectors could not be compared with new ones.
+func (s *Set) For(name, kind string) (Provider, error) {
+	if name == "" {
+		name, kind = "local", "local"
+	}
+	p, ok := s.byName[name]
+	if !ok {
+		return nil, fmt.Errorf("embedding provider %q is not configured (a generation was built with it)", name)
+	}
+	if kind != "" && s.kinds[name] != kind {
+		return nil, fmt.Errorf("embedding provider %q is now of kind %q but a generation was built with kind %q", name, s.kinds[name], kind)
+	}
+	return p, nil
+}
+
+// Slot bounds concurrent requests to a provider: it blocks until a slot is
+// free (or ctx ends) and returns the release function.
+func (s *Set) Slot(ctx context.Context, name string) (func(), error) {
+	c, ok := s.conc[name]
+	if !ok {
+		return func() {}, nil
+	}
+	select {
+	case c <- struct{}{}:
+		return func() { <-c }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}

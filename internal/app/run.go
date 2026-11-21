@@ -578,7 +578,7 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 		RefKeys:  e.Store.RefKeys,
 		RootKeys: e.Store.KeysAfter,
 		LoadGen:  e.Store.Generation, ModelOf: ModelIdentity}
-	embed := pipeline.NewEmbedStage(e.Embed, e.Store, e.Pipes, cfg.Embedder.BatchSize, cfg.Embedder.Concurrency, e.Log)
+	embed := pipeline.NewEmbedStage(e.Providers, e.Store, e.Pipes, cfg.Embedder.BatchSize, e.Log)
 	committer := &pipeline.Committer{Cfg: cfg, Store: e.Store, Specs: e.Pipes, Progress: progress, Planner: planner, Log: e.Log}
 	reader := &pipeline.Reader{Conn: conn, Cfg: cfg, Specs: e.Pipes, Progress: progress, Out: items, StartLSN: cp.LSN, AcceptedSig: acceptedSig, Log: e.Log}
 	bf := &pipeline.Backfill{Cfg: cfg, Specs: e.Pipes, Source: e.Source, Store: e.Store, Registry: registry, Log: e.Log}

@@ -47,7 +47,7 @@ type Migrator struct {
 	Trs      map[string]*transform.Transformer // per pipeline
 	Log      *slog.Logger
 	Searcher *search.Searcher
-	Embed    *embedclient.Client
+	Embed    *embedclient.Set
 	Out      io.Writer
 }
 
@@ -78,6 +78,7 @@ type GateResult struct {
 // ModelMetrics summarises one generation on the evaluation set.
 type ModelMetrics struct {
 	Generation    string  `json:"generation"`
+	Provider      string  `json:"provider"`
 	Model         string  `json:"model"`
 	Revision      string  `json:"revision"`
 	RecallAt10    float64 `json:"recall_at_10"`
@@ -774,18 +775,20 @@ func LoadQrels(path string) (map[string]map[string]float64, error) {
 }
 
 func (m *Migrator) embedQueries(ctx context.Context, gen string, qs []Query) ([]string, error) {
-	model, rev, prefix, dim, err := m.Searcher.QueryEncoder(ctx, gen)
+	enc, err := m.Searcher.Encoder(ctx, gen)
 	if err != nil {
 		return nil, err
 	}
+	dim := enc.Dim
 	out := make([]string, len(qs))
 	for i := 0; i < len(qs); i += 64 {
 		end := min(i+64, len(qs))
-		inputs := make([]string, 0, end-i)
+		texts := make([]string, 0, end-i)
 		for _, q := range qs[i:end] {
-			inputs = append(inputs, prefix+q.Text)
+			texts = append(texts, q.Text)
 		}
-		vecs, rej, err := m.Embed.Embed(ctx, embedclient.Request{Model: model, Revision: rev, Kind: embedclient.Query, Inputs: inputs})
+		inputs := texts
+		vecs, rej, err := enc.Provider.Embed(ctx, enc.Request(texts...))
 		if err != nil {
 			return nil, err
 		}
@@ -861,11 +864,11 @@ func (m *Migrator) quality(ctx context.Context, rep *GateReport, from, to string
 		if err != nil {
 			return nil, err
 		}
-		model, rev, _, _, err := m.Searcher.QueryEncoder(ctx, gen)
+		enc, err := m.Searcher.Encoder(ctx, gen)
 		if err != nil {
 			return nil, err
 		}
-		return &perGen{vecs: vecs, mm: &ModelMetrics{Generation: gen, Model: model, Revision: rev}}, nil
+		return &perGen{vecs: vecs, mm: &ModelMetrics{Generation: gen, Model: enc.Model, Revision: enc.Revision, Provider: enc.Provider.Name()}}, nil
 	}
 	a, err := prep(from)
 	if err != nil {
