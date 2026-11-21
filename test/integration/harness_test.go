@@ -118,6 +118,82 @@ type fakeEmbedder struct {
 	// done records "<first input>" in completion order (when recordDone).
 	recordDone atomic.Bool
 	doneLog    []string
+
+	// OpenAI-compatible endpoint (/v1/embeddings) faults: the next
+	// throttleN requests get 429 with Retry-After: retryAfter seconds; the
+	// next malformedN get a 200 with one embedding missing. outage applies.
+	throttleN    atomic.Int64
+	retryAfter   atomic.Int64
+	malformedN   atomic.Int64
+	openaiCalls  atomic.Int64
+	openaiInputs atomic.Int64
+}
+
+const mockAPIKey = "it-secret-key"
+
+func (f *fakeEmbedder) handleOpenAI(w http.ResponseWriter, r *http.Request) {
+	f.openaiCalls.Add(1)
+	if r.Header.Get("Authorization") != "Bearer "+mockAPIKey {
+		http.Error(w, `{"error":{"message":"bad key"}}`, http.StatusUnauthorized)
+		return
+	}
+	if f.outage.Load() {
+		http.Error(w, `{"error":{"message":"down"}}`, http.StatusServiceUnavailable)
+		return
+	}
+	if f.throttleN.Load() > 0 {
+		f.throttleN.Add(-1)
+		w.Header().Set("Retry-After", strconv.FormatInt(f.retryAfter.Load(), 10))
+		http.Error(w, `{"error":{"message":"rate limited"}}`, http.StatusTooManyRequests)
+		return
+	}
+	var req struct {
+		Model      string
+		Input      []string
+		Dimensions int
+		InputType  string `json:"input_type"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), 400)
+		return
+	}
+	if !strings.HasPrefix(req.Model, "fake/") {
+		http.Error(w, `{"error":{"message":"unknown model"}}`, 404)
+		return
+	}
+	if bad := f.reject.Load().(string); bad != "" {
+		for _, s := range req.Input {
+			if strings.Contains(s, bad) {
+				http.Error(w, `{"error":{"message":"input rejected by policy"}}`, 400)
+				return
+			}
+		}
+	}
+	kind := "document"
+	if strings.HasPrefix(strings.Join(req.Input, ""), "query: ") || req.InputType == "query" {
+		kind = "query"
+	}
+	f.mu.Lock()
+	f.log = append(f.log, fmt.Sprintf("openai %s %s %d", req.Model, kind, len(req.Input)))
+	f.mu.Unlock()
+	type item struct {
+		Index     int       `json:"index"`
+		Embedding []float32 `json:"embedding"`
+	}
+	var data []item
+	tokens := 0
+	for i, s := range req.Input {
+		data = append(data, item{Index: i, Embedding: encode(req.Model, s)})
+		tokens += len(strings.Fields(s))
+	}
+	if f.malformedN.Load() > 0 && len(data) > 1 {
+		f.malformedN.Add(-1)
+		data = data[:len(data)-1] // one embedding short: invalid
+	} else {
+		f.openaiInputs.Add(int64(len(req.Input)))
+	}
+	json.NewEncoder(w).Encode(map[string]any{"object": "list", "model": req.Model, "data": data,
+		"usage": map[string]int{"prompt_tokens": tokens, "total_tokens": tokens}})
 }
 
 const dim = 64
@@ -193,6 +269,10 @@ func encode(model, text string) []float32 {
 }
 
 func (f *fakeEmbedder) handle(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v1/embeddings" {
+		f.handleOpenAI(w, r)
+		return
+	}
 	if r.URL.Path == "/healthz" {
 		w.Write([]byte(`{"status":"ok"}`))
 		return
@@ -306,6 +386,8 @@ type envOpts struct {
 	embedBatch int
 	// binary runs every command with this binary instead of the current one.
 	binary string
+	// initialGen overrides initial_generation (default v1).
+	initialGen string
 }
 
 func randHex(n int) string {
@@ -376,6 +458,7 @@ func newEnv(t *testing.T, o envOpts) *env {
 		"EMBEDSYNC_READER_DSN="+dsnFor(adminDSN, "embedsync_reader", "it-reader", e.db),
 		"EMBEDSYNC_SOURCE_ADMIN_DSN="+dsnFor(adminDSN, "", "", e.db),
 		"EMBEDSYNC_SINK_ADMIN_DSN="+dsnFor(adminDSN, "", "", e.db),
+		"EMBEDSYNC_IT_MOCK_KEY="+mockAPIKey,
 	)
 	e.writeConfig()
 	t.Cleanup(e.cleanup)
@@ -393,6 +476,25 @@ func (e *env) writeConfig() {
   v2: {name: fake/bowalt, revision: rev1, dimension: 64, distance: cosine, query_prefix: "query: ", document_prefix: "passage: ", hnsw: {m: 16, ef_construction: 64, ef_search: 100}}
   v2b: {name: fake/bowalt, revision: rev1, dimension: 64, distance: cosine, query_prefix: "query: ", document_prefix: "passage: ", hnsw: {m: 8, ef_construction: 64, ef_search: 100}}
   bad: {name: fake/noise, revision: rev1, dimension: 64, distance: cosine}`
+	providers := ""
+	if o.binary == "" { // older binaries in upgrade tests reject unknown config fields
+		models += `
+  pv1: {provider: mock, name: fake/bow, revision: rev1, dimension: 64, distance: cosine, hnsw: {m: 16, ef_construction: 64, ef_search: 100}}
+  pv2: {provider: mock, name: fake/bowalt, revision: rev1, dimension: 64, distance: cosine, query_prefix: "query: ", document_prefix: "passage: ", hnsw: {m: 16, ef_construction: 64, ef_search: 100}}
+  pbad: {provider: mock, name: fake/noise, revision: rev1, dimension: 64, distance: cosine}`
+		providers = fmt.Sprintf(`
+providers:
+  mock:
+    kind: openai
+    url: %s/v1
+    api_key_env: EMBEDSYNC_IT_MOCK_KEY
+    timeout: 5s
+    batch_size: 8
+    concurrency: 2
+    retry: {initial_backoff: 20ms, max_backoff: 300ms}
+    max_retry_after: 3s
+    pricing: {usd_per_million_tokens: 0.02, source: "integration test fixture (not a real price)"}`, e.emb.srv.URL)
+	}
 	eval := ""
 	if o.evalQueries != "" {
 		eval = fmt.Sprintf("\n  eval_queries: %s\n  eval_qrels: %s", o.evalQueries, o.evalQrels)
@@ -407,6 +509,10 @@ func (e *env) writeConfig() {
 	}
 	if o.views != "" {
 		tables, pipes = "", pipes+"\nviews:\n"+o.views
+	}
+	initialGen := o.initialGen
+	if initialGen == "" {
+		initialGen = "v1"
 	}
 	embedBatch := o.embedBatch
 	if embedBatch == 0 {
@@ -426,7 +532,8 @@ embedder:
   requests_per_second: 0
   retry: {initial_backoff: 20ms, max_backoff: 300ms}
 models:%s
-initial_generation: v1
+%s
+initial_generation: %s
 pipeline:
   tx_queue: 16
   max_inflight_units: 4
@@ -444,7 +551,7 @@ migration:
   catchup_timeout: 60s%s
   gates: {min_ann_recall_at_10: 0.9, noninferiority_margin_ndcg: 0.02, noninferiority_margin_recall: 0.02, bootstrap_samples: 1000, seed: 7, require_zero_unresolved: true}
 metrics: {listen: "127.0.0.1:%d"}
-`, tables, e.slot, pipes, o.chunkWords, o.chunkOverlap, e.emb.srv.URL, embedBatch, models, o.onPoison, o.batch, eval, e.port)
+`, tables, e.slot, pipes, o.chunkWords, o.chunkOverlap, e.emb.srv.URL, embedBatch, models, providers, initialGen, o.onPoison, o.batch, eval, e.port)
 	e.cfgPath = filepath.Join(e.dir, "embedsync.yaml")
 	if err := os.WriteFile(e.cfgPath, []byte(cfg), 0o600); err != nil {
 		e.t.Fatal(err)
