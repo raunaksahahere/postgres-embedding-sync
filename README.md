@@ -335,6 +335,36 @@ zero unresolved rows and catch-up.
 
 Methodology and full reports: [docs/evaluation.md](docs/evaluation.md).
 
+## Several tables
+
+One `embedsync run` can sync several tables through one publication, one replication slot
+and one embedder. Each table is a named *pipeline* with its own key columns, allowlisted
+fields and template; a primary key may span several columns:
+
+```yaml
+pipelines:
+  - name: default
+    table: public.documents
+    key: id
+    fields: [{name: title, column: title}, {name: body, column: body}]
+  - name: tickets
+    table: support.tickets
+    key: [tenant_id, id]
+    fields: [{name: subject, column: subject}, {name: body, column: body}]
+    transform: {template: "Ticket: {{.subject}}\n\n{{.body}}"}
+```
+
+* A document is identified by `(pipeline, key)`, so ids may repeat across tables. Search
+  hits carry `"pipeline"`; `"key"` is the column value for a one-column key and a JSON
+  array of the column values for a composite key (`["7","42"]`).
+* A transaction that writes several of these tables is applied in one sink transaction.
+* The single-table form (`source.table`, `source.key`, `source.fields`, which `embedsync
+  setup` writes) stays valid: it is the pipeline `default`. An existing installation keeps
+  serving its documents after `embedsync init` upgrades the sink schema. To add a table,
+  name the existing one `default` under `pipelines:`, add the new one, run `embedsync init`
+  and restart `run`. See [`examples/embedsync-multi.yaml`](examples/embedsync-multi.yaml)
+  and [operations](docs/operations.md#upgrades).
+
 ## Commands
 
 
@@ -402,7 +432,7 @@ Postgres tables into pgvector with transactional guarantees.
   all-MiniLM-L6-v2 on the benchmark laptop); sustained writes above that grow the
   backlog (freshness alerts fire, WAL is retained up to `max_slot_wal_keep_size`).
 * A pause (schema change, `on_poison: pause`, unresolvable TOAST) stops freshness for
-  the table until an operator acts.
+  every synced table (they share one stream) until an operator acts.
 * Search is eventually consistent with the source (see the measured latency).
 * The benchmark is one laptop and synthetic write workloads; your numbers will differ.
 * Installers: macOS builds are Apple silicon only (PyTorch no longer publishes Intel

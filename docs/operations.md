@@ -128,7 +128,8 @@ a failover without synced slots, treat it as slot loss.
   migration rebuilds each chunk table's primary key, which takes a lock for a time
   proportional to the table; searches wait meanwhile. Downgrading after `init` is not
   supported (the old binary refuses to start on the upgraded checkpoint).
-* **Adding a table**: move the existing table under `pipelines:` with the name `default`
+* **Adding a table** (example: [`examples/embedsync-multi.yaml`](../examples/embedsync-multi.yaml)):
+  move the existing table under `pipelines:` with the name `default`
   (any other name would be a new, empty pipeline), add the new pipeline, run
   `embedsync init` (grants its columns to the replicator role and adds it to the
   publication with its column list) and restart `run`. The new pipeline is registered,

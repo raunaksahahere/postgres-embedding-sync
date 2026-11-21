@@ -76,7 +76,9 @@ The wizard:
    you to restart PostgreSQL and run setup again.
 2. Lists the tables that have a supported primary key (single column: integer, bigint,
    smallint, text, varchar or uuid). You pick a table and the columns to embed. Only
-   those columns are ever read or published.
+   those columns are ever read or published. Setup configures one table (the pipeline
+   `default`); for several tables or composite keys, edit the config as in
+   [`examples/embedsync-multi.yaml`](../examples/embedsync-multi.yaml).
 3. Asks for the embedding model: a bundled one, or any Hugging Face model.
 4. Creates three least-privilege roles (`embedsync_replicator`, `embedsync_sink`,
    `embedsync_reader`) with random passwords, the publication, and the `embedsync`
