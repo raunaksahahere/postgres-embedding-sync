@@ -106,12 +106,12 @@ type Ref struct {
 // "<view>:root", "<view>:<child>", "<view>:<link>" or "<view>:<link>.target";
 // a colon cannot appear in a pipeline name, so names never collide.
 type Component struct {
-	Def     PipelineDef
-	View    *ViewDef
-	Kind    ComponentKind
-	Child   *ChildDef
-	Link    *LinkDef
-	Refs []Ref
+	Def   PipelineDef
+	View  *ViewDef
+	Kind  ComponentKind
+	Child *ChildDef
+	Link  *LinkDef
+	Refs  []Ref
 	// OrderCols orders a child's rows (columns, possibly key columns);
 	// OrderFields orders a link's targets (target field names). Ties are
 	// broken by the child or target key.
@@ -184,7 +184,7 @@ func (v *ViewDef) Components() []*Component {
 	for i := range v.Children {
 		ch := &v.Children[i]
 		comp := &Component{View: v, Kind: CompChild, Child: ch,
-			Def:  compDef(ComponentName(v.Name, ch.Name), ch.Table, ch.Key, ch.Fields, append(append([]string{}, ch.Parent...), ch.OrderBy...)),
+			Def:       compDef(ComponentName(v.Name, ch.Name), ch.Table, ch.Key, ch.Fields, append(append([]string{}, ch.Parent...), ch.OrderBy...)),
 			Refs:      []Ref{{Name: "parent", Columns: ch.Parent, To: root.Def.Name}},
 			OrderCols: ch.OrderBy}
 		out = append(out, comp)
@@ -194,8 +194,8 @@ func (v *ViewDef) Components() []*Component {
 		target := &Component{View: v, Kind: CompTarget, Link: l,
 			Def: compDef(ComponentName(v.Name, l.Name+".target"), l.TargetTable, l.TargetKey, l.TargetFields, nil)}
 		link := &Component{View: v, Kind: CompLink, Link: l,
-			Def: compDef(ComponentName(v.Name, l.Name), l.Table, l.Key, nil, append(append([]string{}, l.Parent...), l.Target...)),
-			Refs: []Ref{{Name: "parent", Columns: l.Parent, To: root.Def.Name}, {Name: "target", Columns: l.Target, To: target.Def.Name}},
+			Def:         compDef(ComponentName(v.Name, l.Name), l.Table, l.Key, nil, append(append([]string{}, l.Parent...), l.Target...)),
+			Refs:        []Ref{{Name: "parent", Columns: l.Parent, To: root.Def.Name}, {Name: "target", Columns: l.Target, To: target.Def.Name}},
 			OrderFields: l.OrderBy}
 		out = append(out, link, target)
 	}
