@@ -525,6 +525,11 @@ func legacyBinary(t *testing.T) string {
 	if ref == "" {
 		ref = "v0.2.0"
 	}
+	return binaryAt(t, ref)
+}
+
+// binaryAt builds embedsync at a git ref of this repository.
+func binaryAt(t *testing.T, ref string) string {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "src")
 	if err := os.MkdirAll(src, 0o755); err != nil {

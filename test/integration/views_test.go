@@ -158,6 +158,38 @@ func TestViewAcceptance(t *testing.T) {
 	if !strings.Contains(string(b), "kb=view") || !strings.Contains(string(b), "kb:sections=view_table") {
 		t.Fatalf("status pipelines: %s", b)
 	}
+
+	// A document the embedder rejects is quarantined (stale chunks removed),
+	// a later section edit re-renders and re-quarantines it, and a replay
+	// after the cause is gone restores it.
+	e.emb.reject.Store("POISONWORD")
+	e.exec(`UPDATE kb_sections SET body = 'contains POISONWORD' WHERE tenant_id = 2 AND id = 801`)
+	waitFor(t, 20*time.Second, "view quarantine", func() bool {
+		return e.scalar(`SELECT count(*)::text FROM embedsync.dlq WHERE state = 'open' AND pipeline = 'kb' AND source_key = '["2","8"]'`) == "1"
+	})
+	if d := e.kbDoc("v1", `["2","8"]`); d != "" {
+		t.Fatalf("a quarantined view document must not be served: %q", d)
+	}
+	e.emb.reject.Store("")
+	if out, err := e.cli("dlq", "replay"); err != nil || !strings.Contains(out, `"resolved": 1`) {
+		t.Fatalf("view dlq replay: %v %s", err, out)
+	}
+	e.requireConsistent("after view dlq replay")
+
+	// A model migration rebuilds the view from state (render job only) and
+	// the coverage gate assembles it from the sink's state.
+	e.emb.reject.Store("")
+	out, err := e.cli("migrate", "--to", "v2")
+	if err != nil {
+		t.Fatalf("migrate a view to v2: %v\n%s", err, out)
+	}
+	if k := e.scalar(`SELECT string_agg(kind, ',' ORDER BY kind) FROM embedsync.backfill_jobs WHERE generation_id = 'v2'`); k != "render" {
+		t.Fatalf("v2 jobs: %s", k)
+	}
+	r = e.requireConsistent("after migrating the view to v2")
+	if len(r.Generations) != 2 || r.Generations[1].Pipelines["kb"].ActualChunks == 0 {
+		t.Fatalf("both generations must hold the view: %s", r)
+	}
 	p.stop(t)
 }
 
@@ -323,6 +355,68 @@ func TestViewFanoutLimitPauses(t *testing.T) {
 	e.requireConsistent("after raising the limit")
 	if n := e.scalar(`SELECT count(DISTINCT source_key)::text FROM embedsync.chunks_v1 WHERE content LIKE '%everywhere%'`); n != "60" {
 		t.Fatalf("rename reached %s of 60 documents", n)
+	}
+	p.stop(t)
+}
+
+// A populated v0.3.0 installation (several pipelines, composite keys) is
+// upgraded by init (sink/0003_views.sql): nothing is re-embedded or
+// rewritten, and a view added afterwards is backfilled in place.
+func TestUpgradeFrom030AddsView(t *testing.T) {
+	old := binaryAt(t, "v0.3.0")
+	e := newEnv(t, envOpts{binary: old, pipelines: multiPipelines, setupSQL: append(append([]string{}, multiSetup...), kbSetup...)})
+	e.seedMulti(80, 2, 30)
+	p := e.start()
+	e.waitReady()
+	waitFor(t, 60*time.Second, "v0.3.0 backfill", e.jobsDone)
+	e.requireConsistent("v0.3.0 installation")
+	before := e.chunkRows("chunks_v1", "")
+	p.stop(t)
+
+	e.bin = binary
+	if out, err := e.cli("status"); err == nil || !strings.Contains(out, "run `embedsync init`") {
+		t.Fatalf("status against a v0.3.0 sink must ask for init: %v %s", err, out)
+	}
+	out, err := e.cli("init")
+	if err != nil || !strings.Contains(out, "sink: applied sink/0003_views.sql") {
+		t.Fatalf("upgrade init: %v %s", err, out)
+	}
+	embeds := e.emb.embeds.Load()
+	p = e.start()
+	e.waitReady()
+	time.Sleep(2 * time.Second)
+	if n := e.emb.embeds.Load() - embeds; n != 0 {
+		t.Fatalf("the upgrade re-embedded %d inputs", n)
+	}
+	if got := e.chunkRows("chunks_v1", ""); fmt.Sprint(got) != fmt.Sprint(before) {
+		t.Fatal("the upgrade rewrote chunks")
+	}
+	e.requireConsistent("after upgrading to views")
+	p.stop(t)
+
+	// Add a view over the kb tables in place.
+	e.seedKB(2, 10, 3)
+	e.opts.views = kbView
+	e.writeConfig()
+	if out, err := e.cli("init"); err != nil || !strings.Contains(out, "added public.kb_documents") {
+		t.Fatalf("init adding a view: %v %s", err, out)
+	}
+	p = e.start()
+	e.waitReady()
+	waitFor(t, 90*time.Second, "view state and render backfill", e.jobsDone)
+	e.exec(`UPDATE kb_sections SET document_id = 3 WHERE tenant_id = 1 AND id = 201`)
+	r := e.requireConsistent("after adding a view to an upgraded installation")
+	requirePipelines(t, r, "docs", "notes", "tickets")
+	if r.Pipelines["kb:root"].SourceRows == 0 || r.Pipelines["kb:sections"].SourceRows == 0 {
+		t.Fatalf("verify did not compare the view's tables: %s", r)
+	}
+	for _, g := range r.Generations {
+		if c := g.Pipelines["kb"]; c.ActualChunks == 0 || c.Missing+c.Extra+c.Stale != 0 {
+			t.Fatalf("generation %s view kb: %+v", g.Generation, c)
+		}
+	}
+	if k := e.scalar(`SELECT string_agg(DISTINCT kind, ',' ORDER BY kind) FROM embedsync.backfill_jobs`); k != "embed,render,state" {
+		t.Fatalf("job kinds %s", k)
 	}
 	p.stop(t)
 }
