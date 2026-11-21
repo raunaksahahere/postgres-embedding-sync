@@ -222,6 +222,10 @@ func (d *doctor) sinkSchema(ctx context.Context, conn *pgx.Conn, cfg *config.Con
 			"`embedsync init --admin-url <admin URL>` (see docs/install.md, Upgrading)", n, want)
 		return
 	}
+	if n > want {
+		d.fail("sink: schema version %d is newer than this embedsync supports (%d): use the embedsync version that upgraded it", n, want)
+		return
+	}
 	d.ok("sink: pgvector %s, schema v%d", vec, n)
 }
 

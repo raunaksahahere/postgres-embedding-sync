@@ -167,7 +167,10 @@ func (c *Committer) apply(ctx context.Context, u *Unit) error {
 			return err
 		}
 		if p.Final {
-			if _, err := tx.Exec(ctx, `UPDATE `+c.Store.T("generations")+` SET state = 'ready', ready_at = now() WHERE id = $1 AND state = 'building'`, p.Gen); err != nil {
+			// A generation is ready once every pipeline's backfill into it is
+			// complete, not when the first one finishes.
+			if _, err := tx.Exec(ctx, `UPDATE `+c.Store.T("generations")+` SET state = 'ready', ready_at = now() WHERE id = $1 AND state = 'building'
+				AND NOT EXISTS (SELECT 1 FROM `+c.Store.T("backfill_jobs")+` WHERE generation_id = $1 AND state IN ('pending', 'running'))`, p.Gen); err != nil {
 				return err
 			}
 		}

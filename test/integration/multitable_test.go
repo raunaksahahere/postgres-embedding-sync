@@ -253,6 +253,47 @@ func TestMultiPipelineAcceptance(t *testing.T) {
 	if slots := e.scalar(`SELECT count(*)::text FROM pg_replication_slots WHERE database = $1`, e.db); slots != "1" {
 		t.Fatalf("expected one replication slot, got %s", slots)
 	}
+
+	// A model migration covers every pipeline: the candidate is ready only
+	// after all three backfills (one job each), and the coverage gate checks
+	// every table. Writers keep running across all tables meanwhile.
+	e.emb.delayMS.Store(5)
+	w2 := e.startCrossWriters(2, 99, 60*time.Millisecond)
+	done := make(chan struct{})
+	var early atomic.Value
+	go func() {
+		defer close(done)
+		for {
+			// The candidate must not be ready while one of its jobs is open.
+			st := e.scalar(`SELECT coalesce((SELECT state FROM embedsync.generations WHERE id = 'v2'), '') || ':' ||
+				(SELECT count(*) FROM embedsync.backfill_jobs WHERE generation_id = 'v2' AND state IN ('pending','running'))::text`)
+			if strings.HasPrefix(st, "ready:") && st != "ready:0" {
+				early.CompareAndSwap(nil, st)
+			}
+			if strings.HasPrefix(st, "ready:0") || strings.HasPrefix(st, "active:") || strings.HasPrefix(st, "rejected:") {
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	out, err := e.cli("migrate", "--to", "v2")
+	<-done
+	e.emb.delayMS.Store(0)
+	w2.halt()
+	if v := early.Load(); v != nil {
+		t.Fatalf("candidate was ready with backfill jobs still open (%v)", v)
+	}
+	if err != nil {
+		t.Fatalf("migrate across pipelines: %v\n%s", err, out)
+	}
+	if n := e.scalar(`SELECT count(*)::text FROM embedsync.backfill_jobs WHERE generation_id = 'v2'`); n != "3" {
+		t.Fatalf("expected one v2 backfill job per pipeline, got %s", n)
+	}
+	r = e.requireConsistent("after migrating every pipeline to v2")
+	requirePipelines(t, r, "docs", "notes", "tickets")
+	if s := e.scalar(`SELECT generation_id FROM embedsync.serving`); s != "v2" {
+		t.Fatalf("serving %s", s)
+	}
 	p.stop(t)
 }
 

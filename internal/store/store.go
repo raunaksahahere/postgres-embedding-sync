@@ -440,7 +440,12 @@ func (s *Store) AddPipelines(ctx context.Context, genID string, add map[string]s
 				return err
 			}
 		}
-		return nil
+		// A candidate that was ready is not complete any more: it becomes
+		// ready again when the new pipelines' backfills finish. Serving and
+		// rollback generations keep their state and fill in the new tables.
+		_, err := tx.Exec(ctx, `UPDATE `+s.T("generations")+` SET state = 'building', ready_at = NULL WHERE id = $1 AND state = 'ready'
+			AND NOT EXISTS (SELECT 1 FROM `+s.T("serving")+` WHERE generation_id = $1 OR previous_generation_id = $1)`, genID)
+		return err
 	})
 }
 

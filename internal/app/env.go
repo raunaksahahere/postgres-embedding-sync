@@ -65,6 +65,9 @@ func Open(ctx context.Context, cfg *config.Config, log *slog.Logger, needSource 
 	} else if have < want {
 		st.Close()
 		return nil, &ErrSinkSchemaOutdated{Have: have, Want: want}
+	} else if have > want {
+		st.Close()
+		return nil, fmt.Errorf("the sink schema is at version %d, newer than this embedsync supports (%d): use the embedsync version that upgraded it", have, want)
 	}
 	if needSource {
 		srcDSN, err := config.Env(cfg.Source.DSNEnv)
