@@ -12,7 +12,10 @@ mkdir -p "$work/opt" "$work/usr/bin" "$work/DEBIAN" "$OUT"
 cp -R "$PAYLOAD" "$work/opt/embedsync"
 ln -s /opt/embedsync/embedsync "$work/usr/bin/embedsync"
 size=$(du -sk "$work/opt" | cut -f1)
-others=$(for v in nomodel minilm full; do [ "$v" != "$VARIANT" ] && printf 'embedsync-%s, ' "$v"; done)
+others=""
+for v in nomodel minilm full; do
+  if [ "$v" != "$VARIANT" ]; then others="${others}embedsync-${v}, "; fi
+done
 cat > "$work/DEBIAN/control" <<CTRL
 Package: ${pkg}
 Version: ${VERSION}

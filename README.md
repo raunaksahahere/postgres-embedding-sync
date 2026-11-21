@@ -29,7 +29,7 @@ Each comes in three variants. They differ only in which embedding models are inc
 |---|---|---|---|
 | `minilm` | all-MiniLM-L6-v2 | ~290 MB | you want to start right away (recommended) |
 | `nomodel` | none: setup downloads any Hugging Face model you name | ~210 MB | you know which model you want |
-| `full` | all-MiniLM-L6-v2, bge-small-en-v1.5, paraphrase-MiniLM-L3-v2 | ~480 MB | offline machines, or comparing models with `migrate` |
+| `full` | all-MiniLM-L6-v2, bge-small-en-v1.5, paraphrase-MiniLM-L3-v2 | ~410 MB | offline machines, or comparing models with `migrate` |
 
 Then, in a terminal:
 

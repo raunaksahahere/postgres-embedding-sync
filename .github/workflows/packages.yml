@@ -86,7 +86,11 @@ jobs:
           if [ ! -x "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ]; then choco install innosetup --no-progress -y; fi
           echo "ISCC=/c/Program Files (x86)/Inno Setup 6/ISCC.exe" >> "$GITHUB_ENV"
       - name: Build installers
-        run: packaging/build.sh "$(cat VERSION)" ${{ matrix.goos }} ${{ matrix.goarch }} build/embedder-dist build/out
+        run: |
+          # Inno Setup's compiler is not long-path aware and torch's bundled license
+          # tree is deep: stage the Windows payload in a short directory.
+          if [ "${{ matrix.goos }}" = windows ]; then export WORK=/c/esb; fi
+          packaging/build.sh "$(cat VERSION)" ${{ matrix.goos }} ${{ matrix.goarch }} build/embedder-dist build/out
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: installers-${{ matrix.goos }}-${{ matrix.goarch }}
