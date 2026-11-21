@@ -1,17 +1,123 @@
-# postgres-embedding-sync
+<p align="center">
+  <img src="docs/assets/banner.svg" alt="embedsync: keep pgvector search current as PostgreSQL rows change. Logical replication in, vectors out, one transaction with the checkpoint." width="100%">
+</p>
 
-Keep pgvector search current as PostgreSQL rows change. `embedsync` reads a table
-through logical replication, re-embeds only what changed, and writes chunks and
-vectors to pgvector **in the same transaction as its replication checkpoint**, so a
-crash can neither lose nor duplicate an effect. It measures how long a commit takes
-to become searchable, and switches embedding models (blue/green, gated, reversible)
+<p align="center">
+  <a href="https://github.com/raunaksahahere/postgres-embedding-sync/actions/workflows/ci.yml"><img src="https://github.com/raunaksahahere/postgres-embedding-sync/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
+  <a href="https://github.com/raunaksahahere/postgres-embedding-sync/releases/latest"><img src="https://img.shields.io/github/v/release/raunaksahahere/postgres-embedding-sync?color=7c3aed&label=release" alt="Latest release"></a>
+  <img src="https://img.shields.io/badge/Go-1.27-00ADD8?logo=go&logoColor=white" alt="Go 1.27">
+  <img src="https://img.shields.io/badge/PostgreSQL-16%20%7C%2017%20%7C%2018-336791?logo=postgresql&logoColor=white" alt="PostgreSQL 16, 17 and 18">
+  <img src="https://img.shields.io/badge/pgvector-0.8-22c55e" alt="pgvector 0.8">
+  <img src="https://img.shields.io/badge/installers-Windows%20%7C%20macOS%20%7C%20Linux-475569" alt="Installers for Windows, macOS and Linux">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License: Apache-2.0"></a>
+  <img src="https://img.shields.io/badge/status-alpha-orange" alt="Status: alpha">
+</p>
+
+<p align="center">
+  <a href="#install"><b>Install</b></a> ·
+  <a href="#what-it-handles"><b>What it handles</b></a> ·
+  <a href="#how-it-works"><b>How it works</b></a> ·
+  <a href="#results"><b>Results</b></a> ·
+  <a href="#limitations"><b>Limitations</b></a> ·
+  <a href="#documentation"><b>Documentation</b></a>
+</p>
+
+---
+
+**Keep pgvector search current as PostgreSQL rows change, without losing or duplicating a single update.**
+
+Embeddings go stale the moment the row behind them changes. The usual fixes are a cron job that
+re-embeds everything, or a trigger that fills a queue that a worker drains every few seconds:
+both leave search wrong for seconds to minutes, and a crash between "embedded" and "recorded" can
+lose or repeat work. **embedsync** reads the table through **logical replication**, re-embeds only
+the chunks that changed, and writes the vectors to pgvector **in the same transaction as its
+replication checkpoint**, so a crash can neither lose nor duplicate an effect. It measures how long
+a commit takes to become searchable, and switches embedding models (blue/green, gated, reversible)
 while serving searches.
 
-* Go service (pgx, pglogrepl), a local CPU embedding service (sentence-transformers,
-  pinned revisions, no API key), PostgreSQL 16/17/18 with pgvector.
+* Go service (pgx, pglogrepl), a local CPU embedding service (sentence-transformers, pinned
+  revisions, no API key), PostgreSQL 16, 17 or 18 with pgvector.
 * Status: **v0.2.0**, single table, single process. See [limitations](#limitations).
 
+```mermaid
+flowchart LR
+  A0(["Cron or trigger + queue"]):::bad --> A1[row changes] --> A2["queue or next batch<br/>10 s to 60 s tick"] --> A3["embed, then record<br/>crash in between:<br/>lost or repeated"]:::bad
+  B0(["embedsync"]):::good --> B1[row changes] --> B2["WAL stream<br/>pgoutput"] --> B3["re-embed only<br/>changed chunks"] --> B4[("pgvector<br/>vectors + checkpoint<br/>one transaction")] --> B5(["searchable in ~35 ms<br/>p50, up to 30 rows/s"]):::good
+  classDef bad fill:#fee2e2,stroke:#ef4444,color:#7f1d1d
+  classDef good fill:#dcfce7,stroke:#22c55e,color:#14532d
+```
+
+```console
+$ embedsync search "replication slot filling the disk with WAL"
+generation minilm (sentence-transformers/all-MiniLM-L6-v2@1110a243fd) embed 11.8ms query 2.1ms
+ 1. [1] 0.855  Replication slots and disk usage An inactive replication slot keeps WAL on disk until its consumer confirms it…
+ 2. [2] 0.031  Indoor cat care Cats need shelves to climb and a quiet place to sleep.
+ 3. [3] -0.010  Sourdough basics Feed the starter flour and water every day.
+
+$ psql -c "UPDATE documents SET title = 'Keeping an indoor cat happy', body = 'Indoor cats need climbing shelves, ...' WHERE id = 2" \
+       -c "DELETE FROM documents WHERE id = 1"
+
+$ embedsync search "how do I entertain my indoor cat"
+generation minilm (sentence-transformers/all-MiniLM-L6-v2@1110a243fd) embed 11.8ms query 2.1ms
+ 1. [2] 0.705  Keeping an indoor cat happy Indoor cats need climbing shelves, daily play with a wand toy and a scratching pos…
+ 2. [3] 0.100  Sourdough basics Feed the starter flour and water every day.
+
+$ embedsync search "replication slot filling the disk with WAL"
+generation minilm (sentence-transformers/all-MiniLM-L6-v2@1110a243fd) embed 11.6ms query 1.9ms
+ 1. [2] 0.056  Keeping an indoor cat happy Indoor cats need climbing shelves, daily play with a wand toy and a scratching pos…
+ 2. [3] -0.010  Sourdough basics Feed the starter flour and water every day.
+
+$ embedsync verify
+boundary 0/16BF970 checkpoint 0/16BF970 source rows 2
+source_state: missing=0 extra=0 stale=0
+minilm: chunks expected=2 actual=2 missing=0 extra=0 stale=0 quarantined_keys=0
+ok=true
+```
+
+<sub>A real run of the installed v0.2.0 on a laptop: the three-row table was set up with `embedsync setup`, the bundled all-MiniLM-L6-v2 embedder started by `embedsync run`, PostgreSQL 17 with pgvector 0.8.7. The edit and delete were searchable within a second of the commit; the [benchmarks](#results) measure the latency properly.</sub>
+
+## Three answers from `verify`, and nothing in between
+
+`embedsync verify` compares **every row of the source** with **every chunk in the sink** at one replication boundary.
+
+| Result | Exit | Meaning |
+|---|:-:|---|
+| ✅ **ok** | `0` | Zero missing, zero extra, zero stale chunks for every generation, at one consistent boundary. |
+| ❌ **differences** | `4` | The sink differs from the source. The report counts them per generation. |
+| ⚠️ **error** | `1` | The check could not run (for example the checkpoint never reached the barrier). It is never reported as ok. |
+
+## What it handles
+
+Each row is covered by a named integration test against real PostgreSQL 16, 17 and 18
+([guarantees](docs/guarantees.md)).
+
+| What goes wrong | What embedsync does | Lost or duplicated |
+|---|---|:-:|
+| `kill -9` before the sink commit, or after it but before feedback | the effects and the checkpoint LSN are one transaction; feedback reports only the durable LSN | 0 |
+| Aborted transactions, concurrent writers | pgoutput only delivers committed transactions; whole transactions are applied | 0 |
+| Backfill running while rows are inserted, updated, deleted and re-keyed | watermark windows consumed in the same stream; deletes are never resurrected | 0 |
+| The embedding service is down | retries with jittered backoff, nothing is acknowledged, the backlog drains on return | 0 |
+| A row the embedder rejects (poison) | quarantined atomically in a versioned dead-letter queue (or pause); replay with `embedsync dlq replay` | 0 |
+| Schema change on the source table | the stream pauses before acknowledging; you accept it with `--accept-schema-change` | 0 |
+| Replication slot lost | detected on restart; `embedsync rebuild --confirm` recovers into a fresh generation | 0 |
+| Secret columns next to the text | only allowlisted columns are published, granted and selected | none leave the source |
+| Switching to a worse model | candidate generation must pass coverage, catch-up and quality gates; rollback window | readers see 0 errors |
+
+## Why embedsync
+
+| | Feature | What it means |
+|:-:|---|---|
+| 🔁 | **Transactional checkpoint** | Vectors, the dead-letter queue and the replication position commit together. No window in which a crash loses or repeats work. |
+| ⚡ | **Millisecond freshness** | A commit is searchable in a median of 33 to 35 ms up to 30 rows/s on a laptop CPU; trigger + queue and periodic batches take seconds to minutes ([results](#results)). |
+| 🧩 | **Re-embeds only what changed** | Per-chunk fingerprints over text, transform and model revision skip unchanged chunks and remove obsolete ones. |
+| 🔀 | **Blue/green model migration** | Build a new generation next to the live one, gate it, promote atomically, roll back within a window. Queries stay pinned to the encoder of the generation they hit. |
+| 🛡️ | **Least privilege** | Separate replicator, sink and read-only roles; column-level grants; credentials only from environment variables. |
+| 📦 | **Install and run** | Windows, macOS and Debian/Ubuntu installers with the embedding service inside; `embedsync setup` walks you through it. |
+| 📈 | **Observable** | Prometheus metrics, a Grafana dashboard, alert rules, `embedsync status` and a runbook ([operations](docs/operations.md)). |
+| 🔌 | **No API key** | A local CPU embedder with pinned model revisions; any sentence-transformers model works. |
+
 ## Install
+
 
 Download one installer from the [latest release](https://github.com/raunaksahahere/postgres-embedding-sync/releases/latest).
 Everything is included, the embedding service as well. You don't need Python, Docker
@@ -51,6 +157,7 @@ On macOS, use *System Settings → Privacy & Security → Open Anyway* or
 Details, uninstalling and the CLI-only archives are covered in [docs/install.md](docs/install.md).
 
 ## Try the demo with Docker (no install)
+
 
 Requirements: Docker with Compose v2.24+, ~3 GB RAM, ~2 GB disk.
 
@@ -97,7 +204,45 @@ es migrate status            # persisted gate reports
 es migrate rollback          # back to the previous generation (rollback window: 30 min)
 ```
 
+## How it works
+
+```mermaid
+flowchart LR
+  T[("source table<br/>allowlisted columns")] -->|"publication<br/>with column list"| SLOT["logical<br/>replication slot"]
+  SLOT --> RD["reader<br/>whole transactions"] --> PL["planner<br/>fingerprints, TOAST"] --> EM["embed stage<br/>batching, retries"] --> CM["committer<br/>one transaction"]
+  CM --> SINK[("sink schema<br/>chunks per generation + HNSW<br/>checkpoint, DLQ, progress")]
+  CM -. "feedback = durable LSN only" .-> SLOT
+  EM <--> EMB["embedder<br/>sentence-transformers<br/>pinned revisions"]
+  BF["backfill<br/>bounded PK scans<br/>low/high markers"] --> T
+  CLI["embedsync CLI<br/>setup, status, search,<br/>verify, migrate"] --> API["/search /status /metrics<br/>migration gates"]
+  API --> SINK
+  API <--> EMB
+  API -- metrics --> PROM[("Prometheus<br/>Grafana")]
+```
+
+1. **Follow.** An explicit publication with a column list (the key plus allowlisted columns) and
+   the backfill marker table feeds a logical slot. Whole transactions are read; source and slot
+   identity are checked on restart.
+2. **Plan.** Each change becomes chunks with deterministic IDs and fingerprints over text,
+   transform and model revision. Unchanged chunks are skipped, obsolete ones removed, unchanged
+   TOAST values resolved from stored state or deferred.
+3. **Embed.** Bounded queues, rate limiting and jittered retries talk to the local embedder. Rows it
+   rejects are quarantined in a persistent, versioned DLQ (`embedsync dlq list|inspect|replay`), or the
+   pipeline pauses by policy.
+4. **Commit.** Effects, DLQ records, progress and the end LSN go into **one sink transaction**.
+   Standby feedback reports only that durable position, also on keepalives, so the slot never moves
+   ahead of what is safely stored.
+5. **Backfill.** Watermark windows with committed low/high markers are consumed in the same stream,
+   so snapshot rows yield to concurrent changes. Deletes, key changes and truncate are reconciled and
+   progress is resumable.
+6. **Migrate.** Each model gets its own chunk tables; queries are pinned to the generation's encoder
+   (even for equal-dimension models). Promotion happens only after coverage, catch-up and quality
+   gates, with a rollback window and resumable migrations.
+
+More: [docs/architecture.md](docs/architecture.md) and [docs/guarantees.md](docs/guarantees.md).
+
 ## Results
+
 
 All numbers below were produced by `make bench` on one laptop
 (AMD Ryzen 5 5600H with Radeon Graphics, 12 threads, 7.1 GB RAM, embedder limited to 4 torch threads; PostgreSQL 17.12 (Debian 17.12-1.pgdg12+1), pgvector 0.8.7, embedsync 0.1.0 at commit `aec93ac`) and are stored with seeds and commands in
@@ -188,33 +333,8 @@ zero unresolved rows and catch-up.
 
 Methodology and full reports: [docs/evaluation.md](docs/evaluation.md).
 
-## How it works
-
-```
-source table ──pgoutput──▶ reader ─▶ planner ─▶ embed ─▶ committer ──▶ chunks_<generation> (pgvector)
-      ▲                      │ feedback = durable LSN only        └─ same transaction: effects,
-      └── low/high markers ◀─ backfill (bounded PK scans)              DLQ, progress, checkpoint
-```
-
-* **CDC**: explicit publication with a column list (key + allowlisted columns) plus
-  the backfill marker table; whole transactions; idempotent effects and the end LSN in
-  one sink transaction; standby feedback only up to durable progress, also on
-  keepalives; source/slot identity checks on restart.
-* **Chunks**: deterministic chunk IDs, fingerprints over text + transform + model
-  revision, unchanged chunks skipped, obsolete chunks removed, unchanged TOAST resolved
-  or paused, schema changes pause before acknowledging; bounded queues, rate limiting,
-  jittered retries, graceful shutdown; poison rows quarantined atomically in a
-  persistent, versioned DLQ (`embedsync dlq list|inspect|replay`) or pause.
-* **Backfill**: watermark windows with committed low/high markers consumed in the
-  stream; deletes, key changes and truncate reconciled; resumable progress stored with
-  the effects.
-* **Generations**: per-model chunk tables and metadata; queries pinned to the
-  generation's encoder (even for equal-dimension models); promotion only after
-  coverage, catch-up and quality gates; rollback window; resumable migrations.
-
-More: [docs/architecture.md](docs/architecture.md).
-
 ## Commands
+
 
 | command | |
 |---|---|
@@ -241,10 +361,12 @@ a private localhost port and stops it on exit.
 
 ## Operations
 
+
 [docs/operations.md](docs/operations.md): roles and least privilege, retained WAL and
 alerts, pauses, DLQ, slot loss and rebuild, upgrades, model cache and offline use.
 
 ## Comparison
+
 
 | | embedsync | [CocoIndex Postgres source][coco] | [Pathway][pw] | [Supabase automatic embeddings][supa] |
 |---|---|---|---|---|
@@ -269,6 +391,7 @@ one Postgres table into pgvector with transactional guarantees.
 
 ## Limitations
 
+
 * One source table per process, single-column primary key (int, text or uuid); no
   joins, no hybrid (lexical) search, no external vector stores (v1 scope).
 * Throughput is bounded by the CPU embedding model (~70 short documents/s for
@@ -282,7 +405,20 @@ one Postgres table into pgvector with transactional guarantees.
   macOS wheels); Linux packages need glibc 2.28+. Intel Macs and other systems can use
   the CLI-only archives with the Docker embedder. The installers are not code-signed.
 
-## Development
+## Documentation
+
+| | |
+|---|---|
+| 🚀 [Install guide](docs/install.md) | Installers, variants, first run, uninstall, CLI-only archives |
+| 🧱 [Architecture](docs/architecture.md) | Data path, idle vs. stalled, watermark backfill, generations, failure handling, code map |
+| 🛡️ [Guarantees](docs/guarantees.md) | What is promised, the mechanism, and the test that tries to break it |
+| 🧯 [Operations](docs/operations.md) | Roles and least privilege, retained WAL and alerts, pauses, DLQ, slot loss, upgrades |
+| 📊 [Evaluation](docs/evaluation.md) | Methodology for the freshness, outage and SciFact migration results |
+| 🧭 [Changelog](CHANGELOG.md) | Release history |
+
+<details>
+<summary><b>Development</b></summary>
+
 
 | suite | command |
 |---|---|
@@ -296,7 +432,10 @@ one Postgres table into pgvector with transactional guarantees.
 | release archives + install check | `make release-check` |
 | native installers (on each OS; CI: `.github/workflows/packages.yml`) | `packaging/build.sh <version> <goos> <goarch> <embedder_dist> <out>` |
 
+</details>
+
 ## License
+
 
 Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) (models and the SciFact
 dataset are downloaded at run time, not redistributed).
