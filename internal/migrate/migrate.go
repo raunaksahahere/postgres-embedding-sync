@@ -307,17 +307,30 @@ func (m *Migrator) Migrate(ctx context.Context, target string, o Options) (*Gate
 		return nil, fmt.Errorf("serving generation changed from %s to %s since the migration started; finalize or roll back first", from, sv.GenerationID)
 	}
 
-	if mg.Step == "backfill" {
-		if err := m.waitReady(ctx, g.ID, o.PollEvery); err != nil {
-			return nil, err
-		}
-		mg.Step = "catchup"
-		if err := m.setStep(ctx, mg.ID, mg.Step, "running", nil, ""); err != nil {
-			return nil, err
-		}
-	}
 	var boundary pglogrepl.LSN
-	if mg.Step == "catchup" {
+	for {
+		// A candidate can go from ready back to building after the backfill
+		// step: `embedsync run` extends live generations to newly configured
+		// pipelines (store.AddPipelines) and backfills them. Gating it then
+		// finds the new pipeline's chunks missing and rejects a candidate that
+		// is merely incomplete, so before catch-up and before the gate (also on
+		// resume) re-check readiness and go back to the backfill step. Catch-up
+		// then takes a fresh barrier, so an older boundary never reaches the gate.
+		if err := m.recheckReady(ctx, mg, g.ID); err != nil {
+			return nil, err
+		}
+		if mg.Step == "backfill" {
+			if err := m.waitReady(ctx, g.ID, o.PollEvery); err != nil {
+				return nil, err
+			}
+			mg.Step = "catchup"
+			if err := m.setStep(ctx, mg.ID, mg.Step, "running", nil, ""); err != nil {
+				return nil, err
+			}
+		}
+		if mg.Step != "catchup" {
+			break
+		}
 		boundary, err = m.Barrier(ctx, g.ID)
 		if err != nil {
 			return nil, err
@@ -337,7 +350,9 @@ func (m *Migrator) Migrate(ctx context.Context, target string, o Options) (*Gate
 		if err := m.setStep(ctx, mg.ID, mg.Step, "running", nil, ""); err != nil {
 			return nil, err
 		}
-	} else if mg.BoundaryLSN != nil {
+	}
+	if boundary == 0 && mg.BoundaryLSN != nil {
+		// Resumed at gate/promote with a ready candidate: use the persisted boundary.
 		boundary, _ = pglogrepl.ParseLSN(*mg.BoundaryLSN)
 	}
 	var rep *GateReport
@@ -376,6 +391,38 @@ func (m *Migrator) Migrate(ctx context.Context, target string, o Options) (*Gate
 		m.printf("promoted %s; %s stays current until the rollback window ends (%s)", g.ID, from, m.Cfg.Migration.RollbackWindow.Duration)
 	}
 	return rep, nil
+}
+
+// resumeStep returns the step to continue a migration at, given its candidate
+// generation's state: catch-up and the gate need a ready candidate, so they go
+// back to backfill otherwise. Other steps are unchanged.
+func resumeStep(step, genState string) string {
+	if (step == "catchup" || step == "gate") && genState != store.StateReady {
+		return "backfill"
+	}
+	return step
+}
+
+// recheckReady reloads the candidate and, if a migration at catchup or gate
+// no longer has a ready candidate, persists the step back to backfill.
+func (m *Migrator) recheckReady(ctx context.Context, mg *Migration, gen string) error {
+	if mg.Step != "catchup" && mg.Step != "gate" {
+		return nil
+	}
+	g, err := m.Store.Generation(ctx, gen)
+	if err != nil {
+		return err
+	}
+	if g == nil {
+		return fmt.Errorf("generation %s not found", gen)
+	}
+	next := resumeStep(mg.Step, g.State)
+	if next == mg.Step {
+		return nil
+	}
+	m.printf("candidate %s is %s, not ready (e.g. a pipeline was added); back to the backfill step before catch-up", gen, g.State)
+	mg.Step, mg.BoundaryLSN = next, nil
+	return m.setStep(ctx, mg.ID, mg.Step, "running", nil, "")
 }
 
 func (m *Migrator) waitReady(ctx context.Context, gen string, poll time.Duration) error {
