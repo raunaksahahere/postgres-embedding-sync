@@ -37,6 +37,7 @@ cat > "$work/DEBIAN/postinst" <<'SH'
 #!/bin/sh
 set -e
 echo "embedsync installed. Next: run 'embedsync setup' in a terminal."
+echo "Upgrading? Stop 'embedsync run', then run 'embedsync init --admin-url <admin URL>' before starting it again."
 SH
 chmod 0755 "$work/DEBIAN/postinst"
 deb="$OUT/embedsync-${VERSION}-${VARIANT}-linux-${ARCH}.deb"

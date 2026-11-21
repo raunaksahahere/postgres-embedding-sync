@@ -40,7 +40,8 @@ Getting started:
   model list|add           list bundled/configured models, add one from Hugging Face
 
 Commands:
-  init                     apply source/sink SQL migrations (admin DSNs)
+  init [--admin-url URL]   apply source/sink SQL migrations (admin URL or admin DSNs);
+                           run it after an upgrade, before starting embedsync run
   run                      stream changes, backfill, serve /metrics /status /search
   backfill                 queue a watermark backfill for a generation
   status                   show checkpoint, slot, generations, DLQ, migrations
@@ -220,6 +221,7 @@ func cmdInit(ctx context.Context, args []string) error {
 	reader := c.fs.String("reader-role", "embedsync_reader", "read-only search role")
 	srcEnv := c.fs.String("source-admin-dsn-env", "EMBEDSYNC_SOURCE_ADMIN_DSN", "env var with the source admin DSN")
 	sinkEnv := c.fs.String("sink-admin-dsn-env", "EMBEDSYNC_SINK_ADMIN_DSN", "env var with the sink admin DSN")
+	adminURL := c.fs.String("admin-url", "", "admin connection URL for a side whose admin DSN env var is not set, e.g. postgres://postgres:secret@localhost:5432/app (or $"+adminURLEnv+")")
 	_ = c.fs.Parse(args)
 	cfg, _, err := c.load()
 	if err != nil {
@@ -232,9 +234,9 @@ func cmdInit(ctx context.Context, args []string) error {
 	}
 	roles := dbinit.Roles{Replicator: *repl, Sink: *sink, Reader: *reader}
 	for _, side := range []struct{ name, env string }{{"source", *srcEnv}, {"sink", *sinkEnv}} {
-		dsn, err := config.Env(side.env)
+		dsn, err := resolveAdminDSN(side.env, *adminURL, os.Getenv)
 		if err != nil {
-			return err
+			return fmt.Errorf("%s: %w", side.name, err)
 		}
 		conn, err := pgx.Connect(ctx, dsn)
 		if err != nil {
@@ -262,6 +264,32 @@ func cmdInit(ctx context.Context, args []string) error {
 		}
 	}
 	return nil
+}
+
+// adminURLEnv is the variable `embedsync setup` reads its admin URL from.
+const adminURLEnv = "EMBEDSYNC_ADMIN_URL"
+
+// resolveAdminDSN picks one side's admin DSN for `embedsync init`: the env var
+// envName if it is set, else the --admin-url value, else $EMBEDSYNC_ADMIN_URL.
+// Setup uses one database for source and sink, so one admin URL serves both.
+// The error never contains a DSN (they carry passwords).
+func resolveAdminDSN(envName, flagURL string, getenv func(string) string) (string, error) {
+	if envName != "" {
+		if v := getenv(envName); v != "" {
+			return v, nil
+		}
+	}
+	if flagURL != "" {
+		return flagURL, nil
+	}
+	if v := getenv(adminURLEnv); v != "" {
+		return v, nil
+	}
+	opts := "pass --admin-url postgres://user:password@host:5432/dbname or set " + adminURLEnv
+	if envName != "" {
+		opts = "set " + envName + ", " + opts
+	}
+	return "", errors.New("no admin connection: " + opts)
 }
 
 func cmdRun(ctx context.Context, args []string) error {

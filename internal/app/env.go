@@ -39,7 +39,8 @@ func (e *Env) Trs() map[string]*transform.Transformer { return e.Pipes.Transform
 type ErrSinkSchemaOutdated struct{ Have, Want int }
 
 func (e *ErrSinkSchemaOutdated) Error() string {
-	return fmt.Sprintf("the sink schema is at version %d but this embedsync needs version %d: run `embedsync init` (with the admin DSNs) to upgrade it, see docs/operations.md", e.Have, e.Want)
+	return fmt.Sprintf("the sink schema is at version %d but this embedsync needs version %d: stop `embedsync run`, then run `embedsync init` to upgrade it: "+
+		"`embedsync init --admin-url <postgres admin URL>` (or set EMBEDSYNC_SOURCE_ADMIN_DSN / EMBEDSYNC_SINK_ADMIN_DSN); see docs/operations.md", e.Have, e.Want)
 }
 
 // Open connects to sink and source and builds the transformer and embed client.

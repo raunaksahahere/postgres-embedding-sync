@@ -122,6 +122,30 @@ Models that are not bundled are downloaded once into your user cache
 `%LocalAppData%\embedsync\hf`). The embedder log is `embedder.log` in the same
 `embedsync` cache folder. Private or gated Hugging Face models need `HF_TOKEN` set.
 
+## Upgrading
+
+A new release can change embedsync's tables in your database. To upgrade:
+
+1. Stop `embedsync run` (Ctrl-C, or stop the service that runs it).
+2. Install the new package the same way as above. Your config, credentials and cache
+   stay in place.
+3. Upgrade the database with an administrator connection to the database you chose in
+   setup. Like in setup, the password is used for this step only and is never stored:
+
+   ```sh
+   embedsync init --admin-url 'postgres://postgres:...@host/db'
+   ```
+
+   It prints what it applied, or `up to date`. Instead of the flag you can set
+   `EMBEDSYNC_ADMIN_URL`. If `EMBEDSYNC_SOURCE_ADMIN_DSN` and `EMBEDSYNC_SINK_ADMIN_DSN`
+   are set (as in the Docker Compose stack), plain `embedsync init` uses those.
+4. Start `embedsync run` again.
+
+Nothing is re-embedded: the checkpoint, generations and DLQ carry over. Until `init` has
+run, every command stops and asks you to "run `embedsync init`". Downgrading after
+`init` is not supported: the older version refuses to start against the upgraded
+database. Details: [operations](operations.md#upgrades).
+
 ## Uninstall
 
 * **Windows:** *Settings → Apps → embedsync → Uninstall*. This also removes the PATH entry.

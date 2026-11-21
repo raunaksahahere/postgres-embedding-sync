@@ -373,7 +373,7 @@ pipelines:
 | `embedsync setup [--yes --admin-url U --table T --columns a,b --model M]` | guided first-run setup (installed packages) |
 | `embedsync doctor [--skip-embedder]` | check installation, config, database and embedder |
 | `embedsync model list \| add <owner/name[@rev]>` | list models, add one from Hugging Face |
-| `embedsync init` | create control objects, publication and sink schema (admin DSNs) |
+| `embedsync init [--admin-url URL]` | create control objects, publication and sink schema; apply upgrades (admin URL or admin DSNs) |
 | `embedsync run [--accept-schema-change]` | stream, backfill, serve `/metrics` `/status` `/search` `/readyz` |
 | `embedsync backfill [--generation G] [--pipeline P] [--wait]` | queue a watermark re-scan |
 | `embedsync status [--json]` | checkpoint, slot and retained WAL, generations, DLQ, migrations |

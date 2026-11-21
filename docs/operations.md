@@ -120,7 +120,7 @@ a failover without synced slots, treat it as slot loss.
   command checks the sink schema version and refuses (with "run `embedsync init`") to
   work against an older schema.
 * **From a single-table release (v0.2.0 and earlier) to pipelines**: stop `run`, replace
-  the binary, run `embedsync init` with the admin DSNs (it applies
+  the binary, run `embedsync init` with the admin DSNs or `--admin-url` (it applies
   `sink/0002_pipelines.sql`: existing rows of `source_state`, every chunk table, `dlq` and
   `backfill_jobs` become the pipeline `default`, and the accepted relation moves to
   `pipeline_relations`), then start `run` with the unchanged config. Nothing is
