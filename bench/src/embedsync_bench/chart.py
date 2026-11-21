@@ -51,7 +51,7 @@ def latency_chart() -> None:
     ax.set_ylabel("commit → searchable (s, log scale)")
     ax.set_title("Freshness measured by an independent reader")
     ax.grid(True, which="both", alpha=0.25)
-    ax.legend(fontsize=7.5, loc="upper left", ncol=1)
+    ax.legend(fontsize=7.5, loc="upper left", bbox_to_anchor=(1.01, 1.0), ncol=1, frameon=False)
     _save(fig, "freshness_latency")
 
 
