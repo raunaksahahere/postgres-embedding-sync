@@ -23,6 +23,7 @@ package pipeline
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,14 +34,54 @@ import (
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/keys"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/store"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/transform"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/viewdoc"
 )
 
-// Spec is the runtime view of one configured pipeline.
+// Spec is the runtime view of one configured pipeline, one view (a document
+// pipeline without a table of its own) or one view component (a table whose
+// rows only feed state; it has no transformer).
 type Spec struct {
-	Def   *config.PipelineDef
+	Def   *config.PipelineDef // nil for a view
 	Name  string
-	Codec keys.Codec // filled from the source catalog (or the accepted relation)
+	Codec keys.Codec // filled from the source catalog (or the accepted relation); a view uses its root's
 	Tr    *transform.Transformer
+	// ViewDef is set for a view; Comp for a view component.
+	ViewDef *config.ViewDef
+	Comp    *config.Component
+	// View is the view's assembly spec, built once every component's
+	// relation is known (set on the view's Spec).
+	View *viewdoc.ViewSpec
+}
+
+// IsView reports whether the spec is a view (documents assembled from state).
+func (s *Spec) IsView() bool { return s.ViewDef != nil }
+
+// IsComponent reports whether the spec is a table of a view.
+func (s *Spec) IsComponent() bool { return s.Comp != nil }
+
+// NewViewSpec builds a view's transformer; the root codec and assembly spec
+// are set once the components' relations are known.
+func NewViewSpec(v *config.ViewDef) (*Spec, error) {
+	root := make([]string, 0, len(v.Fields))
+	for _, f := range v.Fields {
+		root = append(root, f.Name)
+	}
+	lists := map[string][]string{}
+	for _, ch := range v.Children {
+		for _, f := range ch.Fields {
+			lists[ch.Name] = append(lists[ch.Name], f.Name)
+		}
+	}
+	for _, l := range v.Links {
+		for _, f := range l.TargetFields {
+			lists[l.Name] = append(lists[l.Name], f.Name)
+		}
+	}
+	tr, err := transform.NewView("view:"+v.Name, v.Transform.Template, root, lists, v.Transform.ChunkWords, v.Transform.ChunkOverlap, v.Fingerprint())
+	if err != nil {
+		return nil, fmt.Errorf("view %s: %w", v.Name, err)
+	}
+	return &Spec{Name: v.Name, Tr: tr, ViewDef: v}, nil
 }
 
 // NewSpec builds a pipeline's transformer; the codec is set once key types are known.
@@ -55,7 +96,7 @@ func NewSpec(p *config.PipelineDef) (*Spec, error) {
 // Specs indexes pipelines by name.
 type Specs map[string]*Spec
 
-// NewSpecs builds a Spec for every configured pipeline.
+// NewSpecs builds a Spec for every configured pipeline, view and view component.
 func NewSpecs(cfg *config.Config) (Specs, error) {
 	out := Specs{}
 	for i := range cfg.Pipelines {
@@ -65,15 +106,40 @@ func NewSpecs(cfg *config.Config) (Specs, error) {
 		}
 		out[s.Name] = s
 	}
+	for i := range cfg.Views {
+		s, err := NewViewSpec(&cfg.Views[i])
+		if err != nil {
+			return nil, err
+		}
+		out[s.Name] = s
+	}
+	for _, c := range cfg.Components() {
+		d := c.Def
+		out[d.Name] = &Spec{Def: &d, Name: d.Name, Comp: c}
+	}
 	return out, nil
 }
 
-// Transformers returns each pipeline's transformer.
+// Transformers returns each document pipeline's transformer.
 func (s Specs) Transformers() map[string]*transform.Transformer {
 	out := make(map[string]*transform.Transformer, len(s))
 	for n, p := range s {
-		out[n] = p.Tr
+		if p.Tr != nil {
+			out[n] = p.Tr
+		}
 	}
+	return out
+}
+
+// Views returns the view specs.
+func (s Specs) Views() []*Spec {
+	var out []*Spec
+	for _, p := range s {
+		if p.IsView() {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
@@ -172,6 +238,7 @@ type DocEffect struct {
 	CommitTime time.Time
 	Poison     string // planner-detected poison reason ("" when fine)
 	PoisonErr  string
+	Refs       map[string]string // view component rows: ref name -> referenced key
 }
 
 // RangeDelete removes one pipeline's sink rows inside a backfill window's key
@@ -215,11 +282,14 @@ type GenInfo struct {
 
 // Unit is a group of consecutive source transactions applied in one sink transaction.
 type Unit struct {
-	Seq          uint64
-	EndLSN       LSN
-	Txns         []TxnMeta
-	Truncates    map[string]bool // pipelines truncated in this unit (applied before every other effect)
-	Stream       map[DocID]*DocEffect
+	Seq       uint64
+	EndLSN    LSN
+	Txns      []TxnMeta
+	Truncates map[string]bool // pipelines truncated in this unit (applied before every other effect)
+	Stream    map[DocID]*DocEffect
+	// State holds view component rows: written to source_state and
+	// source_refs only, never embedded.
+	State        map[DocID]*DocEffect
 	Snapshot     map[string]map[DocID]*DocEffect // gen -> doc -> effect
 	RangeDeletes []RangeDelete
 	GenStarts    []GenStart
@@ -236,12 +306,30 @@ type Unit struct {
 	ready    chan struct{}
 	err      error
 	docs     int
+
+	// Planner-only: view documents to render at the end of the unit, and
+	// render windows waiting for the post-unit state.
+	dirty   map[string]map[string]dirtyMark // view -> root key
+	renders []renderReq
+}
+
+// dirtyMark records the latest source change that made a view document stale.
+type dirtyMark struct {
+	lsn LSN
+	ct  time.Time
+}
+
+// renderReq is a render backfill window resolved at the end of a unit.
+type renderReq struct {
+	gi    *GenInfo
+	entry *WindowRows
 }
 
 func newUnit(seq uint64) *Unit {
 	return &Unit{
-		Seq: seq, Truncates: map[string]bool{}, Stream: map[DocID]*DocEffect{}, Snapshot: map[string]map[DocID]*DocEffect{},
-		Gens: map[string]*GenInfo{}, SnapGens: map[string]*GenInfo{},
+		Seq: seq, Truncates: map[string]bool{}, Stream: map[DocID]*DocEffect{}, State: map[DocID]*DocEffect{}, Snapshot: map[string]map[DocID]*DocEffect{},
+		dirty: map[string]map[string]dirtyMark{},
+		Gens:  map[string]*GenInfo{}, SnapGens: map[string]*GenInfo{},
 		Chunks: map[string]map[DocID][]transform.Chunk{}, Vectors: map[string]map[string]string{},
 		Rejected: map[string]map[string]string{}, ready: make(chan struct{}),
 	}

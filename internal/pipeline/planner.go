@@ -31,6 +31,7 @@ type JobLoader interface {
 type JobCursor struct {
 	Pipeline string
 	Last     *string
+	Kind     string // store.JobEmbed, JobState or JobRender
 }
 
 // window tracks one open backfill window. Its pipeline is only known when
@@ -46,6 +47,7 @@ type window struct {
 
 type overlayEntry struct {
 	fields  map[string]*string
+	refs    map[string]string // view component rows: ref name -> referenced key
 	deleted bool
 	seq     uint64
 }
@@ -58,6 +60,9 @@ type Planner struct {
 	Specs     Specs
 	Registry  *Registry
 	Lookup    StateLookup
+	RefLookup RefLookup
+	RefKeys   RefKeysLookup
+	RootKeys  RootKeysLookup
 	LoadGen   GenLoader
 	Jobs      JobLoader
 	ModelOf   func(g *store.Generation) transform.ModelIdentity
@@ -65,8 +70,9 @@ type Planner struct {
 	Live      map[string]*GenInfo  // live generations at startup
 	ActiveJob map[int64]*JobCursor // running/pending backfill jobs
 
-	windows map[string]*window
-	seq     uint64
+	windows  map[string]*window
+	seq      uint64
+	txnDirty map[string]map[string]bool // documents dirtied by the current source transaction, per view
 
 	mu      sync.Mutex
 	overlay map[DocID]*overlayEntry
@@ -122,6 +128,11 @@ func (p *Planner) Run(ctx context.Context, in <-chan Item, out chan<- *Unit) err
 				}
 			}
 		}
+		if u.Pause == nil {
+			if err := p.renderViews(ctx, u); err != nil {
+				return err
+			}
+		}
 		metrics.QueueDepth.WithLabelValues("planner_in").Set(float64(len(in)))
 		select {
 		case out <- u:
@@ -151,6 +162,7 @@ func (p *Planner) add(ctx context.Context, u *Unit, it Item) error {
 		// The paused unit carries no effects and must not advance the checkpoint.
 		return nil
 	}
+	p.txnDirty = map[string]map[string]bool{}
 	for i := range txn.Changes {
 		ch := &txn.Changes[i]
 		var err error
@@ -158,7 +170,11 @@ func (p *Planner) add(ctx context.Context, u *Unit, it Item) error {
 		case KMarker:
 			err = p.marker(ctx, u, txn, ch.Marker)
 		case KTruncate:
-			p.truncate(u, ch.Pipeline)
+			if spec := p.Specs[ch.Pipeline]; spec != nil && spec.IsComponent() {
+				err = p.truncateComponent(ctx, u, txn, spec)
+			} else {
+				p.truncate(u, ch.Pipeline)
+			}
 		default:
 			err = p.row(ctx, u, txn, ch)
 		}
@@ -181,6 +197,11 @@ func (p *Planner) truncate(u *Unit, pipe string) {
 	for id := range u.Stream {
 		if id.Pipeline == pipe {
 			delete(u.Stream, id)
+		}
+	}
+	for id := range u.State {
+		if id.Pipeline == pipe {
+			delete(u.State, id)
 		}
 	}
 	for _, m := range u.Snapshot {
@@ -294,6 +315,9 @@ func (p *Planner) effect(id DocID, fields map[string]*string, lsn LSN, ct time.T
 }
 
 func (p *Planner) row(ctx context.Context, u *Unit, txn *Txn, ch *Change) error {
+	if spec := p.Specs[ch.Pipeline]; spec != nil && spec.IsComponent() {
+		return p.componentRow(ctx, u, txn, ch, spec)
+	}
 	id := DocID{Pipeline: ch.Pipeline, Key: ch.Key}
 	switch ch.Kind {
 	case KDelete:
@@ -361,7 +385,11 @@ func (p *Planner) deferUnchanged(u *Unit, ch *Change, lsn LSN) error {
 			if ch.OldKey != "" {
 				old := DocID{Pipeline: ch.Pipeline, Key: ch.OldKey}
 				p.markChanged(u, old)
-				u.Stream[old] = &DocEffect{ID: old, Delete: true, LSN: lsn}
+				if spec.IsComponent() {
+					u.State[old] = &DocEffect{ID: old, Delete: true, LSN: lsn}
+				} else {
+					u.Stream[old] = &DocEffect{ID: old, Delete: true, LSN: lsn}
+				}
 				p.setOverlay(old, nil, true, u.Seq)
 			}
 			return nil
@@ -387,7 +415,7 @@ func (p *Planner) trackJob(ctx context.Context, id int64) error {
 	if j == nil || (j.State != "pending" && j.State != "running") {
 		return nil
 	}
-	p.ActiveJob[id] = &JobCursor{Pipeline: j.Pipeline, Last: j.LastKey}
+	p.ActiveJob[id] = &JobCursor{Pipeline: j.Pipeline, Last: j.LastKey, Kind: j.Kind}
 	return nil
 }
 
@@ -416,7 +444,7 @@ func (p *Planner) marker(ctx context.Context, u *Unit, txn *Txn, m Marker) error
 		}
 		for _, j := range jobs {
 			if _, ok := p.ActiveJob[j.ID]; !ok {
-				p.ActiveJob[j.ID] = &JobCursor{Pipeline: j.Pipeline, Last: j.LastKey}
+				p.ActiveJob[j.ID] = &JobCursor{Pipeline: j.Pipeline, Last: j.LastKey, Kind: j.Kind}
 			}
 		}
 	case "low":
@@ -428,7 +456,25 @@ func (p *Planner) marker(ctx context.Context, u *Unit, txn *Txn, m Marker) error
 		w := p.windows[m.WindowID]
 		delete(p.windows, m.WindowID)
 		entry := p.Registry.Take(m.WindowID)
+		if entry != nil && entry.Kind == store.JobState {
+			if w == nil || w.dirty[entry.Pipeline] {
+				metrics.BackfillWindows.WithLabelValues("discarded").Inc()
+				entry.Finish("discarded")
+				return nil
+			}
+			p.applyStateWindow(u, w, entry, txn.EndLSN)
+			return nil
+		}
 		gi := p.Live[m.Gen]
+		if entry != nil && entry.Kind == store.JobRender {
+			if w == nil || gi == nil {
+				entry.Finish("discarded")
+				return nil
+			}
+			// Resolved at the end of the unit, against the state after it.
+			u.renders = append(u.renders, renderReq{gi: gi, entry: entry})
+			return nil
+		}
 		if w == nil || entry == nil || gi == nil {
 			if entry != nil {
 				entry.Finish("discarded")
@@ -493,7 +539,7 @@ func (p *Planner) applyWindow(u *Unit, gi *GenInfo, w *window, entry *WindowRows
 	if entry.Final {
 		delete(p.ActiveJob, entry.JobID)
 	} else {
-		p.ActiveJob[entry.JobID] = &JobCursor{Pipeline: pipe, Last: last}
+		p.ActiveJob[entry.JobID] = &JobCursor{Pipeline: pipe, Last: last, Kind: store.JobEmbed}
 	}
 	metrics.BackfillRows.WithLabelValues(gen).Add(float64(len(entry.Rows)))
 	metrics.BackfillWindows.WithLabelValues("applied").Inc()

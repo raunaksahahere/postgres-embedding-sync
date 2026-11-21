@@ -40,10 +40,10 @@ func Backfill(ctx context.Context, e *Env, gen, pipe string, wait bool, out io.W
 	if g == nil || !(store.IsLive(g.State) || g.State == store.StatePending) {
 		return fmt.Errorf("generation %q is not live", gen)
 	}
-	pipes := e.Cfg.PipelineNames()
+	pipes := e.Cfg.DocNames()
 	if pipe != "" {
-		if e.Cfg.Pipe(pipe) == nil {
-			return fmt.Errorf("unknown pipeline %q (configured: %s)", pipe, strings.Join(pipes, ", "))
+		if e.Cfg.Pipe(pipe) == nil && e.Cfg.View(pipe) == nil {
+			return fmt.Errorf("unknown pipeline or view %q (configured: %s)", pipe, strings.Join(pipes, ", "))
 		}
 		pipes = []string{pipe}
 	}
@@ -52,7 +52,26 @@ func Backfill(ctx context.Context, e *Env, gen, pipe string, wait bool, out io.W
 		if _, ok := g.Pipelines[p]; !ok {
 			return fmt.Errorf("generation %s does not cover pipeline %q yet; `embedsync run` extends it at startup", gen, p)
 		}
-		id, err := e.Store.RequestBackfill(ctx, gen, p)
+		if v := e.Cfg.View(p); v != nil {
+			// A view re-scans its tables into state first; its documents
+			// are rendered again once every state job is done.
+			for _, c := range v.Components() {
+				id, err := e.Store.RequestStateBackfill(ctx, c.Def.Name)
+				if err != nil {
+					return err
+				}
+				ids = append(ids, id)
+				fmt.Fprintf(out, "state backfill job %d queued for %s\n", id, c.Def.Name)
+			}
+			id, err := e.Store.RequestBackfill(ctx, gen, p, store.JobRender)
+			if err != nil {
+				return err
+			}
+			ids = append(ids, id)
+			fmt.Fprintf(out, "render job %d queued for %s (view %s)\n", id, gen, p)
+			continue
+		}
+		id, err := e.Store.RequestBackfill(ctx, gen, p, store.JobEmbed)
 		if err != nil {
 			return err
 		}
@@ -101,8 +120,11 @@ type VerifyReport struct {
 	SourceRows    int                            `json:"source_rows"`
 	SourceState   verify.StateReport             `json:"source_state"`
 	Pipelines     map[string]*PipelineVerifyRows `json:"pipelines"`
-	Generations   []*verify.GenReport            `json:"generations"`
-	OK            bool                           `json:"ok"`
+	// ViewOrphans counts child and link rows whose parent document does not
+	// exist (reported, not an error).
+	ViewOrphans int                 `json:"view_orphan_rows"`
+	Generations []*verify.GenReport `json:"generations"`
+	OK          bool                `json:"ok"`
 }
 
 // PipelineVerifyRows is one pipeline's source and source_state comparison.
@@ -147,9 +169,14 @@ func Verify(ctx context.Context, e *Env, timeout time.Duration) (*VerifyReport, 
 	}
 	rep := &VerifyReport{BoundaryLSN: b.String(), CheckpointLSN: cp.String(), OK: true, Pipelines: map[string]*PipelineVerifyRows{}}
 	var rows verify.Rows
-	// Every pipeline's table is read in one source snapshot.
+	var views map[string]verify.ViewDocs
+	// Every table is read, and every view assembled with SQL joins,
+	// in one source snapshot.
 	err = pgx.BeginTxFunc(ctx, e.Source, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
-		rows, err = verify.AllSourceRows(ctx, tx, e.Cfg)
+		if rows, err = verify.AllSourceRows(ctx, tx, e.Cfg); err != nil {
+			return err
+		}
+		views, rep.ViewOrphans, err = verify.SourceViews(ctx, tx, e.Cfg)
 		return err
 	})
 	if err != nil {
@@ -163,7 +190,8 @@ func Verify(ctx context.Context, e *Env, timeout time.Duration) (*VerifyReport, 
 		}
 		rep.SourceState = verify.State(rows, state)
 		rep.OK = rep.SourceState.OK()
-		for _, p := range e.Cfg.PipelineNames() {
+		for _, d := range e.Cfg.TableDefs() {
+			p := d.Name
 			pr := &PipelineVerifyRows{SourceRows: len(rows[p]), SourceState: verify.State(verify.Rows{p: rows[p]}, map[string]map[string]map[string]*string{p: state[p]})}
 			rep.Pipelines[p] = pr
 		}
@@ -177,7 +205,7 @@ func Verify(ctx context.Context, e *Env, timeout time.Duration) (*VerifyReport, 
 			if !store.IsLive(g.State) {
 				continue
 			}
-			gr, err := verify.Generation(ctx, tx, e.Store.Schema, g, e.Trs(), rows, e.Cfg.Pipeline.MaxDocumentBytes)
+			gr, err := verify.Generation(ctx, tx, e.Store.Schema, g, e.Trs(), verify.OnlyPipelines(rows, e.Cfg), views, e.Cfg.Pipeline.MaxDocumentBytes)
 			if err != nil {
 				return err
 			}
@@ -222,6 +250,12 @@ func ReplayDLQ(ctx context.Context, e *Env, id int64, out io.Writer) (*ReplayRes
 		if spec == nil {
 			fmt.Fprintf(out, "skipped dlq #%d: pipeline %q is not configured\n", d.ID, d.Pipeline)
 			res.StillBad++
+			continue
+		}
+		if spec.IsView() {
+			if err := replayViewDoc(ctx, e, d, g, spec, out, res); err != nil {
+				return res, err
+			}
 			continue
 		}
 		st, err := e.Store.LoadSourceState(ctx, e.Store.Pool, d.Pipeline, []string{d.SourceKey})
@@ -379,6 +413,7 @@ func Rebuild(ctx context.Context, e *Env, out io.Writer) (string, error) {
 			`DELETE FROM ` + e.Store.T("checkpoints"),
 			`DELETE FROM ` + e.Store.T("pipeline_relations"),
 			`DELETE FROM ` + e.Store.T("source_state"),
+			`DELETE FROM ` + e.Store.T("source_refs"),
 			`UPDATE ` + e.Store.T("backfill_jobs") + ` SET state = 'cancelled', updated_at = now() WHERE state IN ('pending','running')`,
 			`UPDATE ` + e.Store.T("generations") + ` SET state = 'stale' WHERE state IN ('pending','building','ready','active','previous')`,
 			`UPDATE ` + e.Store.T("serving") + ` SET previous_generation_id = NULL, rollback_until = NULL`,

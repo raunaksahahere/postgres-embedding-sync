@@ -15,6 +15,7 @@ import (
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/keys"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/store"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/transform"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/viewdoc"
 )
 
 // Row is one expected document (encoded key, allowlisted fields, nil = NULL).
@@ -107,11 +108,49 @@ type Querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
-// Generation compares a generation's chunk table with every pipeline's rows.
-func Generation(ctx context.Context, q Querier, schema string, g *store.Generation, trs map[string]*transform.Transformer, rows Rows, maxDocBytes int) (*GenReport, error) {
+// ViewDocs holds a view's assembled documents (encoded root key -> doc).
+type ViewDocs struct {
+	Docs        map[string]*viewdoc.Doc
+	MaxChildren int
+}
+
+// ExpectedViews computes chunks for assembled view documents under one
+// generation; documents over max_children or max_document_bytes, or that
+// fail to render, are expected to be absent (quarantined).
+func ExpectedViews(trs map[string]*transform.Transformer, m transform.ModelIdentity, views map[string]ViewDocs, maxDocBytes int,
+	out map[chunkKey]chunkVal, poison map[chunkKey]bool) error {
+	for view, vd := range views {
+		tr := trs[view]
+		if tr == nil {
+			return fmt.Errorf("no transform for view %q", view)
+		}
+		for key, d := range vd.Docs {
+			if _, n := d.MaxList(); n > vd.MaxChildren {
+				poison[chunkKey{pipeline: view, key: key}] = true
+				continue
+			}
+			text, err := tr.RenderData(d.Data())
+			if err != nil || len(text) > maxDocBytes {
+				poison[chunkKey{pipeline: view, key: key}] = true
+				continue
+			}
+			for _, c := range tr.Chunks(key, text, m) {
+				out[chunkKey{view, key, c.No}] = chunkVal{c.Fingerprint, c.Text}
+			}
+		}
+	}
+	return nil
+}
+
+// Generation compares a generation's chunk table with every standalone
+// pipeline's rows and every view's assembled documents.
+func Generation(ctx context.Context, q Querier, schema string, g *store.Generation, trs map[string]*transform.Transformer, rows Rows, views map[string]ViewDocs, maxDocBytes int) (*GenReport, error) {
 	m := transform.ModelIdentity{Name: g.ModelName, Revision: g.ModelRevision, DocumentPrefix: g.DocumentPrefix}
 	exp, poison, err := Expected(trs, m, rows, maxDocBytes)
 	if err != nil {
+		return nil, err
+	}
+	if err := ExpectedViews(trs, m, views, maxDocBytes, exp, poison); err != nil {
 		return nil, err
 	}
 	quarantined := map[chunkKey]bool{}
@@ -145,6 +184,9 @@ func Generation(ctx context.Context, q Querier, schema string, g *store.Generati
 	}
 	for pipe := range rows {
 		pc(pipe)
+	}
+	for view := range views {
+		pc(view)
 	}
 	for ck := range exp {
 		pc(ck.pipeline).ExpectedChunks++
@@ -299,11 +341,11 @@ func SourceRows(ctx context.Context, q Querier, p *config.PipelineDef) ([]Row, e
 	return out, rs.Err()
 }
 
-// AllSourceRows reads every pipeline's table (call inside one snapshot).
+// AllSourceRows reads every replicated table, standalone pipelines and view
+// components alike (call inside one snapshot).
 func AllSourceRows(ctx context.Context, q Querier, cfg *config.Config) (Rows, error) {
 	out := Rows{}
-	for i := range cfg.Pipelines {
-		p := &cfg.Pipelines[i]
+	for _, p := range cfg.TableDefs() {
 		rs, err := SourceRows(ctx, q, p)
 		if err != nil {
 			return nil, err

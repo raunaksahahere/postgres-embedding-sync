@@ -166,9 +166,10 @@ func (c *Committer) apply(ctx context.Context, u *Unit) error {
 			p.JobID, p.LastKey, p.Rows, state); err != nil {
 			return err
 		}
-		if p.Final {
+		if p.Final && p.Gen != "" {
 			// A generation is ready once every pipeline's backfill into it is
-			// complete, not when the first one finishes.
+			// complete, not when the first one finishes. (State jobs of a
+			// view belong to no generation.)
 			if _, err := tx.Exec(ctx, `UPDATE `+c.Store.T("generations")+` SET state = 'ready', ready_at = now() WHERE id = $1 AND state = 'building'
 				AND NOT EXISTS (SELECT 1 FROM `+c.Store.T("backfill_jobs")+` WHERE generation_id = $1 AND state IN ('pending', 'running'))`, p.Gen); err != nil {
 				return err
@@ -235,10 +236,21 @@ func sortedPipes(m map[string]bool) []string {
 
 // applyState maintains source_state: the allowlisted projection of every
 // pipeline's source table at the checkpoint.
+// isView reports whether pipe is a view: its documents are assembled from
+// its components' state, so it has no state rows of its own.
+func (c *Committer) isView(pipe string) bool {
+	s := c.Specs[pipe]
+	return s != nil && s.IsView()
+}
+
 func (c *Committer) applyState(ctx context.Context, tx pgx.Tx, u *Unit) error {
 	st := c.Store.T("source_state")
+	refs := c.Store.T("source_refs")
 	for _, pipe := range sortedPipes(u.Truncates) {
 		if _, err := tx.Exec(ctx, `DELETE FROM `+st+` WHERE pipeline = $1`, pipe); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM `+refs+` WHERE pipeline = $1`, pipe); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `UPDATE `+c.Store.T("dlq")+` SET state = 'superseded', updated_at = now() WHERE state = 'open' AND pipeline = $1`, pipe); err != nil {
@@ -247,18 +259,23 @@ func (c *Committer) applyState(ctx context.Context, tx pgx.Tx, u *Unit) error {
 	}
 	seen := map[string]bool{}
 	for _, rd := range u.RangeDeletes {
+		if c.isView(rd.Pipeline) {
+			continue
+		}
 		sig := fmt.Sprint(rd.Pipeline, rd.Lo, rd.Hi)
 		if seen[sig] {
 			continue
 		}
 		seen[sig] = true
-		args := []any{rd.Keep}
-		pred, err := c.rangePredicate(rd.Pipeline, "source_key", rd.Lo, rd.Hi, &args)
-		if err != nil {
-			return err
-		}
-		if _, err := tx.Exec(ctx, `DELETE FROM `+st+` WHERE `+pred+` AND source_key <> ALL($1::text[])`, args...); err != nil {
-			return fmt.Errorf("range delete state: %w", err)
+		for _, t := range []string{st, refs} {
+			args := []any{rd.Keep}
+			pred, err := c.rangePredicate(rd.Pipeline, "source_key", rd.Lo, rd.Hi, &args)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, `DELETE FROM `+t+` WHERE `+pred+` AND source_key <> ALL($1::text[])`, args...); err != nil {
+				return fmt.Errorf("range delete state: %w", err)
+			}
 		}
 	}
 	final := map[DocID]*DocEffect{}
@@ -270,10 +287,34 @@ func (c *Committer) applyState(ctx context.Context, tx pgx.Tx, u *Unit) error {
 			final[id] = d
 		}
 	}
+	// View component rows (state only); a component's rows never appear in
+	// Stream or Snapshot.
+	for id, d := range u.State {
+		final[id] = d
+	}
 	var delPipes, delKeys, upPipes, upKeys, upLSN []string
 	var upFields [][]byte
+	var refPipes, refKeys, refNames, refTargets []string
+	var touchedPipes, touchedKeys []string
 	for _, id := range sortedIDs(final) {
 		d := final[id]
+		if c.isView(id.Pipeline) {
+			continue
+		}
+		if spec := c.Specs[id.Pipeline]; spec != nil && spec.IsComponent() {
+			touchedPipes, touchedKeys = append(touchedPipes, id.Pipeline), append(touchedKeys, id.Key)
+			if !d.Delete {
+				names := make([]string, 0, len(d.Refs))
+				for n := range d.Refs {
+					names = append(names, n)
+				}
+				sort.Strings(names)
+				for _, n := range names {
+					refPipes, refKeys = append(refPipes, id.Pipeline), append(refKeys, id.Key)
+					refNames, refTargets = append(refNames, n), append(refTargets, d.Refs[n])
+				}
+			}
+		}
 		if d.Delete {
 			delPipes, delKeys = append(delPipes, id.Pipeline), append(delKeys, id.Key)
 			continue
@@ -297,6 +338,18 @@ func (c *Committer) applyState(ctx context.Context, tx pgx.Tx, u *Unit) error {
 			ON CONFLICT (pipeline, source_key) DO UPDATE SET fields = EXCLUDED.fields, source_lsn = EXCLUDED.source_lsn, updated_at = now()`,
 			upPipes, upKeys, upFields, upLSN); err != nil {
 			return fmt.Errorf("upsert state: %w", err)
+		}
+	}
+	// The reference index follows each component row's latest version.
+	if len(touchedKeys) > 0 {
+		if _, err := tx.Exec(ctx, `DELETE FROM `+refs+` WHERE (pipeline, source_key) IN (SELECT * FROM unnest($1::text[], $2::text[]))`, touchedPipes, touchedKeys); err != nil {
+			return err
+		}
+	}
+	if len(refKeys) > 0 {
+		if _, err := tx.Exec(ctx, `INSERT INTO `+refs+` (pipeline, source_key, ref, ref_key)
+			SELECT * FROM unnest($1::text[], $2::text[], $3::text[], $4::text[])`, refPipes, refKeys, refNames, refTargets); err != nil {
+			return fmt.Errorf("upsert refs: %w", err)
 		}
 	}
 	return nil

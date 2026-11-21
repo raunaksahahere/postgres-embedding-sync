@@ -28,12 +28,18 @@ type SnapRow struct {
 // finds it when it reaches the high marker in the stream.
 type WindowRows struct {
 	WindowID string
-	Gen      string
+	Gen      string // empty for a state window
 	Pipeline string
 	JobID    int64
-	Lo       *string
-	Rows     []SnapRow
-	Final    bool
+	// Kind is the job kind: embed (snapshot rows embedded into Gen), state
+	// (snapshot rows of a view component, written to state only) or render
+	// (no rows: the planner renders up to Limit view documents after Lo
+	// from the state at the end of the unit).
+	Kind  string
+	Limit int
+	Lo    *string
+	Rows  []SnapRow
+	Final bool
 
 	once    sync.Once
 	done    chan struct{}
@@ -125,40 +131,48 @@ func (b *Backfill) Run(ctx context.Context) error {
 }
 
 func (b *Backfill) runJob(ctx context.Context, job *store.BackfillJob) error {
-	g, err := b.Store.Generation(ctx, job.GenerationID)
-	if err != nil {
-		return err
-	}
-	if g == nil {
-		return fmt.Errorf("generation %s missing", job.GenerationID)
-	}
 	spec := b.Specs[job.Pipeline]
 	if spec == nil {
 		return fmt.Errorf("backfill job %d is for pipeline %q, which is not configured", job.ID, job.Pipeline)
 	}
-	if g.StreamFromLSN == nil {
-		// The start marker orders "this generation consumes changes from here"
-		// before every snapshot window of the job.
-		if err := b.marker(ctx, "start", g.ID, job.ID, ""); err != nil {
-			return fmt.Errorf("write start marker: %w", err)
+	kind := job.Kind
+	if kind == "" {
+		kind = store.JobEmbed
+	}
+	gen := job.GenerationID
+	if kind != store.JobState {
+		// embed and render jobs fill one generation.
+		g, err := b.Store.Generation(ctx, gen)
+		if err != nil {
+			return err
 		}
-		for {
-			g, err = b.Store.Generation(ctx, job.GenerationID)
-			if err != nil {
-				return err
+		if g == nil {
+			return fmt.Errorf("generation %s missing", gen)
+		}
+		if g.StreamFromLSN == nil {
+			// The start marker orders "this generation consumes changes from here"
+			// before every window of the job.
+			if err := b.marker(ctx, "start", g.ID, job.ID, ""); err != nil {
+				return fmt.Errorf("write start marker: %w", err)
 			}
-			if g.StreamFromLSN != nil {
-				break
-			}
-			if !sleepCtx(ctx, 200*time.Millisecond) {
-				return ctx.Err()
+			for {
+				g, err = b.Store.Generation(ctx, gen)
+				if err != nil {
+					return err
+				}
+				if g.StreamFromLSN != nil {
+					break
+				}
+				if !sleepCtx(ctx, 200*time.Millisecond) {
+					return ctx.Err()
+				}
 			}
 		}
 	}
 	if err := b.Store.MarkJobRunning(ctx, job.ID); err != nil {
 		return err
 	}
-	b.Log.Info("backfill started", "job", job.ID, "generation", g.ID, "pipeline", spec.Name)
+	b.Log.Info("backfill started", "job", job.ID, "kind", kind, "generation", gen, "pipeline", spec.Name)
 	limit := b.Cfg.Backfill.BatchSize
 	discards := 0
 	for ctx.Err() == nil {
@@ -170,29 +184,36 @@ func (b *Backfill) runJob(ctx context.Context, job *store.BackfillJob) error {
 			return fmt.Errorf("backfill job %d disappeared", job.ID)
 		}
 		if cur.State == "done" || cur.State == "cancelled" {
-			b.Log.Info("backfill finished", "job", job.ID, "generation", g.ID, "pipeline", spec.Name, "rows", cur.RowsScanned, "windows", cur.Windows)
+			b.Log.Info("backfill finished", "job", job.ID, "kind", kind, "generation", gen, "pipeline", spec.Name, "rows", cur.RowsScanned, "windows", cur.Windows)
 			b.cleanupMarkers(ctx)
 			return nil
 		}
 		// A generation that stopped being maintained (retired, rejected, stale)
 		// can never complete a window; cancel instead of retrying forever and
 		// blocking every later job.
-		if gs, err := b.Store.Generation(ctx, g.ID); err != nil {
-			return err
-		} else if gs == nil || !(store.IsLive(gs.State) || gs.State == store.StatePending) {
-			if _, err := b.Store.Pool.Exec(ctx, `UPDATE `+b.Store.T("backfill_jobs")+` SET state = 'cancelled', updated_at = now() WHERE id = $1 AND state IN ('pending','running')`, job.ID); err != nil {
+		if kind != store.JobState {
+			if gs, err := b.Store.Generation(ctx, gen); err != nil {
 				return err
+			} else if gs == nil || !(store.IsLive(gs.State) || gs.State == store.StatePending) {
+				if _, err := b.Store.Pool.Exec(ctx, `UPDATE `+b.Store.T("backfill_jobs")+` SET state = 'cancelled', updated_at = now() WHERE id = $1 AND state IN ('pending','running')`, job.ID); err != nil {
+					return err
+				}
+				b.Log.Warn("backfill cancelled: generation is no longer maintained", "job", job.ID, "generation", gen)
+				return nil
 			}
-			b.Log.Warn("backfill cancelled: generation is no longer maintained", "job", job.ID, "generation", g.ID)
-			return nil
 		}
-		outcome, err := b.window(ctx, spec, g.ID, job.ID, cur.LastKey, limit)
+		var outcome string
+		if kind == store.JobRender {
+			outcome, err = b.renderWindow(ctx, spec, gen, job.ID, cur.LastKey, limit)
+		} else {
+			outcome, err = b.window(ctx, spec, kind, gen, job.ID, cur.LastKey, limit)
+		}
 		if err != nil {
 			return err
 		}
 		if outcome == "discarded" {
 			discards++
-			if limit > 1 {
+			if limit > 1 && kind != store.JobRender {
 				limit = max(1, limit/2)
 			}
 			sleepCtx(ctx, time.Duration(min(discards, 10))*50*time.Millisecond)
@@ -207,8 +228,10 @@ func (b *Backfill) runJob(ctx context.Context, job *store.BackfillJob) error {
 	return ctx.Err()
 }
 
-// window brackets one bounded primary-key scan with committed low/high markers.
-func (b *Backfill) window(ctx context.Context, spec *Spec, gen string, job int64, lo *string, limit int) (string, error) {
+// window brackets one bounded primary-key scan with committed low/high
+// markers. kind is embed (rows embedded into gen) or state (a view
+// component's rows, written to state only; gen is empty).
+func (b *Backfill) window(ctx context.Context, spec *Spec, kind, gen string, job int64, lo *string, limit int) (string, error) {
 	id := newUUID()
 	if err := b.marker(ctx, "low", gen, job, id); err != nil {
 		return "", fmt.Errorf("low marker: %w", err)
@@ -220,7 +243,29 @@ func (b *Backfill) window(ctx context.Context, spec *Spec, gen string, job int64
 	if err != nil {
 		return "", err
 	}
-	w := &WindowRows{WindowID: id, Gen: gen, Pipeline: spec.Name, JobID: job, Lo: lo, Rows: rows, Final: len(rows) < limit}
+	w := &WindowRows{WindowID: id, Gen: gen, Pipeline: spec.Name, JobID: job, Kind: kind, Lo: lo, Rows: rows, Final: len(rows) < limit}
+	b.Registry.Put(w)
+	if err := b.marker(ctx, "high", gen, job, id); err != nil {
+		b.Registry.Take(id)
+		return "", fmt.Errorf("high marker: %w", err)
+	}
+	select {
+	case <-w.done:
+		return w.outcome, nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// renderWindow asks the planner to render the next limit documents of a
+// view after lo into gen. It scans nothing: the planner reads the view's
+// state at the window's position in the stream.
+func (b *Backfill) renderWindow(ctx context.Context, spec *Spec, gen string, job int64, lo *string, limit int) (string, error) {
+	id := newUUID()
+	if err := b.marker(ctx, "low", gen, job, id); err != nil {
+		return "", fmt.Errorf("low marker: %w", err)
+	}
+	w := &WindowRows{WindowID: id, Gen: gen, Pipeline: spec.Name, JobID: job, Kind: store.JobRender, Lo: lo, Limit: limit}
 	b.Registry.Put(w)
 	if err := b.marker(ctx, "high", gen, job, id); err != nil {
 		b.Registry.Take(id)

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -15,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/config"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/keys"
 )
 
 // Consumer is the checkpoint row name for the single replication consumer.
@@ -75,6 +77,23 @@ type Generation struct {
 // GenPipeline is what a generation records about one pipeline it covers.
 type GenPipeline struct {
 	TransformFingerprint string `json:"transform_fingerprint"`
+	// View marks a document view: its backfill renders from state ("render"
+	// jobs) instead of scanning a table ("embed" jobs).
+	View bool `json:"view,omitempty"`
+}
+
+// Job kinds.
+const (
+	JobEmbed  = "embed"
+	JobState  = "state"
+	JobRender = "render"
+)
+
+func (p GenPipeline) jobKind() string {
+	if p.View {
+		return JobRender
+	}
+	return JobEmbed
 }
 
 // Checkpoint is the durable replication progress and source identity.
@@ -293,7 +312,7 @@ func NewGeneration(id, modelKey string, m config.Model, cfg *config.Config) (*Ge
 	}
 	pipes := map[string]GenPipeline{}
 	for name, fp := range cfg.PipelineFingerprints() {
-		pipes[name] = GenPipeline{TransformFingerprint: fp}
+		pipes[name] = GenPipeline{TransformFingerprint: fp, View: cfg.View(name) != nil}
 	}
 	return &Generation{
 		ID: id, ModelKey: modelKey, ModelName: m.Name, ModelRevision: m.Revision, Dimension: m.Dimension,
@@ -411,7 +430,8 @@ func (s *Store) CreateGeneration(ctx context.Context, g *Generation, readerRole 
 			}
 		}
 		for _, p := range g.PipelineNames() {
-			if _, err := tx.Exec(ctx, `INSERT INTO `+s.T("backfill_jobs")+` (generation_id, pipeline, state) VALUES ($1, $2, 'pending')`, g.ID, p); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO `+s.T("backfill_jobs")+` (generation_id, pipeline, kind, state) VALUES ($1, $2, $3, 'pending')`,
+				g.ID, p, g.Pipelines[p].jobKind()); err != nil {
 				return err
 			}
 		}
@@ -422,7 +442,7 @@ func (s *Store) CreateGeneration(ctx context.Context, g *Generation, readerRole 
 // AddPipelines extends a live or pending generation to pipelines added to the
 // configuration: it records their transform fingerprints and queues one
 // backfill job per new pipeline, in one transaction.
-func (s *Store) AddPipelines(ctx context.Context, genID string, add map[string]string) error {
+func (s *Store) AddPipelines(ctx context.Context, genID string, add map[string]GenPipeline) error {
 	return pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
 		names := make([]string, 0, len(add))
 		for n := range add {
@@ -430,13 +450,13 @@ func (s *Store) AddPipelines(ctx context.Context, genID string, add map[string]s
 		}
 		sort.Strings(names)
 		for _, n := range names {
-			b, _ := json.Marshal(GenPipeline{TransformFingerprint: add[n]})
+			b, _ := json.Marshal(add[n])
 			if _, err := tx.Exec(ctx, `UPDATE `+s.T("generations")+` SET pipelines = pipelines || jsonb_build_object($2::text, $3::jsonb) WHERE id = $1`,
 				genID, n, b); err != nil {
 				return err
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO `+s.T("backfill_jobs")+` (generation_id, pipeline, state) VALUES ($1, $2, 'pending')
-				ON CONFLICT (generation_id, pipeline) WHERE state IN ('pending','running') DO NOTHING`, genID, n); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO `+s.T("backfill_jobs")+` (generation_id, pipeline, kind, state) VALUES ($1, $2, $3, 'pending')
+				ON CONFLICT (generation_id, pipeline) WHERE state IN ('pending','running') DO NOTHING`, genID, n, add[n].jobKind()); err != nil {
 				return err
 			}
 		}
@@ -494,19 +514,20 @@ func (s *Store) PipelineStatus(ctx context.Context) (state, reason, detail strin
 // BackfillJob is a resumable watermark backfill of one pipeline into one generation.
 type BackfillJob struct {
 	ID           int64
-	GenerationID string
-	Pipeline     string
+	GenerationID string // empty for state jobs
+	Pipeline     string // pipeline, view (render) or view component (state)
+	Kind         string // embed, state or render
 	State        string
 	LastKey      *string // encoded key (keys.Codec) of the last applied window
 	RowsScanned  int64
 	Windows      int64
 }
 
-const jobCols = `id, generation_id, pipeline, state, last_key, rows_scanned, windows`
+const jobCols = `id, coalesce(generation_id, ''), pipeline, kind, state, last_key, rows_scanned, windows`
 
 func scanJob(row pgx.Row) (*BackfillJob, error) {
 	var j BackfillJob
-	if err := row.Scan(&j.ID, &j.GenerationID, &j.Pipeline, &j.State, &j.LastKey, &j.RowsScanned, &j.Windows); err != nil {
+	if err := row.Scan(&j.ID, &j.GenerationID, &j.Pipeline, &j.Kind, &j.State, &j.LastKey, &j.RowsScanned, &j.Windows); err != nil {
 		return nil, err
 	}
 	return &j, nil
@@ -529,10 +550,11 @@ func (s *Store) jobs(ctx context.Context, where string, args ...any) ([]Backfill
 	return out, rows.Err()
 }
 
-// NextBackfillJob returns the oldest pending/running job.
+// NextBackfillJob returns the next pending/running job: state jobs first (a
+// view renders only once its state is complete), then the oldest.
 func (s *Store) NextBackfillJob(ctx context.Context) (*BackfillJob, error) {
 	j, err := scanJob(s.Pool.QueryRow(ctx, `SELECT `+jobCols+` FROM `+s.T("backfill_jobs")+`
-		WHERE state IN ('pending','running') ORDER BY id LIMIT 1`))
+		WHERE state IN ('pending','running') ORDER BY (kind = 'state') DESC, id LIMIT 1`))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -558,12 +580,94 @@ func (s *Store) ActiveBackfillJobs(ctx context.Context, genID string) ([]Backfil
 	return s.jobs(ctx, `WHERE state IN ('pending','running') AND ($1 = '' OR generation_id = $1) ORDER BY id`, genID)
 }
 
+// RequestStateBackfill queues a state scan of a view component (no-op if one is queued).
+func (s *Store) RequestStateBackfill(ctx context.Context, component string) (int64, error) {
+	var id int64
+	err := s.Pool.QueryRow(ctx, `INSERT INTO `+s.T("backfill_jobs")+` (generation_id, pipeline, kind, state) VALUES (NULL, $1, 'state', 'pending')
+		ON CONFLICT (pipeline) WHERE kind = 'state' AND state IN ('pending','running') DO UPDATE SET updated_at = now() RETURNING id`, component).Scan(&id)
+	return id, err
+}
+
+// Children returns, per parent key, the keys of a component's rows whose
+// reference ref points at it (from source_refs).
+func (s *Store) Children(ctx context.Context, q interface {
+	Query(context.Context, string, ...any) (pgx.Rows, error)
+}, pipeline, ref string, parents []string) (map[string][]string, error) {
+	rows, err := q.Query(ctx, `SELECT ref_key, source_key FROM `+s.T("source_refs")+` WHERE pipeline = $1 AND ref = $2 AND ref_key = ANY($3) ORDER BY 1, 2`,
+		pipeline, ref, parents)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		var p, k string
+		if err := rows.Scan(&p, &k); err != nil {
+			return nil, err
+		}
+		out[p] = append(out[p], k)
+	}
+	return out, rows.Err()
+}
+
+// KeysAfter lists up to limit state keys of a pipeline after lo, in the
+// key order of codec (used to page through a view's root rows).
+func (s *Store) KeysAfter(ctx context.Context, pipeline string, codec keys.Codec, lo *string, limit int) ([]string, error) {
+	args := []any{pipeline}
+	pred := "pipeline = $1"
+	if lo != nil {
+		cmp, err := codec.SinkCompare("source_key", ">", *lo, &args)
+		if err != nil {
+			return nil, err
+		}
+		pred += " AND CASE WHEN pipeline = $1 THEN " + cmp + " ELSE false END"
+	}
+	args = append(args, limit)
+	order := strings.Join(codec.SinkExprs("source_key"), ", ")
+	// The sort runs on rows already restricted to the pipeline, so the
+	// typed casts only see this codec's keys.
+	rows, err := s.Pool.Query(ctx, `SELECT source_key FROM `+s.T("source_state")+` WHERE `+pred+
+		` ORDER BY `+order+fmt.Sprintf(` LIMIT $%d`, len(args)), args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+// RefKeys returns the distinct keys that a component's reference ref points
+// at (e.g. every parent with a section), for truncate fan-out.
+func (s *Store) RefKeys(ctx context.Context, pipeline, ref string) ([]string, error) {
+	rows, err := s.Pool.Query(ctx, `SELECT DISTINCT ref_key FROM `+s.T("source_refs")+` WHERE pipeline = $1 AND ref = $2`, pipeline, ref)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
 // RequestBackfill queues a re-scan of one pipeline for a live generation
 // (no-op if one is queued).
-func (s *Store) RequestBackfill(ctx context.Context, genID, pipeline string) (int64, error) {
+func (s *Store) RequestBackfill(ctx context.Context, genID, pipeline, kind string) (int64, error) {
 	var id int64
-	err := s.Pool.QueryRow(ctx, `INSERT INTO `+s.T("backfill_jobs")+` (generation_id, pipeline, state) VALUES ($1, $2, 'pending')
-		ON CONFLICT (generation_id, pipeline) WHERE state IN ('pending','running') DO UPDATE SET updated_at = now() RETURNING id`, genID, pipeline).Scan(&id)
+	err := s.Pool.QueryRow(ctx, `INSERT INTO `+s.T("backfill_jobs")+` (generation_id, pipeline, kind, state) VALUES ($1, $2, $3, 'pending')
+		ON CONFLICT (generation_id, pipeline) WHERE state IN ('pending','running') DO UPDATE SET updated_at = now() RETURNING id`, genID, pipeline, kind).Scan(&id)
 	return id, err
 }
 

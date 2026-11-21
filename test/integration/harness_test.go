@@ -298,6 +298,8 @@ type envOpts struct {
 	// pipelines, when set, replaces the single-table source mapping with a
 	// `pipelines:` block (YAML, indented by two spaces).
 	pipelines string
+	// views, when set, adds a `views:` block (YAML, indented by two spaces).
+	views string
 	// setupSQL runs as the admin before `embedsync init` (extra tables).
 	setupSQL []string
 	// embedBatch overrides embedder.batch_size (default 16).
@@ -402,6 +404,9 @@ func (e *env) writeConfig() {
 	pipes := ""
 	if o.pipelines != "" {
 		tables, pipes = "", "\npipelines:\n"+o.pipelines
+	}
+	if o.views != "" {
+		tables, pipes = "", pipes+"\nviews:\n"+o.views
 	}
 	embedBatch := o.embedBatch
 	if embedBatch == 0 {
@@ -710,6 +715,7 @@ type verifyReport struct {
 		SourceState stateCounts `json:"source_state"`
 	} `json:"pipelines"`
 	Generations []genReport `json:"generations"`
+	ViewOrphans int         `json:"view_orphan_rows"`
 	OK          bool        `json:"ok"`
 }
 

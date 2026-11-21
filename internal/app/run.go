@@ -18,6 +18,7 @@ import (
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/metrics"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/pipeline"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/store"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/viewdoc"
 )
 
 // ErrSlotLost means the source no longer retains the WAL this sink needs.
@@ -109,8 +110,7 @@ func sameSet(a []string, b []string) bool {
 func LoadCatalog(ctx context.Context, e *Env) (*Catalogs, error) {
 	cfg := e.Cfg
 	out := &Catalogs{Pipes: map[string]*Catalog{}, SchemaErrs: map[string]*SchemaError{}}
-	for i := range cfg.Pipelines {
-		p := &cfg.Pipelines[i]
+	for _, p := range cfg.TableDefs() {
 		c, err := loadPipeCatalog(ctx, e, p)
 		var se *SchemaError
 		switch {
@@ -137,8 +137,8 @@ func LoadCatalog(ctx context.Context, e *Env) (*Catalogs, error) {
 	}
 	defer prow.Close()
 	byTable := map[string]*config.PipelineDef{}
-	for i := range cfg.Pipelines {
-		byTable[cfg.Pipelines[i].Table] = &cfg.Pipelines[i]
+	for _, d := range cfg.TableDefs() {
+		byTable[d.Table] = d
 	}
 	seen := map[string]bool{}
 	sawMarkers := false
@@ -179,7 +179,7 @@ func LoadCatalog(ctx context.Context, e *Env) (*Catalogs, error) {
 	if !sawMarkers {
 		return nil, fmt.Errorf("publication %q must include %s.markers", cfg.Source.Publication, cfg.Source.ControlSchema)
 	}
-	for _, p := range cfg.Pipelines {
+	for _, p := range cfg.TableDefs() {
 		if !seen[p.Name] {
 			return nil, fmt.Errorf("publication %q does not include %s (pipeline %s); run `embedsync init` to add it", cfg.Source.Publication, p.Table, p.Name)
 		}
@@ -320,8 +320,7 @@ func resolveRelations(e *Env, cp *store.Checkpoint, rels map[string]*store.Relat
 	opts RunOptions) (accepted map[string]*Catalog, fresh, accepts []store.Relation, err error) {
 	cfg := e.Cfg
 	accepted = map[string]*Catalog{}
-	for i := range cfg.Pipelines {
-		p := &cfg.Pipelines[i]
+	for _, p := range cfg.TableDefs() {
 		rel := rels[p.Name]
 		cat, se := cats.Pipes[p.Name], cats.SchemaErrs[p.Name]
 		if rel == nil {
@@ -388,7 +387,7 @@ func resolveRelations(e *Env, cp *store.Checkpoint, rels map[string]*store.Relat
 		}
 	}
 	for name := range rels {
-		if cfg.Pipe(name) == nil {
+		if !tableConfigured(cfg, name) {
 			return nil, nil, nil, &pipeline.PauseError{Reason: "startup_check", Detail: fmt.Sprintf(
 				"pipeline %q is registered in this sink but no longer configured; restore it (removing a pipeline is not supported in place)", name)}
 		}
@@ -510,11 +509,29 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 			return fmt.Errorf("register pipeline %s: %w", r.Pipeline, err)
 		}
 		e.Log.Info("registered pipeline", "pipeline", r.Pipeline, "table", r.SourceTable, "key", r.KeyColumns, "key_kinds", r.KeyKinds)
+		if spec := e.Pipes[r.Pipeline]; spec != nil && spec.IsComponent() {
+			// A view's table enters state through a state backfill; the
+			// view renders once every one of its tables is complete.
+			id, err := e.Store.RequestStateBackfill(ctx, r.Pipeline)
+			if err != nil {
+				return fmt.Errorf("queue state backfill of %s: %w", r.Pipeline, err)
+			}
+			e.Log.Info("state backfill queued", "component", r.Pipeline, "job", id)
+		}
 	}
 	acceptedSig := map[string]string{}
+	viewRels := map[string]viewdoc.Relation{}
 	for name, c := range accepted {
 		e.Pipes[name].Codec = c.Codec
 		acceptedSig[name] = c.Signature
+		viewRels[name] = viewdoc.Relation{KeyKinds: c.Codec.String(), Signature: c.Signature}
+	}
+	for _, v := range e.Pipes.Views() {
+		vs, err := viewdoc.Build(v.ViewDef, viewRels)
+		if err != nil {
+			return &pipeline.PauseError{Reason: "startup_check", Detail: err.Error()}
+		}
+		v.View, v.Codec = vs, vs.Root.Codec
 	}
 	if err := ensureGenerations(ctx, e); err != nil {
 		return err
@@ -534,7 +551,7 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 		return err
 	}
 	for _, j := range jobs {
-		activeJobs[j.ID] = &pipeline.JobCursor{Pipeline: j.Pipeline, Last: j.LastKey}
+		activeJobs[j.ID] = &pipeline.JobCursor{Pipeline: j.Pipeline, Last: j.LastKey, Kind: j.Kind}
 	}
 
 	if err := e.Store.SetPipelineStatus(ctx, "running", "", ""); err != nil {
@@ -555,7 +572,12 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 		Lookup: func(ctx context.Context, pipe string, ks []string) (map[string]store.SourceState, error) {
 			return e.Store.LoadSourceState(ctx, e.Store.Pool, pipe, ks)
 		},
-		LoadGen: e.Store.Generation, ModelOf: ModelIdentity}
+		RefLookup: func(ctx context.Context, pipe, ref string, parents []string) (map[string][]string, error) {
+			return e.Store.Children(ctx, e.Store.Pool, pipe, ref, parents)
+		},
+		RefKeys:  e.Store.RefKeys,
+		RootKeys: e.Store.KeysAfter,
+		LoadGen:  e.Store.Generation, ModelOf: ModelIdentity}
 	embed := pipeline.NewEmbedStage(e.Embed, e.Store, e.Pipes, cfg.Embedder.BatchSize, cfg.Embedder.Concurrency, e.Log)
 	committer := &pipeline.Committer{Cfg: cfg, Store: e.Store, Specs: e.Pipes, Progress: progress, Planner: planner, Log: e.Log}
 	reader := &pipeline.Reader{Conn: conn, Cfg: cfg, Specs: e.Pipes, Progress: progress, Out: items, StartLSN: cp.LSN, AcceptedSig: acceptedSig, Log: e.Log}
@@ -694,6 +716,17 @@ func checkIdentity(cfg *config.Config, cp *store.Checkpoint, sys pglogrepl.Ident
 	return nil
 }
 
+// tableConfigured reports whether a registered relation (pipeline or view
+// component) is still configured.
+func tableConfigured(cfg *config.Config, name string) bool {
+	for _, d := range cfg.TableDefs() {
+		if d.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 // checkGenerations verifies that every live or pending generation was built
 // with a configured model and with the configured transform of every
 // pipeline it covers (pipelines it does not cover yet are added later).
@@ -743,9 +776,9 @@ func ensureGenerations(ctx context.Context, e *Env) error {
 		if len(miss) == 0 {
 			continue
 		}
-		add := map[string]string{}
+		add := map[string]store.GenPipeline{}
 		for _, n := range miss {
-			add[n] = fps[n]
+			add[n] = store.GenPipeline{TransformFingerprint: fps[n], View: e.Cfg.View(n) != nil}
 		}
 		if err := e.Store.AddPipelines(ctx, g.ID, add); err != nil {
 			return fmt.Errorf("extend generation %s: %w", g.ID, err)

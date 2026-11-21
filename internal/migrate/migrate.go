@@ -33,6 +33,7 @@ import (
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/store"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/transform"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/verify"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/viewdoc"
 )
 
 // ErrGateFailed is returned when a candidate fails a promotion gate.
@@ -661,7 +662,21 @@ func (m *Migrator) Evaluate(ctx context.Context, from, to string, boundary pglog
 			return err
 		}
 		rep.StateRows = rows.Count()
-		rep.Coverage, err = verify.Generation(ctx, tx, m.Store.Schema, cand, m.Trs, rows, m.Cfg.Pipeline.MaxDocumentBytes)
+		var views map[string]verify.ViewDocs
+		if len(m.Cfg.Views) > 0 {
+			rels, err := m.Store.Relations(ctx)
+			if err != nil {
+				return err
+			}
+			vr := map[string]viewdoc.Relation{}
+			for n, r := range rels {
+				vr[n] = viewdoc.Relation{KeyKinds: r.KeyKinds, Signature: r.RelationSignature}
+			}
+			if views, err = verify.StateViewDocs(ctx, tx, m.Store.Schema, m.Cfg, vr, rows); err != nil {
+				return err
+			}
+		}
+		rep.Coverage, err = verify.Generation(ctx, tx, m.Store.Schema, cand, m.Trs, verify.OnlyPipelines(rows, m.Cfg), views, m.Cfg.Pipeline.MaxDocumentBytes)
 		if err != nil {
 			return err
 		}

@@ -34,6 +34,7 @@ type GenStatus struct {
 // PipelineStatus summarises one configured pipeline.
 type PipelineStatus struct {
 	Name            string   `json:"name"`
+	Kind            string   `json:"kind"` // pipeline, view or view_table
 	Table           string   `json:"table"`
 	Key             []string `json:"key"`
 	KeyKinds        string   `json:"key_kinds,omitempty"`
@@ -139,14 +140,23 @@ func BuildStatus(ctx context.Context, e *Env, consumer string) (*StatusReport, e
 		}
 		rows.Close()
 	}
-	for _, p := range e.Cfg.Pipelines {
-		ps := PipelineStatus{Name: p.Name, Table: p.Table, Key: p.Key, SourceStateRows: stateRows[p.Name], Unresolved: unresolvedBy[p.Name]}
-		if rel := rels[p.Name]; rel != nil {
+	add := func(kind, name, table string, key []string) {
+		ps := PipelineStatus{Name: name, Kind: kind, Table: table, Key: key, SourceStateRows: stateRows[name], Unresolved: unresolvedBy[name]}
+		if rel := rels[name]; rel != nil {
 			ps.Registered, ps.KeyKinds, ps.Signature = true, rel.KeyKinds, rel.RelationSignature
 		}
 		r.Pipelines = append(r.Pipelines, ps)
 	}
-	if len(r.Pipelines) == 1 {
+	for _, p := range e.Cfg.Pipelines {
+		add("pipeline", p.Name, p.Table, p.Key)
+	}
+	for _, v := range e.Cfg.Views {
+		add("view", v.Name, v.Table, v.Key)
+		for _, c := range v.Components() {
+			add("view_table", c.Def.Name, c.Def.Table, c.Def.Key)
+		}
+	}
+	if len(r.Pipelines) == 1 && r.Pipelines[0].Kind == "pipeline" {
 		r.Checkpoint.KeyKind, r.Checkpoint.Signature = r.Pipelines[0].KeyKinds, r.Pipelines[0].Signature
 	}
 	if e.Source != nil {

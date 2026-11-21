@@ -58,7 +58,9 @@ func (r *Reader) Run(ctx context.Context) error {
 	r.rels = map[uint32]*relation{}
 	r.byTable = map[string]*Spec{}
 	for _, s := range r.Specs {
-		r.byTable[s.Def.Table] = s
+		if s.Def != nil { // a view has no table of its own
+			r.byTable[s.Def.Table] = s
+		}
 	}
 	err := pglogrepl.StartReplication(ctx, r.Conn, r.Cfg.Source.Slot, r.StartLSN, pglogrepl.StartReplicationOptions{
 		PluginArgs: []string{"proto_version '1'", "publication_names '" + r.Cfg.Source.Publication + "'"},

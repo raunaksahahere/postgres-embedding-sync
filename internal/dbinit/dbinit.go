@@ -38,8 +38,7 @@ type vars struct {
 func sourceGrants(cfg *config.Config, replRole string) string {
 	var b strings.Builder
 	schemas := map[string]bool{}
-	for i := range cfg.Pipelines {
-		p := &cfg.Pipelines[i]
+	for _, p := range cfg.TableDefs() {
 		schema, _ := p.SchemaTable()
 		if !schemas[schema] {
 			schemas[schema] = true
@@ -65,9 +64,10 @@ func columnList(p *config.PipelineDef) string {
 
 // publicationTables renders "t1 (cols), t2 (cols)" for CREATE/ALTER PUBLICATION.
 func publicationTables(cfg *config.Config) string {
-	parts := make([]string, 0, len(cfg.Pipelines))
-	for i := range cfg.Pipelines {
-		parts = append(parts, pubTable(&cfg.Pipelines[i])+" ("+columnList(&cfg.Pipelines[i])+")")
+	defs := cfg.TableDefs()
+	parts := make([]string, 0, len(defs))
+	for _, d := range defs {
+		parts = append(parts, pubTable(d)+" ("+columnList(d)+")")
 	}
 	return strings.Join(parts, ", ")
 }
@@ -188,8 +188,7 @@ func ReconcileSource(ctx context.Context, conn *pgx.Conn, cfg *config.Config, r 
 	markers := cfg.Source.ControlSchema + ".markers"
 	want := map[string]string{markers: anyColumns}
 	byTable := map[string]*config.PipelineDef{}
-	for i := range cfg.Pipelines {
-		p := &cfg.Pipelines[i]
+	for _, p := range cfg.TableDefs() {
 		want[p.Table] = strings.Join(sortedCopy(p.PublishedColumns()), ",")
 		byTable[p.Table] = p
 	}

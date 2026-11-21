@@ -1,0 +1,162 @@
+//go:build integration
+
+package integration
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+)
+
+// A knowledge base: documents with ordered sections and tags through a link
+// table, every table keyed by tenant first. No foreign keys, so tests can
+// create orphans and apply changes in any order.
+var kbSetup = []string{
+	`CREATE TABLE public.kb_documents (tenant_id int, id bigint, title text, secret text, PRIMARY KEY (tenant_id, id))`,
+	`CREATE TABLE public.kb_sections (tenant_id int, id bigint, document_id bigint, position int, heading text, body text, PRIMARY KEY (tenant_id, id))`,
+	`CREATE TABLE public.kb_tags (tenant_id int, id bigint, name text, PRIMARY KEY (tenant_id, id))`,
+	`CREATE TABLE public.kb_document_tags (tenant_id int, document_id bigint, tag_id bigint, PRIMARY KEY (tenant_id, document_id, tag_id))`,
+}
+
+const kbView = `  - name: kb
+    tenant: tenant_id
+    table: public.kb_documents
+    key: [tenant_id, id]
+    fields: [{name: title, column: title}]
+    children:
+      - name: sections
+        table: public.kb_sections
+        key: [tenant_id, id]
+        parent: [tenant_id, document_id]
+        order_by: [position]
+        fields: [{name: heading, column: heading}, {name: body, column: body}]
+    links:
+      - name: tags
+        table: public.kb_document_tags
+        key: [tenant_id, document_id, tag_id]
+        parent: [tenant_id, document_id]
+        target: [tenant_id, tag_id]
+        target_table: public.kb_tags
+        target_key: [tenant_id, id]
+        target_fields: [{name: name, column: name}]
+        order_by: [name]
+    transform: {template: "{{.title}}{{range .tags}} #{{.name}}{{end}}{{range .sections}} | {{.heading}}: {{.body}}{{end}}", chunk_words: 20, chunk_overlap: 4}
+    max_children: 200
+    max_fanout_per_txn: 40
+`
+
+// seedKB creates docs documents per tenant, each with sections sections and
+// two of the tenant's five tags. Tenants reuse the same ids.
+func (e *env) seedKB(tenants, docs, sections int) {
+	e.t.Helper()
+	e.exec(fmt.Sprintf(`INSERT INTO kb_documents SELECT t, d, 'doc ' || t || '/' || d, 'secret' FROM generate_series(1, %d) t, generate_series(1, %d) d`, tenants, docs))
+	e.exec(fmt.Sprintf(`INSERT INTO kb_sections SELECT t, d * 100 + s, d, (s * 7) %% 5, 'h' || s, 'body of section ' || s || ' of doc ' || d
+		FROM generate_series(1, %d) t, generate_series(1, %d) d, generate_series(1, %d) s`, tenants, docs, sections))
+	e.exec(fmt.Sprintf(`INSERT INTO kb_tags SELECT t, g, 'tag' || g || 't' || t FROM generate_series(1, %d) t, generate_series(1, 5) g`, tenants))
+	e.exec(fmt.Sprintf(`INSERT INTO kb_document_tags SELECT t, d, 1 + (d %% 5) FROM generate_series(1, %d) t, generate_series(1, %d) d
+		UNION SELECT t, d, 1 + ((d + 2) %% 5) FROM generate_series(1, %d) t, generate_series(1, %d) d`, tenants, docs, tenants, docs))
+}
+
+func (e *env) kbDoc(gen, key string) string {
+	e.t.Helper()
+	return e.scalar(`SELECT coalesce(string_agg(content, ' ' ORDER BY chunk_no), '') FROM embedsync.chunks_`+gen+` WHERE pipeline = 'kb' AND source_key = $1`, key)
+}
+
+// The 1B acceptance changes, one by one, each checked against the
+// independently assembled source at a barrier.
+func TestViewAcceptance(t *testing.T) {
+	e := newEnv(t, envOpts{batch: 7, views: kbView, setupSQL: kbSetup})
+	e.seedKB(2, 12, 4)
+	p := e.start()
+	e.waitReady()
+	waitFor(t, 120*time.Second, "state and render backfills", e.jobsDone)
+	r := e.requireConsistent("after view backfill")
+	if r.Generations[0].Pipelines["kb"].ActualChunks == 0 {
+		t.Fatalf("no view documents: %s", r)
+	}
+	if strings.Contains(e.kbDoc("v1", `["1","1"]`), "secret") {
+		t.Fatal("a non-allowlisted column reached a view document")
+	}
+
+	// Moving a section from document 1 to 2 updates both parents.
+	e.exec(`UPDATE kb_sections SET heading = 'moved', document_id = 2 WHERE tenant_id = 1 AND id = 101`)
+	e.requireConsistent("after moving a section")
+	if a, b := e.kbDoc("v1", `["1","1"]`), e.kbDoc("v1", `["1","2"]`); strings.Contains(a, "moved") || !strings.Contains(b, "moved") {
+		t.Fatalf("section move: doc1=%q doc2=%q", a, b)
+	}
+
+	// Renaming a shared tag updates every linked document, in one sink
+	// transaction, and only within the tenant.
+	before := e.scalar(`SELECT count(*)::text FROM embedsync.chunks_v1 WHERE pipeline = 'kb' AND content LIKE '%renamedtag%'`)
+	e.exec(`UPDATE kb_tags SET name = 'renamedtag' WHERE tenant_id = 1 AND id = 2`)
+	e.requireConsistent("after renaming a shared tag")
+	linked := e.scalar(`SELECT count(*)::text FROM kb_document_tags WHERE tenant_id = 1 AND tag_id = 2`)
+	got := e.scalar(`SELECT count(DISTINCT source_key)::text FROM embedsync.chunks_v1 WHERE pipeline = 'kb' AND content LIKE '%renamedtag%'`)
+	if before != "0" || got != linked || linked == "0" {
+		t.Fatalf("tag rename reached %s documents, %s are linked", got, linked)
+	}
+	if n := e.scalar(`SELECT count(*)::text FROM embedsync.chunks_v1 WHERE pipeline = 'kb' AND source_key LIKE '["2",%' AND content LIKE '%renamedtag%'`); n != "0" {
+		t.Fatal("a tag rename crossed tenants")
+	}
+
+	// Deleting a link, then a parent, removes the obsolete content.
+	e.exec(`DELETE FROM kb_document_tags WHERE tenant_id = 1 AND document_id = 3`)
+	e.requireConsistent("after deleting links")
+	if d := e.kbDoc("v1", `["1","3"]`); strings.Contains(d, "#") {
+		t.Fatalf("deleted links still rendered: %q", d)
+	}
+	e.exec(`DELETE FROM kb_documents WHERE tenant_id = 1 AND id = 4`)
+	r = e.requireConsistent("after deleting a parent")
+	if d := e.kbDoc("v1", `["1","4"]`); d != "" {
+		t.Fatalf("deleted parent still searchable: %q", d)
+	}
+	if r.ViewOrphans == 0 {
+		t.Fatal("the deleted parent's sections should be reported as orphans")
+	}
+
+	// Many child edits in one transaction: one final representation.
+	lsnBefore := e.scalar(`SELECT max(source_lsn)::text FROM embedsync.chunks_v1 WHERE pipeline = 'kb' AND source_key = '["2","5"]'`)
+	tx, err := e.admin.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, q := range []string{
+		`UPDATE kb_sections SET body = 'edit one' WHERE tenant_id = 2 AND id = 501`,
+		`UPDATE kb_sections SET body = 'edit two', position = 9 WHERE tenant_id = 2 AND id = 502`,
+		`INSERT INTO kb_sections VALUES (2, 599, 5, 0, 'new', 'inserted first')`,
+		`DELETE FROM kb_sections WHERE tenant_id = 2 AND id = 503`,
+		`UPDATE kb_documents SET title = 'retitled' WHERE tenant_id = 2 AND id = 5`,
+		`INSERT INTO kb_document_tags VALUES (2, 5, 5)`,
+		`UPDATE kb_tags SET name = 'aaa first' WHERE tenant_id = 2 AND id = 5`,
+	} {
+		if _, err := tx.Exec(context.Background(), q); err != nil {
+			t.Fatalf("edit %d: %v", i, err)
+		}
+	}
+	if err := tx.Commit(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	e.requireConsistent("after many child edits in one transaction")
+	doc := e.kbDoc("v1", `["2","5"]`)
+	if !strings.HasPrefix(doc, "retitled #aaa first") || !strings.Contains(doc, "new: inserted first") || strings.Contains(doc, "body of section 3 of doc 5") {
+		t.Fatalf("final representation: %q", doc)
+	}
+	lsns := e.scalar(`SELECT count(DISTINCT source_lsn)::text FROM embedsync.chunks_v1 WHERE pipeline = 'kb' AND source_key = '["2","5"]'`)
+	if lsns != "1" || e.scalar(`SELECT max(source_lsn)::text FROM embedsync.chunks_v1 WHERE pipeline = 'kb' AND source_key = '["2","5"]'`) == lsnBefore {
+		t.Fatalf("the document must be rewritten once, at the transaction's position (distinct lsns %s)", lsns)
+	}
+	st := e.status()
+	var kinds []string
+	for _, p := range st["pipelines"].([]any) {
+		m := p.(map[string]any)
+		kinds = append(kinds, fmt.Sprint(m["name"], "=", m["kind"]))
+	}
+	b, _ := json.Marshal(kinds)
+	if !strings.Contains(string(b), "kb=view") || !strings.Contains(string(b), "kb:sections=view_table") {
+		t.Fatalf("status pipelines: %s", b)
+	}
+	p.stop(t)
+}

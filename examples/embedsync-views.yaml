@@ -1,0 +1,108 @@
+# A "view": one document assembled from several related tables, replicated
+# through the same publication, replication slot and embedder as ordinary
+# pipelines. Everything outside `views:` is shared and works exactly as in
+# examples/embedsync.yaml (see the comments there). Load the demo tables with
+# examples/seed-views.sql.
+#
+# A document is exactly one root row (here one kb_documents row). Its text is
+# rendered from that row's fields plus:
+#   - children: rows of another table that reference the root row (sections),
+#     in a fixed order;
+#   - links: rows of a target table reached through a link table (tags via
+#     kb_document_tags), many-to-many.
+# A change to any of these rows re-renders every document it belongs to; a
+# change to a shared target row (renaming a tag) re-renders every document
+# linked to it.
+#
+# Tenant boundaries: every table's key, and every reference (parent, target),
+# starts with the tenant column. Joins therefore always match the tenant too,
+# so a document can never pick up another tenant's sections or tags, even
+# where both tenants use the same numeric ids.
+#
+# One consumer per table: a table belongs to exactly one pipeline or view
+# (root, child, link or target). Validation rejects reusing a table.
+
+source:
+  dsn_env: EMBEDSYNC_SOURCE_DSN
+  publication: embedsync_pub
+  slot: embedsync_slot
+  control_schema: embedsync_control
+
+sink:
+  dsn_env: EMBEDSYNC_SINK_DSN
+  reader_dsn_env: EMBEDSYNC_READER_DSN
+  schema: embedsync
+  reader_role: embedsync_reader
+
+# Default transform for pipelines and views that do not set their own.
+transform:
+  template: "{{.title}}"
+  chunk_words: 160
+  chunk_overlap: 24
+
+views:
+  - name: kb                               # document pipeline name; may not equal a pipeline name
+    tenant: tenant_id                      # first column of every key and reference below
+    table: public.kb_documents             # root: one document per row
+    key: [tenant_id, id]                   # the root primary key, tenant first
+    fields:                                # the allowlist; only these columns (plus keys and
+      - { name: title, column: title }     # reference/order columns) are published
+
+    children:
+      - name: sections                     # {{range .sections}} in the template
+        table: public.kb_sections
+        key: [tenant_id, id]               # the child primary key, tenant first
+        parent: [tenant_id, document_id]   # child columns referencing the root key, in root key order
+        # Columns ordering the sections in a document. NULL values sort last;
+        # rows with equal values are ordered by the child key, so the
+        # rendered text is deterministic.
+        order_by: [position]
+        fields:
+          - { name: heading, column: heading }
+          - { name: body,    column: body }
+
+    links:
+      - name: tags                         # {{range .tags}} in the template
+        table: public.kb_document_tags     # the link table (many-to-many)
+        key: [tenant_id, document_id, tag_id]
+        parent: [tenant_id, document_id]   # link columns referencing the root key
+        target: [tenant_id, tag_id]        # link columns referencing the target key
+        target_table: public.kb_tags
+        target_key: [tenant_id, id]
+        target_fields:
+          - { name: name, column: name }
+        # Target field names (not columns) ordering the tags. NULL values sort
+        # last; ties are broken by the target key.
+        order_by: [name]
+
+    # The template namespace is the root fields (.title) plus one list per
+    # child and link name (.sections, .tags); each list element holds that
+    # child's fields or that link's target_fields. Root field, child and link
+    # names therefore share one namespace and must be distinct.
+    transform:
+      template: "{{.title}}{{range .tags}} #{{.name}}{{end}}{{range .sections}}\n\n{{.heading}}\n{{.body}}{{end}}"
+      chunk_words: 160
+      chunk_overlap: 24
+
+    # A document with more rows than this in one child or link is quarantined
+    # (too_many_children) instead of being embedded. Default 1000.
+    max_children: 500
+    # The most documents of this view one source transaction may change (e.g.
+    # renaming a tag used everywhere). Above it the pipeline pauses before
+    # acknowledging, keeping the transaction atomic. Default 10000.
+    # Neither limit is part of the view fingerprint: changing them never
+    # re-embeds anything.
+    max_fanout_per_txn: 10000
+
+embedder:
+  url: http://embedder:8000
+  url_env: EMBEDSYNC_EMBEDDER_URL
+
+models:
+  minilm:
+    name: sentence-transformers/all-MiniLM-L6-v2
+    revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+    dimension: 384
+    distance: cosine
+
+initial_generation: minilm

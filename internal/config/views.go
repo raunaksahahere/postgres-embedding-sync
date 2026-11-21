@@ -248,7 +248,9 @@ func (c *Config) DocNames() []string {
 // Fingerprint hashes everything that affects a view's document text: the
 // assembly (tables, keys, references, order, fields) and the transform. The
 // limits are left out: they decide whether a document is processed, not
-// what it says.
+// what it says. Physical column names are included (order and reference
+// columns decide the text), so renaming a view's column means a new
+// generation, unlike a standalone pipeline's field column.
 func (v *ViewDef) Fingerprint() string {
 	d := *v
 	d.MaxChildren, d.MaxFanoutPerTxn = 0, 0
@@ -282,6 +284,9 @@ func (c *Config) validateViews(add func(string, ...any), tables, names map[strin
 			if tables[t] {
 				add("%s: table %s is already used by another pipeline or view (one consumer per table)", where, t)
 			}
+			if schema == c.Source.ControlSchema {
+				add("%s: %s table must not live in the control schema %q", where, what, c.Source.ControlSchema)
+			}
 			tables[t] = true
 		}
 		checkKey := func(what string, key KeyColumns) {
@@ -305,10 +310,12 @@ func (c *Config) validateViews(add func(string, ...any), tables, names map[strin
 				add("%s: %s has %d columns but the key it references has %d", where, what, len(ref), len(to))
 				return
 			}
+			seen := map[string]bool{}
 			for _, c := range ref {
-				if !identRe.MatchString(c) {
-					add("%s: %s column %q is not a lowercase identifier", where, what, c)
+				if !identRe.MatchString(c) || seen[c] {
+					add("%s: %s column %q is invalid or repeated", where, what, c)
 				}
+				seen[c] = true
 			}
 			if len(ref) > 0 && ref[0] != v.Tenant {
 				add("%s: %s must start with the tenant column %q (a join may not cross tenants)", where, what, v.Tenant)
