@@ -179,7 +179,9 @@ type QueryEncoder struct {
 }
 
 // Request builds the provider request for query texts (prompt applied).
-func (q *QueryEncoder) Request(texts ...string) embedclient.Request { return q.g.queryRequest(texts...) }
+func (q *QueryEncoder) Request(texts ...string) embedclient.Request {
+	return q.g.queryRequest(texts...)
+}
 
 // Encoder returns how a generation's queries are embedded: its model,
 // prompt, provider and request settings.
