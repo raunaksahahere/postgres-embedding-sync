@@ -243,11 +243,11 @@ func cmdInit(ctx context.Context, args []string) error {
 			return fmt.Errorf("%s admin connect: %w", side.name, err)
 		}
 		applied, err := dbinit.Apply(ctx, conn, side.name, cfg, roles)
-		var changes []string
+		var changes, warnings []string
 		if err == nil && side.name == "source" {
 			// Grants and publication membership follow the configured
 			// pipelines, also after the first init.
-			changes, err = dbinit.ReconcileSource(ctx, conn, cfg, roles)
+			changes, warnings, err = dbinit.ReconcileSource(ctx, conn, cfg, roles)
 		}
 		conn.Close(context.Background())
 		if err != nil {
@@ -261,6 +261,9 @@ func cmdInit(ctx context.Context, args []string) error {
 		}
 		for _, c := range changes {
 			fmt.Printf("%s: %s\n", side.name, c)
+		}
+		for _, w := range warnings {
+			fmt.Fprintf(os.Stderr, "%s: warning: %s\n", side.name, w)
 		}
 	}
 	return nil

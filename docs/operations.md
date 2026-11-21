@@ -139,7 +139,9 @@ a failover without synced slots, treat it as slot loss.
 * **Changing or removing a pipeline**: its table and key cannot change in place
   (startup pauses with `identity_mismatch`); a new transform needs a new generation
   (`embedsync migrate`), as before. Removing a pipeline from the config pauses startup
-  (`startup_check`); restore it or set up a new sink schema.
+  (`startup_check`); restore it or set up a new sink schema. `embedsync init` never
+  removes a table from the publication; a table that no pipeline names makes `run` stop
+  until it is restored or, if it was never synced, dropped from the publication by hand.
 * **PostgreSQL major upgrade** of the source: `pg_upgrade` does not keep logical slots
   before PG 17 (17+ migrates them if the subscriber/consumer is caught up). Stop writers,
   wait for `embedsync status` to show idle, upgrade, then either reuse the migrated slot

@@ -154,7 +154,7 @@ func LoadCatalog(ctx context.Context, e *Env) (*Catalogs, error) {
 		}
 		p := byTable[s+"."+t]
 		if p == nil {
-			return nil, fmt.Errorf("publication %q includes %s.%s, which no pipeline names; it must contain only the pipelines' tables and the marker table (run `embedsync init` to reconcile it)", cfg.Source.Publication, s, t)
+			return nil, fmt.Errorf("publication %q includes %s.%s, which no pipeline names; it must contain only the pipelines' tables and the marker table: if that table was ever synced, restore its pipeline in the config; otherwise remove it with ALTER PUBLICATION %s DROP TABLE %s", cfg.Source.Publication, s, t, pgx.Identifier{cfg.Source.Publication}.Sanitize(), pgx.Identifier{s, t}.Sanitize())
 		}
 		seen[p.Name] = true
 		have := map[string]bool{}

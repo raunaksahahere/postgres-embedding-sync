@@ -704,7 +704,7 @@ func TestLegacyUpgradeServesOriginalDocuments(t *testing.T) {
 `
 	e.writeConfig()
 	out, err = e.cli("init")
-	if err != nil || !strings.Contains(out, "publication embedsync_pub now publishes") {
+	if err != nil || !strings.Contains(out, "publication embedsync_pub: added support.tickets") {
 		t.Fatalf("init after adding a pipeline: %v %s", err, out)
 	}
 	defaultV1 := e.chunkRows("chunks_v1", "default")
@@ -720,5 +720,26 @@ func TestLegacyUpgradeServesOriginalDocuments(t *testing.T) {
 	if got := e.chunkRows("chunks_v1", "default"); fmt.Sprint(got) != fmt.Sprint(defaultV1) {
 		t.Fatal("adding a pipeline rewrote the existing pipeline's chunks")
 	}
+	p.stop(t)
+
+	// Dropping the pipeline from the config must not drop its table from the
+	// publication: restoring it later would otherwise leave a gap in its
+	// change stream that nothing backfills.
+	full := e.opts.pipelines
+	e.opts.pipelines = full[:strings.Index(full, "  - name: tickets")]
+	e.writeConfig()
+	out, err = e.cli("init")
+	if err != nil || !strings.Contains(out, "still publishes support.tickets") {
+		t.Fatalf("init without the tickets pipeline: %v %s", err, out)
+	}
+	if n := e.scalar(`SELECT count(*)::text FROM pg_publication_tables WHERE pubname = 'embedsync_pub' AND tablename = 'tickets'`); n != "1" {
+		t.Fatal("init removed a synced table from the publication")
+	}
+	e.opts.pipelines = full
+	e.writeConfig()
+	e.exec(`UPDATE support.tickets SET subject = 'changed while unconfigured' WHERE id = 7`)
+	p = e.start()
+	e.waitReady()
+	e.requireConsistent("after removing and restoring the tickets pipeline")
 	p.stop(t)
 }
