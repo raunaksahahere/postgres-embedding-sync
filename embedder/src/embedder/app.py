@@ -16,6 +16,10 @@ Environment:
   EMBEDDER_THREADS         torch CPU threads (default: torch's choice)
   HF_HOME                  model cache directory (first run downloads here)
   HF_HUB_OFFLINE=1         reuse the cache without network access
+  EMBEDDER_BUNDLED_MODELS_DIR  read-only models shipped with an installer, laid out as
+                           <dir>/<org>__<name>/<revision>/; used before the HF cache
+  EMBEDDER_PARENT_PID      exit when this process ends (set by `embedsync` when it
+                           starts the embedder itself)
   EMBEDDER_FAULT_REJECT_SUBSTRING  test-only: reject inputs containing it
 """
 
@@ -101,10 +105,55 @@ class Registry:
             log.exception("model load failed")
 
 
+def bundled_path(name: str, revision: str, root: str | None = None) -> str | None:
+    """Directory of a model shipped with the installer, if present."""
+    root = root if root is not None else os.environ.get("EMBEDDER_BUNDLED_MODELS_DIR")
+    if not root:
+        return None
+    path = os.path.join(root, name.replace("/", "__"), revision)
+    return path if os.path.isfile(os.path.join(path, "modules.json")) else None
+
+
 def _load_sentence_transformer(name: str, revision: str):
     from sentence_transformers import SentenceTransformer
 
+    local = bundled_path(name, revision)
+    if local:
+        log.info("using bundled model %s@%s", name, revision)
+        return SentenceTransformer(local, device="cpu", local_files_only=True)
     return SentenceTransformer(name, revision=revision, device="cpu")
+
+
+def _watch_parent(pid: int, interval: float = 2.0) -> None:
+    """Exit when the process that started us is gone (no orphaned embedders)."""
+
+    def alive() -> bool:
+        if os.name == "nt":
+            import ctypes
+
+            k32 = ctypes.windll.kernel32
+            h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+            k32.CloseHandle(h)
+            return bool(ok) and code.value == 259  # STILL_ACTIVE
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return os.getppid() == pid
+
+    def loop() -> None:
+        while alive():
+            time.sleep(interval)
+        log.info("parent process %d exited; stopping", pid)
+        os._exit(0)
+
+    threading.Thread(target=loop, daemon=True).start()
 
 
 def create_app(settings: Settings | None = None, loader=None, background: bool = True) -> FastAPI:
@@ -123,7 +172,7 @@ def create_app(settings: Settings | None = None, loader=None, background: bool =
             registry.load(settings, loader)
         yield
 
-    app = FastAPI(title="embedsync embedder", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="embedsync embedder", version="0.2.0", lifespan=lifespan)
     app.state.registry = registry
 
     @app.get("/healthz")
@@ -194,6 +243,9 @@ def main() -> None:
     import uvicorn
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    parent = os.environ.get("EMBEDDER_PARENT_PID")
+    if parent:
+        _watch_parent(int(parent))
     uvicorn.run(
         create_app(),
         host=os.environ.get("EMBEDDER_HOST", "0.0.0.0"),

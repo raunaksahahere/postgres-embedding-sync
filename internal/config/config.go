@@ -120,8 +120,11 @@ type Retry struct {
 	MaxBackoff     Duration `yaml:"max_backoff"`
 }
 
-// Embedder configures the HTTP embedding service client.
+// Embedder configures the HTTP embedding service client. With Managed set,
+// embedsync starts the embedder shipped with the installer on a private
+// localhost port and stops it on exit; URL and URLEnv are then ignored.
 type Embedder struct {
+	Managed           bool     `yaml:"managed"`
 	URL               string   `yaml:"url"`
 	URLEnv            string   `yaml:"url_env"`
 	Timeout           Duration `yaml:"timeout"`
@@ -368,8 +371,8 @@ func (c *Config) Validate() error {
 	if c.Transform.ChunkOverlap < 0 || c.Transform.ChunkOverlap >= c.Transform.ChunkWords {
 		add("transform.chunk_overlap must be in [0, chunk_words)")
 	}
-	if c.Embedder.URL == "" && c.Embedder.URLEnv == "" {
-		add("embedder.url or embedder.url_env is required")
+	if !c.Embedder.Managed && c.Embedder.URL == "" && c.Embedder.URLEnv == "" {
+		add("embedder.url or embedder.url_env is required (or embedder.managed: true)")
 	}
 	if len(c.Models) == 0 {
 		add("at least one model is required")

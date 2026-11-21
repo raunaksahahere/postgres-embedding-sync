@@ -1,7 +1,9 @@
 package config
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -58,5 +60,43 @@ unknown_key: 1
 `))
 	if err == nil {
 		t.Fatal("expected errors")
+	}
+}
+
+func TestEnvFile(t *testing.T) {
+	dir := t.TempDir()
+	p := EnvFilePath(filepath.Join(dir, "embedsync.yaml"))
+	if err := WriteEnvFile(p, "test", [][2]string{{"ES_TEST_A", "postgres://u:p@h/db?x=1"}, {"ES_TEST_B", "new"}}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("ES_TEST_B", "from-env")
+	if err := LoadEnvFile(p); err != nil {
+		t.Fatal(err)
+	}
+	if got := os.Getenv("ES_TEST_A"); got != "postgres://u:p@h/db?x=1" {
+		t.Fatalf("A=%q", got)
+	}
+	if got := os.Getenv("ES_TEST_B"); got != "from-env" {
+		t.Fatalf("real environment must win, B=%q", got)
+	}
+	os.Unsetenv("ES_TEST_A")
+	if err := LoadEnvFile(filepath.Join(dir, "missing.env")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestManagedEmbedderNeedsNoURL(t *testing.T) {
+	base := `
+source: {table: public.d, key: id, fields: [{name: body, column: body}]}
+transform: {template: "{{.body}}"}
+embedder: {%s}
+models: {m: {name: a, revision: b, dimension: 3}}
+initial_generation: m
+`
+	if _, err := Parse([]byte(fmt.Sprintf(base, "managed: true"))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Parse([]byte(fmt.Sprintf(base, "managed: false"))); err == nil {
+		t.Fatal("an unmanaged embedder without url must be rejected")
 	}
 }

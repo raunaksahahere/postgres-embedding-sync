@@ -69,3 +69,15 @@ def test_settings_require_pinned_revision():
         Settings.from_env()
     os.environ["EMBEDDER_MODELS"] = "a/b@1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
     assert Settings.from_env().models == [("a/b", "1110a243fdf4706b3f48f1d95db1a4f5529b4d41")]
+
+
+def test_bundled_path(tmp_path):
+    from embedder.app import bundled_path
+
+    model = tmp_path / "org__name" / "abc1234"
+    model.mkdir(parents=True)
+    assert bundled_path("org/name", "abc1234", str(tmp_path)) is None  # not a model dir yet
+    (model / "modules.json").write_text("[]")
+    assert bundled_path("org/name", "abc1234", str(tmp_path)) == str(model)
+    assert bundled_path("org/name", "other", str(tmp_path)) is None
+    assert bundled_path("org/name", "abc1234", "") is None

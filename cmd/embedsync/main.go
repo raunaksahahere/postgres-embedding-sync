@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"syscall"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/app"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/config"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/dbinit"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/local"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/migrate"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/search"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/store"
@@ -29,6 +31,12 @@ const usage = `embedsync %s — CDC-driven embedding sync for PostgreSQL + pgvec
 
 Usage:
   embedsync <command> [flags]
+
+Getting started:
+  setup                    guided setup: connect to PostgreSQL, pick a table and a
+                           model, create roles and write the config (run this first)
+  doctor                   check the installation, database and embedder
+  model list|add           list bundled/configured models, add one from Hugging Face
 
 Commands:
   init                     apply source/sink SQL migrations (admin DSNs)
@@ -43,13 +51,16 @@ Commands:
   rebuild --confirm        recover from a lost slot into a fresh generation
   version                  print version
 
-Every command accepts --config (default ./embedsync.yaml or $EMBEDSYNC_CONFIG).
-Credentials are read only from environment variables named in the config.
+Every command accepts --config (default: $EMBEDSYNC_CONFIG, else ./embedsync.yaml
+if present, else the file written by setup: %s).
+Credentials are read only from environment variables named in the config; an
+embedsync.env file next to the config (written by setup, mode 0600) provides
+any that are not already set.
 `
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Fprintf(os.Stderr, usage, version.Version)
+		fmt.Fprintf(os.Stderr, usage, version.Version, local.DefaultConfigPath())
 		os.Exit(2)
 	}
 	cmd, args := os.Args[1], os.Args[2:]
@@ -61,8 +72,14 @@ func main() {
 		fmt.Println("embedsync", version.Version)
 		return
 	case "help", "-h", "--help":
-		fmt.Printf(usage, version.Version)
+		fmt.Printf(usage, version.Version, local.DefaultConfigPath())
 		return
+	case "setup":
+		err = cmdSetup(ctx, args)
+	case "doctor":
+		err = cmdDoctor(ctx, args)
+	case "model", "models":
+		err = cmdModel(ctx, args)
 	case "init":
 		err = cmdInit(ctx, args)
 	case "run":
@@ -82,9 +99,10 @@ func main() {
 	case "rebuild":
 		err = cmdRebuild(ctx, args)
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command %q\n\n"+usage, cmd, version.Version)
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n"+usage, cmd, version.Version, local.DefaultConfigPath())
 		os.Exit(2)
 	}
+	runCleanups()
 	if err != nil {
 		var ec exitCode
 		if errors.As(err, &ec) {
@@ -106,30 +124,92 @@ type common struct {
 	level  *string
 }
 
+// cleanups run before the process exits (stopping a child embedder).
+var cleanups []func()
+
+func runCleanups() {
+	for i := len(cleanups) - 1; i >= 0; i-- {
+		cleanups[i]()
+	}
+	cleanups = nil
+}
+
+// defaultConfig picks $EMBEDSYNC_CONFIG, ./embedsync.yaml, or the per-user file from setup.
+func defaultConfig() string {
+	if v := os.Getenv("EMBEDSYNC_CONFIG"); v != "" {
+		return v
+	}
+	if _, err := os.Stat("embedsync.yaml"); err == nil {
+		return "embedsync.yaml"
+	}
+	return local.DefaultConfigPath()
+}
+
 func newFlags(name string) *common {
 	fs := flag.NewFlagSet(name, flag.ExitOnError)
-	def := os.Getenv("EMBEDSYNC_CONFIG")
-	if def == "" {
-		def = "embedsync.yaml"
-	}
+	def := defaultConfig()
 	return &common{fs: fs, config: fs.String("config", def, "path to embedsync.yaml"),
 		json: fs.Bool("json", false, "machine-readable output"), level: fs.String("log-level", "info", "debug|info|warn|error")}
 }
+
+func (c *common) loadEnv() error { return config.LoadEnvFile(config.EnvFilePath(*c.config)) }
 
 func (c *common) load() (*config.Config, *slog.Logger, error) {
 	var lvl slog.Level
 	_ = lvl.UnmarshalText([]byte(*c.level))
 	log := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: lvl}))
+	if err := config.LoadEnvFile(config.EnvFilePath(*c.config)); err != nil {
+		return nil, log, err
+	}
 	cfg, err := config.Load(*c.config)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, log, fmt.Errorf("no config at %s: run `embedsync setup` first (or pass --config)", *c.config)
+	}
 	return cfg, log, err
 }
 
 func open(ctx context.Context, c *common, needSource bool) (*app.Env, error) {
+	e, _, err := openWith(ctx, c, needSource, false)
+	return e, err
+}
+
+// openWithEmbedder also makes sure an embedder is reachable: with
+// embedder.managed it reuses the one `embedsync run` started or starts the
+// bundled embedder for the duration of this command.
+func openWithEmbedder(ctx context.Context, c *common, needSource bool) (*app.Env, *local.Embedder, error) {
+	return openWith(ctx, c, needSource, true)
+}
+
+func openWith(ctx context.Context, c *common, needSource, needEmbed bool) (*app.Env, *local.Embedder, error) {
 	cfg, log, err := c.load()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return app.Open(ctx, cfg, log, needSource)
+	var emb *local.Embedder
+	if needEmbed && cfg.Embedder.Managed {
+		emb, err = local.Ensure(ctx, local.Options{Models: configModels(cfg),
+			Progress: func(m string) { log.Info("waiting for embedder", "status", m) }})
+		if err != nil {
+			return nil, nil, err
+		}
+		cleanups = append(cleanups, emb.Stop)
+		cfg.Embedder.URL, cfg.Embedder.URLEnv = emb.URL, ""
+	}
+	e, err := app.Open(ctx, cfg, log, needSource)
+	return e, emb, err
+}
+
+func configModels(cfg *config.Config) []local.ModelRef {
+	keys := make([]string, 0, len(cfg.Models))
+	for k := range cfg.Models {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]local.ModelRef, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, local.ModelRef{Name: cfg.Models[k].Name, Revision: cfg.Models[k].Revision})
+	}
+	return out
 }
 
 func cmdInit(ctx context.Context, args []string) error {
@@ -173,12 +253,33 @@ func cmdRun(ctx context.Context, args []string) error {
 	c := newFlags("run")
 	accept := c.fs.Bool("accept-schema-change", false, "accept a reviewed change to the source table's key/field columns")
 	_ = c.fs.Parse(args)
-	e, err := open(ctx, c, true)
+	e, emb, err := openWithEmbedder(ctx, c, true)
 	if err != nil {
 		return err
 	}
 	defer e.Close()
-	return app.Run(ctx, app.RunOptions{AcceptSchemaChange: *accept}, e)
+	if emb != nil && emb.Exited() != nil {
+		// Let `embedsync search`/`migrate` reuse this embedder, and stop if it dies.
+		if err := emb.Publish(configModels(e.Cfg)); err != nil {
+			e.Log.Warn("could not publish embedder state", "err", err)
+		}
+		var cancel context.CancelCauseFunc
+		ctx, cancel = context.WithCancelCause(ctx)
+		defer cancel(nil)
+		go func() {
+			select {
+			case <-emb.Exited():
+				cancel(fmt.Errorf("bundled embedder exited unexpectedly; log: %s", emb.LogPath))
+			case <-ctx.Done():
+			}
+		}()
+		e.Log.Info("bundled embedder ready", "url", emb.URL, "log", emb.LogPath)
+	}
+	err = app.Run(ctx, app.RunOptions{AcceptSchemaChange: *accept}, e)
+	if cause := context.Cause(ctx); cause != nil && !errors.Is(cause, context.Canceled) {
+		return cause
+	}
+	return err
 }
 
 func cmdBackfill(ctx context.Context, args []string) error {
@@ -225,7 +326,18 @@ func cmdMigrate(ctx context.Context, args []string) error {
 	force := c.fs.Bool("force", false, "finalize before the rollback window ends")
 	timeout := c.fs.Duration("catchup-timeout", 0, "override migration.catchup_timeout")
 	_ = c.fs.Parse(args)
-	e, err := open(ctx, c, true)
+	var e *app.Env
+	var err error
+	if sub == "" {
+		cfg, _, lerr := c.load()
+		if lerr == nil && cfg.Embedder.Managed && local.RunPublished() && !local.RunCovers(configModels(cfg)) {
+			return errors.New("`embedsync run` is running with an embedder that does not serve every configured model; " +
+				"restart `embedsync run` (it loads the models in the config), then run migrate again")
+		}
+		e, _, err = openWithEmbedder(ctx, c, true)
+	} else {
+		e, err = open(ctx, c, true)
+	}
 	if err != nil {
 		return err
 	}
@@ -287,7 +399,7 @@ func cmdSearch(ctx context.Context, args []string) error {
 	if c.fs.NArg() == 0 {
 		return errors.New("usage: embedsync search [flags] <query>")
 	}
-	e, err := open(ctx, c, false)
+	e, _, err := openWithEmbedder(ctx, c, false)
 	if err != nil {
 		return err
 	}
@@ -365,7 +477,7 @@ func cmdDLQ(ctx context.Context, args []string) error {
 	state := c.fs.String("state", "open", "filter by state (open|resolved|superseded|'')")
 	id := c.fs.Int64("id", 0, "replay only this record")
 	_ = c.fs.Parse(args)
-	e, err := open(ctx, c, false)
+	e, _, err := openWith(ctx, c, false, sub == "replay")
 	if err != nil {
 		return err
 	}
