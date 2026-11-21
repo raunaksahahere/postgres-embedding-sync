@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/config"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/dbinit"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/local"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/version"
 )
@@ -181,11 +182,47 @@ func (d *doctor) database(ctx context.Context, cfg *config.Config) {
 			case vec == "":
 				d.fail("sink: pgvector extension not created: run `embedsync setup`")
 			default:
-				d.ok("sink: pgvector %s", vec)
+				d.sinkSchema(ctx, conn, cfg, vec)
 			}
 		}
 		conn.Close(context.Background())
 	}
+}
+
+// sinkSchema checks that the sink schema exists and has every migration this
+// binary ships, then prints the sink line. It connects as the sink role,
+// which owns the schema and can read its schema_migrations.
+func (d *doctor) sinkSchema(ctx context.Context, conn *pgx.Conn, cfg *config.Config, vec string) {
+	want, err := dbinit.SchemaVersion()
+	if err != nil {
+		d.fail("sink: %v", err)
+		return
+	}
+	tbl := pgx.Identifier{cfg.Sink.Schema, "schema_migrations"}.Sanitize()
+	var exists bool
+	if err := conn.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, tbl).Scan(&exists); err != nil {
+		d.fail("sink: look up schema %s: %v", cfg.Sink.Schema, err)
+		return
+	}
+	if !exists {
+		d.fail("sink: schema %s not initialised: run `embedsync setup` (or `embedsync init`)", cfg.Sink.Schema)
+		return
+	}
+	var have *int
+	if err := conn.QueryRow(ctx, `SELECT max(version) FROM `+tbl).Scan(&have); err != nil {
+		d.fail("sink: read schema version of %s: %v", cfg.Sink.Schema, err)
+		return
+	}
+	n := 0
+	if have != nil {
+		n = *have
+	}
+	if n < want {
+		d.fail("sink: schema version %d, this embedsync needs %d: stop `embedsync run`, then run "+
+			"`embedsync init --admin-url <admin URL>` (see docs/install.md, Upgrading)", n, want)
+		return
+	}
+	d.ok("sink: pgvector %s, schema v%d", vec, n)
 }
 
 func (d *doctor) embedURL(ctx context.Context, cfg *config.Config) {

@@ -149,6 +149,17 @@ func Run(ctx context.Context, p *Prompter, o Options) (*Result, error) {
 		for _, f := range applied {
 			p.Say("  applied %s", f)
 		}
+		if side == "source" {
+			// Grants and publication membership follow the configured
+			// pipelines, also when setup reuses an existing publication.
+			changes, err := dbinit.ReconcileSource(ctx, conn, cfg, roles)
+			if err != nil {
+				return nil, fmt.Errorf("initialise source: %w", err)
+			}
+			for _, c := range changes {
+				p.Say("  %s", c)
+			}
+		}
 	}
 	p.Say("\nDone.")
 	p.Say("  config:      %s", o.ConfigPath)

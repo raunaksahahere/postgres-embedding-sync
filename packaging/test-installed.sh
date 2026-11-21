@@ -36,6 +36,18 @@ SQL
 echo "== setup $*"
 embedsync setup --yes --force --reset-role-passwords --admin-url "$ADMIN" --table public.e2e_docs "$@"
 
+echo "== init after setup (nothing left to do)"
+out="$(EMBEDSYNC_SOURCE_ADMIN_DSN="$ADMIN" EMBEDSYNC_SINK_ADMIN_DSN="$ADMIN" embedsync init 2>&1)" || { echo "$out"; echo "init failed after setup" >&2; exit 1; }
+echo "$out"
+for side in source sink; do
+  grep -q "^$side: up to date" <<<"$out" || { echo "init after setup: expected '$side: up to date'" >&2; exit 1; }
+done
+
+echo "== doctor after setup"
+out="$(embedsync doctor --skip-embedder 2>&1)" || { echo "$out"; echo "doctor failed after setup" >&2; exit 1; }
+echo "$out"
+grep -q "sink: pgvector .*, schema v" <<<"$out" || { echo "doctor after setup: sink schema version not reported" >&2; exit 1; }
+
 echo "== run"
 log="$cfgdir/run.log"
 embedsync run >"$log" 2>&1 &
