@@ -37,8 +37,8 @@ while serving searches.
 
 * Go service (pgx, pglogrepl), a local CPU embedding service (sentence-transformers, pinned
   revisions, no API key), PostgreSQL 16, 17 or 18 with pgvector.
-* Status: **v0.2.0** (next: several tables per process, composite keys), single process.
-  See [limitations](#limitations).
+* Status: **v0.3.0**: several tables per process (pipelines), composite primary keys,
+  single process. See [limitations](#limitations).
 
 ```mermaid
 flowchart LR

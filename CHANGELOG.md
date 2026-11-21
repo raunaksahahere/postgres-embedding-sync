@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.3.0
 
 Several tables in one process, and composite primary keys.
 
@@ -16,11 +16,17 @@ Several tables in one process, and composite primary keys.
 * Search hits, `status`, `verify`, the DLQ and backfill jobs report the pipeline;
   `embedsync backfill --pipeline P` re-scans one table. With several pipelines the
   migration gate judges hits as `<pipeline>/<key>` in `eval_qrels`.
-* `embedsync init` reconciles the publication and column grants with the configured
-  pipelines on every run.
-* **Upgrade**: run `embedsync init` before starting the new version; it applies
-  `sink/0002_pipelines.sql` (see docs/operations.md). Existing documents are not
-  re-embedded and keep serving.
+* `embedsync init` (and `setup`) add new pipelines' tables to the publication and grant
+  their columns on every run. They never remove a table: one that no pipeline names is
+  reported, with the statement to drop it by hand if it was never synced.
+* A generation is ready, and a migration gates it, only after every pipeline's backfill
+  is done; a resumed migration re-checks this.
+* **Upgrade**: stop `embedsync run`, install the new version, run
+  `embedsync init --admin-url <admin URL>` (new flag; or the admin DSN variables), then
+  start `run`. It applies `sink/0002_pipelines.sql` (see docs/install.md and
+  docs/operations.md). Existing documents are not re-embedded and keep serving. Until
+  then every command, and `embedsync doctor`, says the sink needs `embedsync init`.
+  Downgrading after `init` is not supported.
 
 ## v0.2.0
 
