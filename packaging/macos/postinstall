@@ -1,0 +1,6 @@
+#!/bin/sh
+# Put `embedsync` on PATH and make sure nothing installed is quarantined.
+mkdir -p /usr/local/bin
+ln -sf /usr/local/embedsync/embedsync /usr/local/bin/embedsync
+xattr -dr com.apple.quarantine /usr/local/embedsync 2>/dev/null || true
+exit 0

@@ -1,0 +1,270 @@
+name: packages
+
+# Builds the native installers (three variants each: nomodel, minilm, full)
+#   Linux   .deb   amd64, arm64
+#   macOS   .dmg   arm64 (Apple silicon; PyTorch no longer ships Intel macOS wheels)
+#   Windows .exe   x64
+# then installs them on clean runners and runs the developer flow end to end
+# (setup -> run -> search -> edit -> verify -> doctor) against a real
+# PostgreSQL with pgvector. On a v* tag, uploads everything to a DRAFT release.
+on:
+  pull_request:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: packages-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.12.21"
+  UV_IMAGE: ghcr.io/astral-sh/uv:0.12.21@sha256:a7aed3216253ee804de3e2d8afa5073baa1a177335345d43845cd4165e43b711
+  LINUX_BUILD_IMAGE: almalinux:8.10-20261027@sha256:2d0f2eb2a83cc09dbc2eb92fade4dbe8f709628149e81aa00aec70630406603b
+  PG_IMAGE: pgvector/pgvector:0.8.7-pg17-bookworm@sha256:b513c48566e4777cd3370451400000c78eda6a08131d68f4c31d4a76f27bd8fd
+
+jobs:
+  build:
+    name: build (${{ matrix.goos }}/${{ matrix.goarch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux, goarch: amd64, runner: ubuntu-24.04 }
+          - { goos: linux, goarch: arm64, runner: ubuntu-24.04-arm }
+          - { goos: darwin, goarch: arm64, runner: macos-15 }
+          - { goos: windows, goarch: amd64, runner: windows-2025 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Version matches tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: test "${GITHUB_REF_NAME}" = "v$(cat VERSION)"
+      # Linux: freeze inside AlmaLinux 8 (glibc 2.28) with uv's portable Python, so
+      # the bundle runs on any glibc 2.28+ distribution (Debian 10+, Ubuntu 20.04+,
+      # RHEL 8+), not only on the runner's newer glibc.
+      - name: Freeze embedder (Linux, AlmaLinux 8 container)
+        if: matrix.goos == 'linux'
+        run: |
+          mkdir -p build
+          cid=$(docker create "$UV_IMAGE") && docker cp "$cid:/uv" build/uv && docker rm "$cid" >/dev/null
+          docker run --rm -v "$PWD:/src" -w /src/embedder -e UV_PROJECT_ENVIRONMENT=/opt/venv \
+            -e UV_PYTHON_PREFERENCE=only-managed -e UV_PYTHON_INSTALL_DIR=/opt/uvpython "$LINUX_BUILD_IMAGE" bash -euc '
+            dnf install -y -q binutils >/dev/null
+            /src/build/uv sync --frozen --no-dev --group package
+            /src/build/uv run --frozen --no-sync pyinstaller --noconfirm --distpath /src/build/embedder-dist \
+              --workpath /tmp/pyi ../packaging/embedder/embedder.spec
+            chown -R '"$(id -u):$(id -g)"' /src/build'
+          # Fail if anything in the bundle needs a newer glibc than 2.28.
+          need=$(find build/embedder-dist -name '*.so*' -type f -exec objdump -T {} \; 2>/dev/null \
+            | grep -o 'GLIBC_2\.[0-9]*' | sort -t. -k2 -n -u | tail -1)
+          echo "highest glibc symbol: $need"
+          [ "${need#GLIBC_2.}" -le 28 ]
+      - name: Freeze embedder (macOS, Windows)
+        if: matrix.goos != 'linux'
+        working-directory: embedder
+        run: |
+          uv sync --frozen --no-dev --group package
+          uv run --frozen --no-sync pyinstaller --noconfirm --distpath ../build/embedder-dist \
+            --workpath ../build/pyi ../packaging/embedder/embedder.spec
+      - name: Inno Setup (Windows)
+        if: matrix.goos == 'windows'
+        run: |
+          if [ ! -x "/c/Program Files (x86)/Inno Setup 6/ISCC.exe" ]; then choco install innosetup --no-progress -y; fi
+          echo "ISCC=/c/Program Files (x86)/Inno Setup 6/ISCC.exe" >> "$GITHUB_ENV"
+      - name: Build installers
+        run: packaging/build.sh "$(cat VERSION)" ${{ matrix.goos }} ${{ matrix.goarch }} build/embedder-dist build/out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: installers-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: build/out/*
+          retention-days: 14
+          compression-level: 0
+
+  test-linux:
+    name: install + e2e (${{ matrix.image }}, ${{ matrix.arch }}, ${{ matrix.variant }})
+    needs: build
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # nomodel downloads the model the user names during setup.
+          - { arch: amd64, variant: nomodel, image: "ubuntu:24.04", setup: "--model sentence-transformers/paraphrase-MiniLM-L3-v2", offline: "0" }
+          # minilm and full must work with no network access to Hugging Face.
+          - { arch: amd64, variant: minilm, image: "debian:12", setup: "", offline: "1" }
+          - { arch: amd64, variant: full, image: "ubuntu:22.04", setup: "--model bge", offline: "1" }
+          - { arch: arm64, variant: minilm, image: "ubuntu:24.04", setup: "", offline: "1" }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: installers-linux-${{ matrix.arch }}
+          path: pkgs
+      - name: PostgreSQL with pgvector (wal_level stays default; setup must handle it)
+        run: |
+          docker network create e2e
+          docker run -d --name pg --network e2e -e POSTGRES_PASSWORD=adminpw "$PG_IMAGE"
+          for i in $(seq 60); do docker exec pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
+      - name: Install the .deb on a clean ${{ matrix.image }} and run the developer flow
+        run: |
+          docker run --rm --network e2e -v "$PWD:/w" -w /w -e VARIANT=${{ matrix.variant }} \
+            -e HF_HUB_OFFLINE=${{ matrix.offline }} -e SETUP_FLAGS="${{ matrix.setup }}" "${{ matrix.image }}" bash -euc '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq && apt-get install -y -qq curl postgresql-client python3 procps >/dev/null
+            apt-get install -y ./pkgs/embedsync-*-${VARIANT}-linux-*.deb
+            ADMIN=postgres://postgres:adminpw@pg:5432/postgres
+            # First setup sets wal_level=logical and asks for a restart (exit 1).
+            if embedsync setup --yes --admin-url "$ADMIN" --table public.none; then echo "expected a restart request"; exit 1; fi
+            touch /w/restart-requested'
+          test -f restart-requested
+          docker restart pg
+          for i in $(seq 60); do docker exec pg pg_isready -U postgres >/dev/null 2>&1 && break; sleep 1; done
+          sleep 2
+          docker run --rm --network e2e -v "$PWD:/w" -w /w -e VARIANT=${{ matrix.variant }} \
+            -e HF_HUB_OFFLINE=${{ matrix.offline }} -e SETUP_FLAGS="${{ matrix.setup }}" "${{ matrix.image }}" bash -euc '
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq && apt-get install -y -qq curl postgresql-client python3 procps >/dev/null
+            apt-get install -y ./pkgs/embedsync-*-${VARIANT}-linux-*.deb
+            packaging/test-installed.sh "$(cat VERSION)" postgres://postgres:adminpw@pg:5432/postgres $SETUP_FLAGS
+            apt-get remove -y embedsync-${VARIANT} >/dev/null && ! command -v embedsync && echo "uninstall OK"'
+
+  test-macos:
+    name: install + e2e (macOS arm64, ${{ matrix.variant }})
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [minilm, nomodel]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: installers-darwin-arm64
+          path: pkgs
+      - name: Install from the .dmg
+        run: |
+          hdiutil attach -nobrowse -mountpoint /Volumes/embedsync pkgs/embedsync-*-${{ matrix.variant }}-macos-arm64.dmg
+          ls /Volumes/embedsync
+          sudo installer -pkg "/Volumes/embedsync/Install embedsync.pkg" -target /
+          hdiutil detach /Volumes/embedsync
+          which embedsync && embedsync version
+      - name: PostgreSQL 17 + pgvector (Homebrew)
+        run: |
+          brew install postgresql@17 pgvector
+          echo "$(brew --prefix postgresql@17)/bin" >> "$GITHUB_PATH"
+          brew services start postgresql@17
+          for i in $(seq 60); do "$(brew --prefix postgresql@17)/bin/pg_isready" -h localhost && break; sleep 1; done
+      - name: Setup asks for wal_level, then the developer flow
+        run: |
+          ADMIN="postgres://$(whoami)@localhost:5432/postgres"
+          if embedsync setup --yes --admin-url "$ADMIN" --table public.none; then echo "expected a restart request"; exit 1; fi
+          brew services restart postgresql@17
+          for i in $(seq 60); do pg_isready -h localhost && break; sleep 1; done
+          sleep 2
+          flags=""
+          [ "${{ matrix.variant }}" = nomodel ] && flags="--model sentence-transformers/paraphrase-MiniLM-L3-v2"
+          packaging/test-installed.sh "$(cat VERSION)" "$ADMIN" $flags
+          sudo /usr/local/embedsync/uninstall.sh && ! command -v embedsync && echo "uninstall OK"
+
+  test-windows:
+    name: install + e2e (Windows x64, ${{ matrix.variant }})
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [minilm, nomodel]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: installers-windows-amd64
+          path: pkgs
+      - name: Silent per-user install; PATH is set in the registry
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem pkgs -Filter "embedsync-*-${{ matrix.variant }}-windows-x64-setup.exe" | Select-Object -First 1
+          Start-Process $exe.FullName -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/CURRENTUSER','/NORESTART','/LOG=install.log' -Wait
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\embedsync'
+          if (-not (Test-Path "$dir\embedsync.exe")) { Get-Content install.log -Tail 30; throw "not installed at $dir" }
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if ($userPath -notlike "*$dir*") { throw "install dir not on the user PATH: $userPath" }
+          Add-Content $env:GITHUB_PATH $dir
+      - name: PostgreSQL 17 (preinstalled on the runner) + pgvector built from source
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          git clone --quiet --depth 1 --branch v0.8.7 https://github.com/pgvector/pgvector.git "%RUNNER_TEMP%\pgvector" || exit /b 1
+          cd /d "%RUNNER_TEMP%\pgvector"
+          set "PGROOT=%PGROOT%"
+          nmake /NOLOGO /F Makefile.win || exit /b 1
+          nmake /NOLOGO /F Makefile.win install || exit /b 1
+          sc config postgresql-x64-17 start= demand
+          net start postgresql-x64-17
+      - name: Setup asks for wal_level, then the developer flow
+        run: |
+          export PATH="$(cygpath -u "$PGBIN"):$PATH"
+          ADMIN="postgres://postgres:root@localhost:5432/postgres"
+          if embedsync setup --yes --admin-url "$ADMIN" --table public.none; then echo "expected a restart request"; exit 1; fi
+          net stop postgresql-x64-17 && net start postgresql-x64-17
+          sleep 3
+          flags=""
+          [ "${{ matrix.variant }}" = nomodel ] && flags="--model sentence-transformers/paraphrase-MiniLM-L3-v2"
+          packaging/test-installed.sh "$(cat VERSION)" "$ADMIN" $flags
+      - name: Uninstall removes files and PATH entry
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:LOCALAPPDATA 'Programs\embedsync'
+          Start-Process "$dir\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+          Start-Sleep -Seconds 3
+          if (Test-Path "$dir\embedsync.exe") { throw "still installed" }
+          $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+          if ($userPath -like "*$dir*") { throw "PATH entry left behind: $userPath" }
+          "uninstall OK"
+
+  draft-release:
+    name: draft release (tags only)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [test-linux, test-macos, test-windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: installers-*
+          path: dist
+          merge-multiple: true
+      - name: CLI-only archives, checksums and draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/release-build.sh "$(cat VERSION)" keep
+          scripts/release-check.sh "$(cat VERSION)" dist
+          gh release create "$GITHUB_REF_NAME" --draft --verify-tag --title "embedsync $GITHUB_REF_NAME" \
+            --notes-file <(awk '/^## /{n++} n==1' CHANGELOG.md) dist/*

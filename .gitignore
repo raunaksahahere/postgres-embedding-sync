@@ -1,5 +1,6 @@
 # build outputs
 /dist/
+/build/
 /embedsync
 *.test
 *.out

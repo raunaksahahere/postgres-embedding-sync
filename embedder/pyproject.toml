@@ -1,6 +1,6 @@
 [project]
 name = "embedsync-embedder"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local CPU embedding service for postgres-embedding-sync (sentence-transformers, pinned revisions)"
 license = "Apache-2.0"
 requires-python = ">=3.12,<3.13"
@@ -17,6 +17,9 @@ embedder = "embedder.app:main"
 
 [dependency-groups]
 dev = ["pytest>=8.4", "httpx>=0.28", "ruff>=0.14"]
+package = [
+    "pyinstaller>=6.22.3",
+]
 
 [build-system]
 requires = ["hatchling>=1.27"]

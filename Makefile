@@ -60,7 +60,7 @@ release-build:
 	scripts/release-build.sh $(VERSION)
 
 release-check: release-build
-	scripts/release-check.sh $(VERSION)
+	scripts/release-check.sh $(VERSION) dist --cli-only
 
 clean:
 	rm -rf dist
