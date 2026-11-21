@@ -22,6 +22,7 @@ import (
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/dbinit"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/local"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/migrate"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/pipeline"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/search"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/store"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/version"
@@ -224,6 +225,11 @@ func cmdInit(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	// Reject a template that references fields outside its pipeline's
+	// allowlist before changing either database.
+	if _, err := pipeline.NewSpecs(cfg); err != nil {
+		return err
+	}
 	roles := dbinit.Roles{Replicator: *repl, Sink: *sink, Reader: *reader}
 	for _, side := range []struct{ name, env string }{{"source", *srcEnv}, {"sink", *sinkEnv}} {
 		dsn, err := config.Env(side.env)
@@ -235,15 +241,24 @@ func cmdInit(ctx context.Context, args []string) error {
 			return fmt.Errorf("%s admin connect: %w", side.name, err)
 		}
 		applied, err := dbinit.Apply(ctx, conn, side.name, cfg, roles)
+		var changes []string
+		if err == nil && side.name == "source" {
+			// Grants and publication membership follow the configured
+			// pipelines, also after the first init.
+			changes, err = dbinit.ReconcileSource(ctx, conn, cfg, roles)
+		}
 		conn.Close(context.Background())
 		if err != nil {
 			return err
 		}
-		if len(applied) == 0 {
+		if len(applied) == 0 && len(changes) == 0 {
 			fmt.Printf("%s: up to date\n", side.name)
 		}
 		for _, f := range applied {
 			fmt.Printf("%s: applied %s\n", side.name, f)
+		}
+		for _, c := range changes {
+			fmt.Printf("%s: %s\n", side.name, c)
 		}
 	}
 	return nil
@@ -285,6 +300,7 @@ func cmdRun(ctx context.Context, args []string) error {
 func cmdBackfill(ctx context.Context, args []string) error {
 	c := newFlags("backfill")
 	gen := c.fs.String("generation", "", "generation id (default: serving)")
+	pipe := c.fs.String("pipeline", "", "pipeline name (default: every pipeline)")
 	wait := c.fs.Bool("wait", true, "wait for completion")
 	_ = c.fs.Parse(args)
 	e, err := open(ctx, c, false)
@@ -292,7 +308,7 @@ func cmdBackfill(ctx context.Context, args []string) error {
 		return err
 	}
 	defer e.Close()
-	return app.Backfill(ctx, e, *gen, *wait, os.Stdout)
+	return app.Backfill(ctx, e, *gen, *pipe, *wait, os.Stdout)
 }
 
 func cmdStatus(ctx context.Context, args []string) error {
@@ -342,7 +358,7 @@ func cmdMigrate(ctx context.Context, args []string) error {
 		return err
 	}
 	defer e.Close()
-	m := &migrate.Migrator{Cfg: e.Cfg, Store: e.Store, Source: e.Source, Tr: e.Tr, Log: e.Log, Embed: e.Embed, Out: os.Stdout,
+	m := &migrate.Migrator{Cfg: e.Cfg, Store: e.Store, Source: e.Source, Trs: e.Trs(), Log: e.Log, Embed: e.Embed, Out: os.Stdout,
 		Searcher: &search.Searcher{Pool: e.Store.Pool, Schema: e.Cfg.Sink.Schema, Client: e.Embed}}
 	if *c.json {
 		m.Out = os.Stderr
@@ -433,9 +449,18 @@ func cmdSearch(ctx context.Context, args []string) error {
 		if len(snippet) > 110 {
 			snippet = snippet[:110] + "…"
 		}
-		fmt.Printf("%2d. [%s] %.3f  %s\n", i+1, h.Key, h.Score, snippet)
+		fmt.Printf("%2d. [%s] %.3f  %s\n", i+1, hitLabel(h), h.Score, snippet)
 	}
 	return nil
+}
+
+// hitLabel shows the key alone for the single-table pipeline ("default"), as
+// before pipelines existed, and "<pipeline>:<key>" otherwise.
+func hitLabel(h search.Hit) string {
+	if h.Pipeline == config.DefaultPipeline {
+		return h.Key
+	}
+	return h.Pipeline + ":" + h.Key
 }
 
 func cmdVerify(ctx context.Context, args []string) error {
@@ -456,9 +481,23 @@ func cmdVerify(ctx context.Context, args []string) error {
 	} else {
 		fmt.Printf("boundary %s checkpoint %s source rows %d\n", rep.BoundaryLSN, rep.CheckpointLSN, rep.SourceRows)
 		fmt.Printf("source_state: missing=%d extra=%d stale=%d\n", rep.SourceState.Missing, rep.SourceState.Extra, rep.SourceState.Stale)
+		multi := len(e.Cfg.Pipelines) > 1
+		if multi {
+			for _, p := range e.Cfg.PipelineNames() {
+				pr := rep.Pipelines[p]
+				fmt.Printf("  pipeline %s: source rows %d, source_state missing=%d extra=%d stale=%d\n", p, pr.SourceRows, pr.SourceState.Missing, pr.SourceState.Extra, pr.SourceState.Stale)
+			}
+		}
 		for _, g := range rep.Generations {
 			fmt.Printf("%s: chunks expected=%d actual=%d missing=%d extra=%d stale=%d quarantined_keys=%d\n",
 				g.Generation, g.ExpectedChunks, g.ActualChunks, g.Missing, g.Extra, g.Stale, g.Quarantined)
+			if multi {
+				for _, p := range e.Cfg.PipelineNames() {
+					if c := g.Pipelines[p]; c != nil {
+						fmt.Printf("  pipeline %s: chunks expected=%d actual=%d missing=%d extra=%d stale=%d\n", p, c.ExpectedChunks, c.ActualChunks, c.Missing, c.Extra, c.Stale)
+					}
+				}
+			}
 		}
 		fmt.Printf("ok=%v\n", rep.OK)
 	}
@@ -492,7 +531,7 @@ func cmdDLQ(ctx context.Context, args []string) error {
 			return app.PrintJSON(os.Stdout, es)
 		}
 		for _, d := range es {
-			fmt.Printf("#%d %-8s gen=%s key=%s lsn=%s reason=%s attempts=%d\n", d.ID, d.State, d.GenerationID, d.SourceKey, d.SourceLSN, d.Reason, d.Attempts)
+			fmt.Printf("#%d %-8s gen=%s pipeline=%s key=%s lsn=%s reason=%s attempts=%d\n", d.ID, d.State, d.GenerationID, d.Pipeline, d.SourceKey, d.SourceLSN, d.Reason, d.Attempts)
 		}
 		return nil
 	case "inspect":

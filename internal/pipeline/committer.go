@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -16,7 +17,6 @@ import (
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/config"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/embedclient"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/failpoint"
-	"github.com/raunaksahahere/postgres-embedding-sync/internal/keys"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/metrics"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/store"
 )
@@ -27,7 +27,7 @@ import (
 type Committer struct {
 	Cfg      *config.Config
 	Store    *store.Store
-	KeyKind  keys.Kind
+	Specs    Specs
 	Progress *Progress
 	Planner  *Planner
 	Log      *slog.Logger
@@ -67,13 +67,13 @@ func (c *Committer) Run(ctx context.Context, in <-chan *Unit) error {
 
 func (c *Committer) poisonPause(u *Unit) *PauseError {
 	for gid := range u.TargetGens() {
-		for k, d := range u.Effective(gid) {
+		for id, d := range u.Effective(gid) {
 			if d.Poison != "" {
-				return &PauseError{Reason: "poison_row", Detail: fmt.Sprintf("generation %s: row version at %s cannot be embedded (%s); on_poison=pause", gid, d.LSN, d.Poison)}
+				return &PauseError{Reason: "poison_row", Detail: fmt.Sprintf("generation %s, pipeline %s: row version at %s cannot be embedded (%s); on_poison=pause", gid, id.Pipeline, d.LSN, d.Poison)}
 			}
-			for _, ch := range u.Chunks[gid][k] {
+			for _, ch := range u.Chunks[gid][id] {
 				if _, bad := u.Rejected[gid][ch.Fingerprint]; bad {
-					return &PauseError{Reason: "poison_row", Detail: fmt.Sprintf("generation %s: embedding service rejected a chunk at %s; on_poison=pause", gid, d.LSN)}
+					return &PauseError{Reason: "poison_row", Detail: fmt.Sprintf("generation %s, pipeline %s: embedding service rejected a chunk at %s; on_poison=pause", gid, id.Pipeline, d.LSN)}
 				}
 			}
 		}
@@ -180,77 +180,119 @@ func (c *Committer) apply(ctx context.Context, u *Unit) error {
 	return tx.Commit(ctx)
 }
 
-func (c *Committer) rangePredicate(col string, lo, hi *string, args *[]any) string {
-	pred := "TRUE"
+// rangePredicate renders "rows of pipe inside (lo, hi]" over the encoded key
+// column. The typed casts sit behind a CASE on the pipeline so they never run
+// on another pipeline's keys (a composite key is not a bigint, a text key is
+// not JSON), whatever order the planner evaluates the conjuncts in.
+func (c *Committer) rangePredicate(pipe, col string, lo, hi *string, args *[]any) (string, error) {
+	spec := c.Specs[pipe]
+	if spec == nil {
+		return "", fmt.Errorf("range delete for unknown pipeline %q", pipe)
+	}
+	*args = append(*args, pipe)
+	pp := fmt.Sprintf("$%d", len(*args))
+	conds := []string{}
 	if lo != nil {
-		*args = append(*args, *lo)
-		pred += fmt.Sprintf(" AND %s > %s", c.KeyKind.SQLExpr(col), c.KeyKind.SQLParam(fmt.Sprintf("$%d", len(*args))))
+		s, err := spec.Codec.SinkCompare(col, ">", *lo, args)
+		if err != nil {
+			return "", err
+		}
+		conds = append(conds, s)
 	}
 	if hi != nil {
-		*args = append(*args, *hi)
-		pred += fmt.Sprintf(" AND %s <= %s", c.KeyKind.SQLExpr(col), c.KeyKind.SQLParam(fmt.Sprintf("$%d", len(*args))))
+		s, err := spec.Codec.SinkCompare(col, "<=", *hi, args)
+		if err != nil {
+			return "", err
+		}
+		conds = append(conds, s)
 	}
-	return pred
+	if len(conds) == 0 {
+		return "pipeline = " + pp, nil
+	}
+	return "pipeline = " + pp + " AND CASE WHEN pipeline = " + pp + " THEN " + strings.Join(conds, " AND ") + " ELSE false END", nil
 }
 
-// applyState maintains source_state: the allowlisted projection of the source at the checkpoint.
+func sortedIDs[T any](m map[DocID]T) []DocID {
+	out := make([]DocID, 0, len(m))
+	for id := range m {
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Less(out[j]) })
+	return out
+}
+
+func sortedPipes(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for p := range m {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// applyState maintains source_state: the allowlisted projection of every
+// pipeline's source table at the checkpoint.
 func (c *Committer) applyState(ctx context.Context, tx pgx.Tx, u *Unit) error {
 	st := c.Store.T("source_state")
-	if u.Truncate {
-		if _, err := tx.Exec(ctx, `DELETE FROM `+st); err != nil {
+	for _, pipe := range sortedPipes(u.Truncates) {
+		if _, err := tx.Exec(ctx, `DELETE FROM `+st+` WHERE pipeline = $1`, pipe); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `UPDATE `+c.Store.T("dlq")+` SET state = 'superseded', updated_at = now() WHERE state = 'open'`); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE `+c.Store.T("dlq")+` SET state = 'superseded', updated_at = now() WHERE state = 'open' AND pipeline = $1`, pipe); err != nil {
 			return err
 		}
 	}
 	seen := map[string]bool{}
 	for _, rd := range u.RangeDeletes {
-		args := []any{rd.Keep}
-		pred := c.rangePredicate("source_key", rd.Lo, rd.Hi, &args)
-		sig := fmt.Sprint(rd.Lo, rd.Hi)
+		sig := fmt.Sprint(rd.Pipeline, rd.Lo, rd.Hi)
 		if seen[sig] {
 			continue
 		}
 		seen[sig] = true
+		args := []any{rd.Keep}
+		pred, err := c.rangePredicate(rd.Pipeline, "source_key", rd.Lo, rd.Hi, &args)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `DELETE FROM `+st+` WHERE `+pred+` AND source_key <> ALL($1::text[])`, args...); err != nil {
 			return fmt.Errorf("range delete state: %w", err)
 		}
 	}
-	final := map[string]*DocEffect{}
-	for k, d := range u.Stream {
-		final[k] = d
+	final := map[DocID]*DocEffect{}
+	for id, d := range u.Stream {
+		final[id] = d
 	}
 	for _, m := range u.Snapshot {
-		for k, d := range m {
-			final[k] = d
+		for id, d := range m {
+			final[id] = d
 		}
 	}
-	var delKeys, upKeys, upLSN []string
+	var delPipes, delKeys, upPipes, upKeys, upLSN []string
 	var upFields [][]byte
-	for k, d := range final {
+	for _, id := range sortedIDs(final) {
+		d := final[id]
 		if d.Delete {
-			delKeys = append(delKeys, k)
+			delPipes, delKeys = append(delPipes, id.Pipeline), append(delKeys, id.Key)
 			continue
 		}
 		b, err := json.Marshal(d.Fields)
 		if err != nil {
 			return err
 		}
-		upKeys = append(upKeys, k)
+		upPipes, upKeys = append(upPipes, id.Pipeline), append(upKeys, id.Key)
 		upFields = append(upFields, b)
 		upLSN = append(upLSN, d.LSN.String())
 	}
 	if len(delKeys) > 0 {
-		if _, err := tx.Exec(ctx, `DELETE FROM `+st+` WHERE source_key = ANY($1)`, delKeys); err != nil {
+		if _, err := tx.Exec(ctx, `DELETE FROM `+st+` WHERE (pipeline, source_key) IN (SELECT * FROM unnest($1::text[], $2::text[]))`, delPipes, delKeys); err != nil {
 			return err
 		}
 	}
 	if len(upKeys) > 0 {
-		if _, err := tx.Exec(ctx, `INSERT INTO `+st+` (source_key, fields, source_lsn, updated_at)
-			SELECT k, f, l::pg_lsn, now() FROM unnest($1::text[], $2::jsonb[], $3::text[]) AS u(k, f, l)
-			ON CONFLICT (source_key) DO UPDATE SET fields = EXCLUDED.fields, source_lsn = EXCLUDED.source_lsn, updated_at = now()`,
-			upKeys, upFields, upLSN); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO `+st+` (pipeline, source_key, fields, source_lsn, updated_at)
+			SELECT p, k, f, l::pg_lsn, now() FROM unnest($1::text[], $2::text[], $3::jsonb[], $4::text[]) AS u(p, k, f, l)
+			ON CONFLICT (pipeline, source_key) DO UPDATE SET fields = EXCLUDED.fields, source_lsn = EXCLUDED.source_lsn, updated_at = now()`,
+			upPipes, upKeys, upFields, upLSN); err != nil {
 			return fmt.Errorf("upsert state: %w", err)
 		}
 	}
@@ -261,8 +303,8 @@ func (c *Committer) applyGen(ctx context.Context, tx pgx.Tx, u *Unit, gi *GenInf
 	gid := gi.Gen.ID
 	tbl := pgx.Identifier{c.Store.Schema, gi.Gen.ChunkTable}.Sanitize()
 	dlq := c.Store.T("dlq")
-	if u.Truncate {
-		if _, err := tx.Exec(ctx, `DELETE FROM `+tbl); err != nil {
+	for _, pipe := range sortedPipes(u.Truncates) {
+		if _, err := tx.Exec(ctx, `DELETE FROM `+tbl+` WHERE pipeline = $1`, pipe); err != nil {
 			return err
 		}
 	}
@@ -271,44 +313,45 @@ func (c *Committer) applyGen(ctx context.Context, tx pgx.Tx, u *Unit, gi *GenInf
 			continue
 		}
 		args := []any{rd.Keep}
-		pred := c.rangePredicate("source_key", rd.Lo, rd.Hi, &args)
+		pred, err := c.rangePredicate(rd.Pipeline, "source_key", rd.Lo, rd.Hi, &args)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `DELETE FROM `+tbl+` WHERE `+pred+` AND source_key <> ALL($1::text[])`, args...); err != nil {
 			return fmt.Errorf("range delete: %w", err)
 		}
 		args2 := []any{rd.Keep, gid}
-		pred2 := c.rangePredicate("source_key", rd.Lo, rd.Hi, &args2)
+		pred2, err := c.rangePredicate(rd.Pipeline, "source_key", rd.Lo, rd.Hi, &args2)
+		if err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `UPDATE `+dlq+` SET state = 'superseded', updated_at = now() WHERE generation_id = $2 AND state = 'open' AND `+
 			pred2+` AND source_key <> ALL($1::text[])`, args2...); err != nil {
 			return err
 		}
 	}
 	eff := u.Effective(gid)
-	keysSorted := make([]string, 0, len(eff))
-	for k := range eff {
-		keysSorted = append(keysSorted, k)
-	}
-	sort.Strings(keysSorted) // deterministic lock order
 	var (
-		delKeys, supersede         []string
-		trimKeys                   []string
-		trimN                      []int32
-		cKey, cID, cFP, cText, cV  []string
-		cNo                        []int32
-		cLSN                       []string
-		cTime                      []*time.Time
-		qKey, qLSN, qReason, qErr  []string
-		upserts, deletes, poisoned int
+		delP, delK, supP, supK        []string
+		trimP, trimK                  []string
+		trimN                         []int32
+		cP, cKey, cID, cFP, cText, cV []string
+		cNo                           []int32
+		cLSN                          []string
+		cTime                         []*time.Time
+		qP, qKey, qLSN, qReason, qErr []string
+		upserts, deletes, poisoned    int
 	)
-	for _, k := range keysSorted {
-		d := eff[k]
+	for _, id := range sortedIDs(eff) { // deterministic lock order
+		d := eff[id]
 		if d.Delete {
-			delKeys = append(delKeys, k)
-			supersede = append(supersede, k)
+			delP, delK = append(delP, id.Pipeline), append(delK, id.Key)
+			supP, supK = append(supP, id.Pipeline), append(supK, id.Key)
 			deletes++
 			continue
 		}
 		reason, errMsg := d.Poison, d.PoisonErr
-		chunks := u.Chunks[gid][k]
+		chunks := u.Chunks[gid][id]
 		if reason == "" {
 			for _, ch := range chunks {
 				if msg, bad := u.Rejected[gid][ch.Fingerprint]; bad {
@@ -324,22 +367,23 @@ func (c *Committer) applyGen(ctx context.Context, tx pgx.Tx, u *Unit, gi *GenInf
 			// Quarantine atomically with the rest of the unit: remove stale
 			// chunks so search never serves an outdated version, and record
 			// the versioned failure for inspection and replay.
-			delKeys = append(delKeys, k)
-			qKey, qLSN, qReason, qErr = append(qKey, k), append(qLSN, d.LSN.String()), append(qReason, reason), append(qErr, truncate(errMsg, 500))
+			delP, delK = append(delP, id.Pipeline), append(delK, id.Key)
+			qP, qKey, qLSN = append(qP, id.Pipeline), append(qKey, id.Key), append(qLSN, d.LSN.String())
+			qReason, qErr = append(qReason, reason), append(qErr, truncate(errMsg, 500))
 			metrics.Quarantined.WithLabelValues(reason).Inc()
 			poisoned++
 			continue
 		}
-		supersede = append(supersede, k)
-		trimKeys = append(trimKeys, k)
-		trimN = append(trimN, int32(len(chunks)))
+		supP, supK = append(supP, id.Pipeline), append(supK, id.Key)
+		trimP, trimK, trimN = append(trimP, id.Pipeline), append(trimK, id.Key), append(trimN, int32(len(chunks)))
 		var ct *time.Time
 		if !d.CommitTime.IsZero() {
 			t := d.CommitTime
 			ct = &t
 		}
 		for _, ch := range chunks {
-			cKey = append(cKey, k)
+			cP = append(cP, id.Pipeline)
+			cKey = append(cKey, id.Key)
 			cNo = append(cNo, int32(ch.No))
 			cID = append(cID, ch.ID)
 			cFP = append(cFP, ch.Fingerprint)
@@ -350,41 +394,41 @@ func (c *Committer) applyGen(ctx context.Context, tx pgx.Tx, u *Unit, gi *GenInf
 		}
 		upserts++
 	}
-	if len(delKeys) > 0 {
-		if _, err := tx.Exec(ctx, `DELETE FROM `+tbl+` WHERE source_key = ANY($1)`, delKeys); err != nil {
+	if len(delK) > 0 {
+		if _, err := tx.Exec(ctx, `DELETE FROM `+tbl+` WHERE (pipeline, source_key) IN (SELECT * FROM unnest($1::text[], $2::text[]))`, delP, delK); err != nil {
 			return err
 		}
 	}
-	if len(trimKeys) > 0 {
-		if _, err := tx.Exec(ctx, `DELETE FROM `+tbl+` t USING unnest($1::text[], $2::int[]) AS d(k, n)
-			WHERE t.source_key = d.k AND t.chunk_no >= d.n`, trimKeys, trimN); err != nil {
+	if len(trimK) > 0 {
+		if _, err := tx.Exec(ctx, `DELETE FROM `+tbl+` t USING unnest($1::text[], $2::text[], $3::int[]) AS d(p, k, n)
+			WHERE t.pipeline = d.p AND t.source_key = d.k AND t.chunk_no >= d.n`, trimP, trimK, trimN); err != nil {
 			return fmt.Errorf("trim chunks: %w", err)
 		}
 	}
 	if len(cKey) > 0 {
-		if _, err := tx.Exec(ctx, `INSERT INTO `+tbl+` AS t (source_key, chunk_no, chunk_id, fingerprint, content, embedding, source_lsn, source_commit_time)
-			SELECT k, n, id, fp, txt, v::vector, l::pg_lsn, ct
-			FROM unnest($1::text[], $2::int[], $3::text[], $4::text[], $5::text[], $6::text[], $7::text[], $8::timestamptz[]) AS u(k, n, id, fp, txt, v, l, ct)
-			ON CONFLICT (source_key, chunk_no) DO UPDATE SET chunk_id = EXCLUDED.chunk_id, fingerprint = EXCLUDED.fingerprint,
+		if _, err := tx.Exec(ctx, `INSERT INTO `+tbl+` AS t (pipeline, source_key, chunk_no, chunk_id, fingerprint, content, embedding, source_lsn, source_commit_time)
+			SELECT p, k, n, id, fp, txt, v::vector, l::pg_lsn, ct
+			FROM unnest($1::text[], $2::text[], $3::int[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::timestamptz[]) AS u(p, k, n, id, fp, txt, v, l, ct)
+			ON CONFLICT (pipeline, source_key, chunk_no) DO UPDATE SET chunk_id = EXCLUDED.chunk_id, fingerprint = EXCLUDED.fingerprint,
 				content = EXCLUDED.content, embedding = EXCLUDED.embedding, source_lsn = EXCLUDED.source_lsn,
 				source_commit_time = EXCLUDED.source_commit_time, updated_at = now()
 			WHERE t.fingerprint IS DISTINCT FROM EXCLUDED.fingerprint`,
-			cKey, cNo, cID, cFP, cText, cV, cLSN, cTime); err != nil {
+			cP, cKey, cNo, cID, cFP, cText, cV, cLSN, cTime); err != nil {
 			return fmt.Errorf("upsert chunks: %w", err)
 		}
 	}
-	if len(supersede) > 0 {
+	if len(supK) > 0 {
 		if _, err := tx.Exec(ctx, `UPDATE `+dlq+` SET state = 'superseded', updated_at = now()
-			WHERE generation_id = $1 AND state = 'open' AND source_key = ANY($2)`, gid, supersede); err != nil {
+			WHERE generation_id = $1 AND state = 'open' AND (pipeline, source_key) IN (SELECT * FROM unnest($2::text[], $3::text[]))`, gid, supP, supK); err != nil {
 			return err
 		}
 	}
 	if len(qKey) > 0 {
-		if _, err := tx.Exec(ctx, `INSERT INTO `+dlq+` (generation_id, source_key, source_lsn, reason, error, state)
-			SELECT $1, k, l::pg_lsn, r, e, 'open' FROM unnest($2::text[], $3::text[], $4::text[], $5::text[]) AS u(k, l, r, e)
-			ON CONFLICT (generation_id, source_key) WHERE state = 'open' DO UPDATE SET source_lsn = EXCLUDED.source_lsn,
+		if _, err := tx.Exec(ctx, `INSERT INTO `+dlq+` (generation_id, pipeline, source_key, source_lsn, reason, error, state)
+			SELECT $1, p, k, l::pg_lsn, r, e, 'open' FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[]) AS u(p, k, l, r, e)
+			ON CONFLICT (generation_id, pipeline, source_key) WHERE state = 'open' DO UPDATE SET source_lsn = EXCLUDED.source_lsn,
 				reason = EXCLUDED.reason, error = EXCLUDED.error, attempts = `+dlq+`.attempts + 1, updated_at = now()`,
-			gid, qKey, qLSN, qReason, qErr); err != nil {
+			gid, qP, qKey, qLSN, qReason, qErr); err != nil {
 			return fmt.Errorf("quarantine: %w", err)
 		}
 	}

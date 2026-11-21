@@ -111,6 +111,13 @@ type fakeEmbedder struct {
 	// prefixMiss counts bowalt inputs sent without their prompt.
 	prefixMiss atomic.Int64
 	delayMS    atomic.Int64
+	// slow delays requests with an input containing this token by slowMS,
+	// so embeddings of one unit (or one transaction) finish out of order.
+	slow   atomic.Value // string
+	slowMS atomic.Int64
+	// done records "<first input>" in completion order (when recordDone).
+	recordDone atomic.Bool
+	doneLog    []string
 }
 
 const dim = 64
@@ -118,6 +125,7 @@ const dim = 64
 func newFakeEmbedder(t *testing.T) *fakeEmbedder {
 	f := &fakeEmbedder{}
 	f.reject.Store("")
+	f.slow.Store("")
 	f.srv = httptest.NewServer(http.HandlerFunc(f.handle))
 	t.Cleanup(f.srv.Close)
 	return f
@@ -209,6 +217,21 @@ func (f *fakeEmbedder) handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "unknown model", 404)
 		return
 	}
+	if tok := f.slow.Load().(string); tok != "" {
+		for _, s := range req.Inputs {
+			if strings.Contains(s, tok) {
+				time.Sleep(time.Duration(f.slowMS.Load()) * time.Millisecond)
+				break
+			}
+		}
+	}
+	if f.recordDone.Load() && len(req.Inputs) > 0 {
+		defer func() {
+			f.mu.Lock()
+			f.doneLog = append(f.doneLog, req.Inputs[0])
+			f.mu.Unlock()
+		}()
+	}
 	if bad := f.reject.Load().(string); bad != "" {
 		var idx []int
 		for i, s := range req.Inputs {
@@ -250,6 +273,7 @@ func (f *fakeEmbedder) handle(w http.ResponseWriter, r *http.Request) {
 
 type env struct {
 	t        *testing.T
+	bin      string // binary under test (default: the one built from this tree)
 	db       string
 	slot     string
 	dir      string
@@ -271,6 +295,15 @@ type envOpts struct {
 	onPoison     string
 	evalQueries  string
 	evalQrels    string
+	// pipelines, when set, replaces the single-table source mapping with a
+	// `pipelines:` block (YAML, indented by two spaces).
+	pipelines string
+	// setupSQL runs as the admin before `embedsync init` (extra tables).
+	setupSQL []string
+	// embedBatch overrides embedder.batch_size (default 16).
+	embedBatch int
+	// binary runs every command with this binary instead of the current one.
+	binary string
 }
 
 func randHex(n int) string {
@@ -312,7 +345,10 @@ func newEnv(t *testing.T, o envOpts) *env {
 		o.onPoison = "quarantine"
 	}
 	ctx := context.Background()
-	e := &env{t: t, db: "it_" + randHex(5), slot: "it_" + randHex(5), dir: t.TempDir(), emb: newFakeEmbedder(t), opts: o}
+	e := &env{t: t, db: "it_" + randHex(5), slot: "it_" + randHex(5), dir: t.TempDir(), emb: newFakeEmbedder(t), opts: o, bin: o.binary}
+	if e.bin == "" {
+		e.bin = binary
+	}
 	e.port = freePort(t)
 	c, err := pgx.Connect(ctx, adminDSN)
 	if err != nil {
@@ -329,6 +365,9 @@ func newEnv(t *testing.T, o envOpts) *env {
 	}
 	e.exec(`CREATE TABLE public.documents (id bigint PRIMARY KEY, title text, body text, secret text, updated_at timestamptz DEFAULT now())`)
 	e.exec(`REVOKE CREATE ON SCHEMA public FROM PUBLIC`)
+	for _, q := range o.setupSQL {
+		e.exec(q)
+	}
 	e.envVars = append(os.Environ(),
 		"EMBEDSYNC_SOURCE_DSN="+dsnFor(adminDSN, "embedsync_replicator", "it-repl", e.db),
 		"EMBEDSYNC_SINK_DSN="+dsnFor(adminDSN, "embedsync_sink", "it-sink", e.db),
@@ -356,19 +395,28 @@ func (e *env) writeConfig() {
 	if o.evalQueries != "" {
 		eval = fmt.Sprintf("\n  eval_queries: %s\n  eval_qrels: %s", o.evalQueries, o.evalQrels)
 	}
-	cfg := fmt.Sprintf(`
-source:
+	tables := fmt.Sprintf(`
   table: public.documents
   key: id
-  fields: [{name: title, column: title}, {name: body, column: %s}]
+  fields: [{name: title, column: title}, {name: body, column: %s}]`, o.column)
+	pipes := ""
+	if o.pipelines != "" {
+		tables, pipes = "", "\npipelines:\n"+o.pipelines
+	}
+	embedBatch := o.embedBatch
+	if embedBatch == 0 {
+		embedBatch = 16
+	}
+	cfg := fmt.Sprintf(`
+source:%s
   publication: embedsync_pub
-  slot: %s
+  slot: %s%s
 sink: {schema: embedsync, reader_role: embedsync_reader, reader_dsn_env: EMBEDSYNC_READER_DSN}
 transform: {template: "{{.title}}\n{{.body}}", chunk_words: %d, chunk_overlap: %d}
 embedder:
   url: %s
   timeout: 5s
-  batch_size: 16
+  batch_size: %d
   concurrency: 3
   requests_per_second: 0
   retry: {initial_backoff: 20ms, max_backoff: 300ms}
@@ -391,7 +439,7 @@ migration:
   catchup_timeout: 60s%s
   gates: {min_ann_recall_at_10: 0.9, noninferiority_margin_ndcg: 0.02, noninferiority_margin_recall: 0.02, bootstrap_samples: 1000, seed: 7, require_zero_unresolved: true}
 metrics: {listen: "127.0.0.1:%d"}
-`, o.column, e.slot, o.chunkWords, o.chunkOverlap, e.emb.srv.URL, models, o.onPoison, o.batch, eval, e.port)
+`, tables, e.slot, pipes, o.chunkWords, o.chunkOverlap, e.emb.srv.URL, embedBatch, models, o.onPoison, o.batch, eval, e.port)
 	e.cfgPath = filepath.Join(e.dir, "embedsync.yaml")
 	if err := os.WriteFile(e.cfgPath, []byte(cfg), 0o600); err != nil {
 		e.t.Fatal(err)
@@ -460,16 +508,16 @@ func (e *env) scalar(q string, args ...any) string {
 }
 
 func (e *env) cliCmd(args ...string) *exec.Cmd {
-	cmd := exec.Command(binary, append(args[:1:1], append([]string{"--config", e.cfgPath}, args[1:]...)...)...)
+	cmd := exec.Command(e.bin, append(args[:1:1], append([]string{"--config", e.cfgPath}, args[1:]...)...)...)
 	cmd.Env = e.envVars
 	return cmd
 }
 
 func (e *env) cli(args ...string) (string, error) {
-	cmd := exec.Command(binary, append(args[:1:1], append([]string{"--config", e.cfgPath}, args[1:]...)...)...)
+	cmd := exec.Command(e.bin, append(args[:1:1], append([]string{"--config", e.cfgPath}, args[1:]...)...)...)
 	if args[0] == "dlq" || (args[0] == "migrate" && len(args) > 1 && !strings.HasPrefix(args[1], "-")) {
 		// subcommand first, then flags
-		cmd = exec.Command(binary, append(args[:2:2], append([]string{"--config", e.cfgPath}, args[2:]...)...)...)
+		cmd = exec.Command(e.bin, append(args[:2:2], append([]string{"--config", e.cfgPath}, args[2:]...)...)...)
 	}
 	cmd.Env = e.envVars
 	out, err := cmd.CombinedOutput()
@@ -485,7 +533,7 @@ type proc struct {
 
 func (e *env) start(extraEnv ...string) *proc {
 	e.t.Helper()
-	cmd := exec.Command(binary, "run", "--config", e.cfgPath)
+	cmd := exec.Command(e.bin, "run", "--config", e.cfgPath)
 	for _, a := range extraEnv {
 		if strings.HasPrefix(a, "--") {
 			cmd.Args = append(cmd.Args, a)
@@ -627,23 +675,40 @@ func (e *env) status() map[string]any {
 	return m
 }
 
+type pipeCounts struct {
+	ExpectedChunks int `json:"expected_chunks"`
+	ActualChunks   int `json:"actual_chunks"`
+	Missing        int `json:"missing"`
+	Extra          int `json:"extra"`
+	Stale          int `json:"stale"`
+}
+
 type genReport struct {
-	Generation     string   `json:"generation"`
-	ExpectedChunks int      `json:"expected_chunks"`
-	ActualChunks   int      `json:"actual_chunks"`
-	Missing        int      `json:"missing"`
-	Extra          int      `json:"extra"`
-	Stale          int      `json:"stale"`
-	Quarantined    int      `json:"quarantined_keys"`
-	MissingQ       int      `json:"missing_due_to_quarantine"`
-	Examples       []string `json:"example_problems"`
+	Generation     string                `json:"generation"`
+	ExpectedChunks int                   `json:"expected_chunks"`
+	ActualChunks   int                   `json:"actual_chunks"`
+	Missing        int                   `json:"missing"`
+	Extra          int                   `json:"extra"`
+	Stale          int                   `json:"stale"`
+	Quarantined    int                   `json:"quarantined_keys"`
+	MissingQ       int                   `json:"missing_due_to_quarantine"`
+	Examples       []string              `json:"example_problems"`
+	Pipelines      map[string]pipeCounts `json:"pipelines"`
+}
+
+type stateCounts struct {
+	Missing, Extra, Stale int
 }
 
 type verifyReport struct {
-	SourceRows  int `json:"source_rows"`
-	SourceState struct {
-		Missing, Extra, Stale int
-	} `json:"source_state"`
+	BoundaryLSN   string      `json:"boundary_lsn"`
+	CheckpointLSN string      `json:"checkpoint_lsn"`
+	SourceRows    int         `json:"source_rows"`
+	SourceState   stateCounts `json:"source_state"`
+	Pipelines     map[string]struct {
+		SourceRows  int         `json:"source_rows"`
+		SourceState stateCounts `json:"source_state"`
+	} `json:"pipelines"`
 	Generations []genReport `json:"generations"`
 	OK          bool        `json:"ok"`
 }
@@ -677,6 +742,12 @@ func (e *env) requireConsistent(label string) verifyReport {
 	for _, g := range r.Generations {
 		e.t.Logf("%s: %s expected=%d actual=%d missing=%d extra=%d stale=%d quarantined=%d (source rows %d)",
 			label, g.Generation, g.ExpectedChunks, g.ActualChunks, g.Missing, g.Extra, g.Stale, g.Quarantined, r.SourceRows)
+		if len(g.Pipelines) > 1 {
+			for name, c := range g.Pipelines {
+				e.t.Logf("%s:   %s pipeline %s: source rows %d, chunks expected=%d actual=%d missing=%d extra=%d stale=%d",
+					label, g.Generation, name, r.Pipelines[name].SourceRows, c.ExpectedChunks, c.ActualChunks, c.Missing, c.Extra, c.Stale)
+			}
+		}
 	}
 	return r
 }

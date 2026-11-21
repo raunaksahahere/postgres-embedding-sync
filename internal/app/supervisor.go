@@ -93,7 +93,7 @@ func Run(ctx context.Context, opts RunOptions, e *Env) error {
 			metrics.SetConsumerState("paused")
 			state.consumer.Store("paused")
 			if pe.InStream && pe.Reason == "schema_incompatible" {
-				_ = e.Store.MarkSchemaPause(context.Background())
+				_ = e.Store.MarkSchemaPause(context.Background(), pe.Pipeline)
 			}
 			_ = e.Store.SetPipelineStatus(context.Background(), "paused", pe.Reason, pe.Detail)
 			e.Log.Error("pipeline paused; nothing past the last checkpoint was acknowledged", "reason", pe.Reason, "detail", pe.Detail)
@@ -218,7 +218,7 @@ func monitor(ctx context.Context, e *Env, state *runState) {
 			metrics.Serving.Reset()
 			metrics.Serving.WithLabelValues(sv.GenerationID).Set(1)
 		}
-		if err := (&migrate.Migrator{Cfg: e.Cfg, Store: e.Store, Source: e.Source, Tr: e.Tr, Log: e.Log}).FinalizeExpired(qctx); err != nil {
+		if err := (&migrate.Migrator{Cfg: e.Cfg, Store: e.Store, Source: e.Source, Trs: e.Trs(), Log: e.Log}).FinalizeExpired(qctx); err != nil {
 			e.Log.Warn("rollback window finalization failed", "err", err)
 		}
 		cancel()

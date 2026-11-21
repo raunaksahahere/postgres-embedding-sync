@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -30,6 +31,18 @@ type GenStatus struct {
 	Serving    bool   `json:"serving"`
 }
 
+// PipelineStatus summarises one configured pipeline.
+type PipelineStatus struct {
+	Name            string   `json:"name"`
+	Table           string   `json:"table"`
+	Key             []string `json:"key"`
+	KeyKinds        string   `json:"key_kinds,omitempty"`
+	Signature       string   `json:"relation_signature,omitempty"`
+	Registered      bool     `json:"registered"`
+	SourceStateRows int64    `json:"source_state_rows"`
+	Unresolved      int64    `json:"unresolved_rows"`
+}
+
 // StatusReport is printed by `embedsync status` and served at /status.
 type StatusReport struct {
 	Pipeline struct {
@@ -40,16 +53,18 @@ type StatusReport struct {
 		Consumer  string    `json:"consumer,omitempty"`
 	} `json:"pipeline"`
 	Checkpoint struct {
-		LSN        string    `json:"lsn"`
-		UpdatedAt  time.Time `json:"updated_at"`
-		SourceLSN  string    `json:"source_wal_lsn"`
-		LagBytes   int64     `json:"lag_bytes"`
-		Slot       string    `json:"slot"`
-		SystemID   string    `json:"system_identifier"`
-		KeyKind    string    `json:"key_kind"`
-		Signature  string    `json:"relation_signature"`
-		Exists     bool      `json:"exists"`
-		AgeSeconds float64   `json:"age_seconds"`
+		LSN       string    `json:"lsn"`
+		UpdatedAt time.Time `json:"updated_at"`
+		SourceLSN string    `json:"source_wal_lsn"`
+		LagBytes  int64     `json:"lag_bytes"`
+		Slot      string    `json:"slot"`
+		SystemID  string    `json:"system_identifier"`
+		// KeyKind and Signature describe the table when exactly one
+		// pipeline is configured (the single-table fields); see Pipelines.
+		KeyKind    string  `json:"key_kind"`
+		Signature  string  `json:"relation_signature"`
+		Exists     bool    `json:"exists"`
+		AgeSeconds float64 `json:"age_seconds"`
 	} `json:"checkpoint"`
 	Slot struct {
 		Exists            bool   `json:"exists"`
@@ -65,6 +80,7 @@ type StatusReport struct {
 		RollbackUntil *time.Time `json:"rollback_until,omitempty"`
 		SwitchedAt    time.Time  `json:"switched_at"`
 	} `json:"serving"`
+	Pipelines     []PipelineStatus    `json:"pipelines"`
 	Generations   []GenStatus         `json:"generations"`
 	Backfill      []store.BackfillJob `json:"backfill_jobs"`
 	Unresolved    int64               `json:"unresolved_rows"`
@@ -95,8 +111,43 @@ func BuildStatus(ctx context.Context, e *Env, consumer string) (*StatusReport, e
 		r.Checkpoint.AgeSeconds = time.Since(cp.UpdatedAt).Seconds()
 		r.Checkpoint.Slot = cp.SlotName
 		r.Checkpoint.SystemID = cp.SystemIdentifier
-		r.Checkpoint.KeyKind = cp.KeyKind
-		r.Checkpoint.Signature = cp.RelationSignature
+	}
+	rels, err := e.Store.Relations(ctx)
+	if err != nil {
+		return nil, err
+	}
+	stateRows := map[string]int64{}
+	unresolvedBy := map[string]int64{}
+	if rows, err := e.Store.Pool.Query(ctx, `SELECT pipeline, count(*) FROM `+e.Store.T("source_state")+` GROUP BY 1`); err == nil {
+		for rows.Next() {
+			var p string
+			var n int64
+			if rows.Scan(&p, &n) == nil {
+				stateRows[p] = n
+			}
+		}
+		rows.Close()
+	}
+	if rows, err := e.Store.Pool.Query(ctx, `SELECT d.pipeline, count(*) FROM `+e.Store.T("dlq")+` d JOIN `+e.Store.T("generations")+
+		` g ON g.id = d.generation_id WHERE d.state = 'open' AND g.state = ANY($1) GROUP BY 1`, store.LiveStates); err == nil {
+		for rows.Next() {
+			var p string
+			var n int64
+			if rows.Scan(&p, &n) == nil {
+				unresolvedBy[p] = n
+			}
+		}
+		rows.Close()
+	}
+	for _, p := range e.Cfg.Pipelines {
+		ps := PipelineStatus{Name: p.Name, Table: p.Table, Key: p.Key, SourceStateRows: stateRows[p.Name], Unresolved: unresolvedBy[p.Name]}
+		if rel := rels[p.Name]; rel != nil {
+			ps.Registered, ps.KeyKinds, ps.Signature = true, rel.KeyKinds, rel.RelationSignature
+		}
+		r.Pipelines = append(r.Pipelines, ps)
+	}
+	if len(r.Pipelines) == 1 {
+		r.Checkpoint.KeyKind, r.Checkpoint.Signature = r.Pipelines[0].KeyKinds, r.Pipelines[0].Signature
 	}
 	if e.Source != nil {
 		var cur string
@@ -134,7 +185,7 @@ func BuildStatus(ctx context.Context, e *Env, consumer string) (*StatusReport, e
 		if g.StreamFromLSN != nil {
 			gs.StreamFrom = g.StreamFromLSN.String()
 		}
-		_ = e.Store.Pool.QueryRow(ctx, `SELECT count(DISTINCT source_key), count(*) FROM `+pgx.Identifier{e.Store.Schema, g.ChunkTable}.Sanitize()).Scan(&gs.Documents, &gs.Chunks)
+		_ = e.Store.Pool.QueryRow(ctx, `SELECT count(DISTINCT (pipeline, source_key)), count(*) FROM `+pgx.Identifier{e.Store.Schema, g.ChunkTable}.Sanitize()).Scan(&gs.Documents, &gs.Chunks)
 		if store.IsLive(g.State) {
 			r.Unresolved += counts[g.ID]
 		}
@@ -193,6 +244,12 @@ func PrintStatus(w io.Writer, r *StatusReport) {
 	}
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "source_state rows: %d   unresolved rows: %d\n", r.SourceStateN, r.Unresolved)
+	if len(r.Pipelines) > 1 || (len(r.Pipelines) == 1 && r.Pipelines[0].Name != "default") {
+		fmt.Fprintln(w, "pipelines:")
+		for _, p := range r.Pipelines {
+			fmt.Fprintf(w, "   %-12s %-28s key=%s (%s) state_rows=%d unresolved=%d\n", p.Name, p.Table, strings.Join(p.Key, ","), p.KeyKinds, p.SourceStateRows, p.Unresolved)
+		}
+	}
 	fmt.Fprintln(w, "generations:")
 	for _, g := range r.Generations {
 		mark := " "
@@ -209,7 +266,7 @@ func PrintStatus(w io.Writer, r *StatusReport) {
 			if j.LastKey != nil {
 				lk = *j.LastKey
 			}
-			fmt.Fprintf(w, "   #%d %-10s %-9s rows=%d windows=%d last_key=%s\n", j.ID, j.GenerationID, j.State, j.RowsScanned, j.Windows, lk)
+			fmt.Fprintf(w, "   #%d %-10s %-12s %-9s rows=%d windows=%d last_key=%s\n", j.ID, j.GenerationID, j.Pipeline, j.State, j.RowsScanned, j.Windows, lk)
 		}
 	}
 	if len(r.Migrations) > 0 {

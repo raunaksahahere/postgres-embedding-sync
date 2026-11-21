@@ -29,6 +29,7 @@ type SnapRow struct {
 type WindowRows struct {
 	WindowID string
 	Gen      string
+	Pipeline string
 	JobID    int64
 	Lo       *string
 	Rows     []SnapRow
@@ -73,10 +74,11 @@ func (r *Registry) Take(id string) *WindowRows {
 	return w
 }
 
-// Backfill runs watermark windows for pending jobs, one job at a time.
+// Backfill runs watermark windows for pending jobs, one job at a time. Each
+// job scans one pipeline's table into one generation.
 type Backfill struct {
 	Cfg      *config.Config
-	KeyKind  keys.Kind
+	Specs    Specs
 	Source   *pgxpool.Pool
 	Store    *store.Store
 	Registry *Registry
@@ -130,6 +132,10 @@ func (b *Backfill) runJob(ctx context.Context, job *store.BackfillJob) error {
 	if g == nil {
 		return fmt.Errorf("generation %s missing", job.GenerationID)
 	}
+	spec := b.Specs[job.Pipeline]
+	if spec == nil {
+		return fmt.Errorf("backfill job %d is for pipeline %q, which is not configured", job.ID, job.Pipeline)
+	}
 	if g.StreamFromLSN == nil {
 		// The start marker orders "this generation consumes changes from here"
 		// before every snapshot window of the job.
@@ -152,7 +158,7 @@ func (b *Backfill) runJob(ctx context.Context, job *store.BackfillJob) error {
 	if err := b.Store.MarkJobRunning(ctx, job.ID); err != nil {
 		return err
 	}
-	b.Log.Info("backfill started", "job", job.ID, "generation", g.ID)
+	b.Log.Info("backfill started", "job", job.ID, "generation", g.ID, "pipeline", spec.Name)
 	limit := b.Cfg.Backfill.BatchSize
 	discards := 0
 	for ctx.Err() == nil {
@@ -160,8 +166,11 @@ func (b *Backfill) runJob(ctx context.Context, job *store.BackfillJob) error {
 		if err != nil {
 			return err
 		}
+		if cur == nil {
+			return fmt.Errorf("backfill job %d disappeared", job.ID)
+		}
 		if cur.State == "done" || cur.State == "cancelled" {
-			b.Log.Info("backfill finished", "job", job.ID, "generation", g.ID, "rows", cur.RowsScanned, "windows", cur.Windows)
+			b.Log.Info("backfill finished", "job", job.ID, "generation", g.ID, "pipeline", spec.Name, "rows", cur.RowsScanned, "windows", cur.Windows)
 			b.cleanupMarkers(ctx)
 			return nil
 		}
@@ -177,7 +186,7 @@ func (b *Backfill) runJob(ctx context.Context, job *store.BackfillJob) error {
 			b.Log.Warn("backfill cancelled: generation is no longer maintained", "job", job.ID, "generation", g.ID)
 			return nil
 		}
-		outcome, err := b.window(ctx, g.ID, job.ID, cur.LastKey, limit)
+		outcome, err := b.window(ctx, spec, g.ID, job.ID, cur.LastKey, limit)
 		if err != nil {
 			return err
 		}
@@ -199,7 +208,7 @@ func (b *Backfill) runJob(ctx context.Context, job *store.BackfillJob) error {
 }
 
 // window brackets one bounded primary-key scan with committed low/high markers.
-func (b *Backfill) window(ctx context.Context, gen string, job int64, lo *string, limit int) (string, error) {
+func (b *Backfill) window(ctx context.Context, spec *Spec, gen string, job int64, lo *string, limit int) (string, error) {
 	id := newUUID()
 	if err := b.marker(ctx, "low", gen, job, id); err != nil {
 		return "", fmt.Errorf("low marker: %w", err)
@@ -207,11 +216,11 @@ func (b *Backfill) window(ctx context.Context, gen string, job int64, lo *string
 	if err := b.waitInFlight(ctx); err != nil {
 		return "", err
 	}
-	rows, err := b.scan(ctx, lo, limit)
+	rows, err := b.scan(ctx, spec, lo, limit)
 	if err != nil {
 		return "", err
 	}
-	w := &WindowRows{WindowID: id, Gen: gen, JobID: job, Lo: lo, Rows: rows, Final: len(rows) < limit}
+	w := &WindowRows{WindowID: id, Gen: gen, Pipeline: spec.Name, JobID: job, Lo: lo, Rows: rows, Final: len(rows) < limit}
 	b.Registry.Put(w)
 	if err := b.marker(ctx, "high", gen, job, id); err != nil {
 		b.Registry.Take(id)
@@ -260,12 +269,16 @@ func (b *Backfill) waitInFlight(ctx context.Context) error {
 	}
 }
 
-func (b *Backfill) scan(ctx context.Context, lo *string, limit int) ([]SnapRow, error) {
-	q, args := ScanQuery(b.Cfg, b.KeyKind, lo, limit)
-	cols := 1 + len(b.Cfg.Source.Fields)
+func (b *Backfill) scan(ctx context.Context, spec *Spec, lo *string, limit int) ([]SnapRow, error) {
+	q, args, err := ScanQuery(spec.Def, spec.Codec, lo, limit)
+	if err != nil {
+		return nil, err
+	}
+	nk := len(spec.Def.Key)
+	cols := nk + len(spec.Def.Fields)
 	rs, err := b.Source.Query(ctx, q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("backfill scan: %w", err)
+		return nil, fmt.Errorf("backfill scan %s: %w", spec.Name, err)
 	}
 	defer rs.Close()
 	var out []SnapRow
@@ -278,9 +291,20 @@ func (b *Backfill) scan(ctx context.Context, lo *string, limit int) ([]SnapRow, 
 		if err := rs.Scan(ptrs...); err != nil {
 			return nil, err
 		}
-		r := SnapRow{Key: *vals[0], Fields: map[string]*string{}}
-		for i, f := range b.Cfg.Source.Fields {
-			r.Fields[f.Name] = vals[i+1]
+		kv := make([]string, nk)
+		for i := range kv {
+			if vals[i] == nil {
+				return nil, fmt.Errorf("backfill scan %s: NULL primary key value", spec.Name)
+			}
+			kv[i] = *vals[i]
+		}
+		key, err := spec.Codec.Encode(kv)
+		if err != nil {
+			return nil, fmt.Errorf("backfill scan %s: %w", spec.Name, err)
+		}
+		r := SnapRow{Key: key, Fields: map[string]*string{}}
+		for i, f := range spec.Def.Fields {
+			r.Fields[f.Name] = vals[nk+i]
 		}
 		out = append(out, r)
 	}
@@ -305,23 +329,32 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// ScanQuery builds one bounded primary-key scan. Columns are table-qualified so
-// ORDER BY and WHERE use the typed key column, never the ::text output alias
-// (an unqualified ORDER BY "id" would bind to the text output and sort "10"
-// before "9").
-func ScanQuery(cfg *config.Config, kk keys.Kind, lo *string, limit int) (string, []any) {
-	schema, table := cfg.SourceSchemaTable()
-	key := "t." + pgx.Identifier{cfg.Source.Key}.Sanitize()
-	cols := []string{key + "::text"}
-	for _, f := range cfg.Source.Fields {
+// ScanQuery builds one bounded primary-key scan of a pipeline's table.
+// Columns are table-qualified so ORDER BY and WHERE use the typed key
+// columns, never the ::text output aliases (an unqualified ORDER BY "id"
+// would bind to the text output and sort "10" before "9"). A composite key is
+// compared as a row, which PostgreSQL orders lexicographically, column by
+// column, the same way keys.Codec.Compare does.
+func ScanQuery(def *config.PipelineDef, codec keys.Codec, lo *string, limit int) (string, []any, error) {
+	schema, table := def.SchemaTable()
+	keyCols := make([]string, len(def.Key))
+	cols := make([]string, 0, len(def.Key)+len(def.Fields))
+	for i, k := range def.Key {
+		keyCols[i] = "t." + pgx.Identifier{k}.Sanitize()
+		cols = append(cols, keyCols[i]+"::text")
+	}
+	for _, f := range def.Fields {
 		cols = append(cols, "t."+pgx.Identifier{f.Column}.Sanitize()+"::text")
 	}
 	q := `SELECT ` + strings.Join(cols, ", ") + ` FROM ` + pgx.Identifier{schema, table}.Sanitize() + ` AS t`
 	var args []any
 	if lo != nil {
-		q += ` WHERE ` + kk.SourceOrder(key) + ` > ` + kk.SQLParam("$1")
-		args = append(args, *lo)
+		pred, err := codec.SourceCompare(keyCols, ">", *lo, &args)
+		if err != nil {
+			return "", nil, err
+		}
+		q += ` WHERE ` + pred
 	}
-	q += ` ORDER BY ` + kk.SourceOrder(key) + fmt.Sprintf(` LIMIT %d`, limit)
-	return q, args
+	q += ` ORDER BY ` + codec.SourceOrderBy(keyCols) + fmt.Sprintf(` LIMIT %d`, limit)
+	return q, args, nil
 }

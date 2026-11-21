@@ -14,6 +14,10 @@
 | Poison rows | quarantine atomically with versioned DLQ records, newer edits/deletes supersede, replay respects them; or pause | `TestPoisonQuarantineAndReplay` |
 | Incompatible schema change is never acknowledged | relation signature check in the stream and at startup | `TestSchemaChangePauses` |
 | Slot loss is detected and recoverable | identity checks; `rebuild` into a fresh generation | `TestSlotLossRebuild` |
+| Several tables share one slot without losing transaction boundaries | one reader, planner and committer for every pipeline; a unit holds whole source transactions and commits only after all of its embeddings, in LSN order | `TestCrossTableTransactionBoundary` (a transaction updates a document and a ticket; one embedding is held back 250 ms, alternating tables; a concurrent reader takes 800+ snapshots of both and never sees mismatched versions); `TestMultiPipelineAcceptance` |
+| Overlapping ids and composite keys stay separate documents | identity is `(pipeline, encoded key)`; a composite key is a JSON array of its column values, a one-column key its value | `TestMultiPipelineAcceptance` (three tables, ids overlap across two of them, `(tenant_id, id)` key changes, deletes during backfill, 6 crashes before/after the sink commit, every pipeline verified at a barrier); `keys` unit tests (escaping, invalid UTF-8 rejected) |
+| Composite-key backfill windows agree with PostgreSQL | row comparison over the typed key columns (text with `COLLATE "C"`) in the source scan; the same lexicographic order in Go and in the sink's range deletes | `TestCompositeKeyOrderAgreesWithPostgres` (negative ints, mixed case, UTF-8, digits as text, JSON-escaped characters; window order, 200 random sink ranges and an end-to-end backfill with 3-row windows); 3-pipeline property test (1,000 interleavings, mixed-table transactions, per-table truncates) |
+| Upgrading a populated single-table installation | `init` labels every existing row with the pipeline `default` and keeps fingerprints; commands refuse an un-upgraded sink | `TestLegacyUpgradeServesOriginalDocuments` (installation built by v0.2.0 with two generations and DLQ records: no re-embedding, identical chunks and search results, replay and rollback still work, then a composite-key table added in place) |
 | Model migration is pinned, gated, atomic and reversible | per-generation encoder identity; gates at one snapshot; serving row swap; rollback window | `TestMigrationPromoteRejectRollback` (continuous reader: zero errors, zero wrong results, generation sequence v1→v2→v1; regression rejected with an inspectable report); `TestMigrationResume` |
 
 What is **not** guaranteed:
@@ -21,8 +25,9 @@ What is **not** guaranteed:
 * Search results are eventually consistent with the source: a committed row is
   searchable after the measured commit-to-searchable latency, not at commit.
 * A paused pipeline (schema change, poison row with `on_poison: pause`, unresolvable
-  TOAST) stops freshness for the whole table until an operator acts; WAL accumulates
-  meanwhile (bounded by `max_slot_wal_keep_size`).
+  TOAST) stops freshness for every table, because all tables share the stream and their
+  transactions are applied in order, until an operator acts; WAL accumulates meanwhile
+  (bounded by `max_slot_wal_keep_size`).
 * Quarantined rows are absent from search until resolved (by design: never serve an
   outdated version), and are reported as unresolved.
-* One table per process; no joins across tables.
+* A document is one row of one table; no documents assembled across tables (joins) yet.

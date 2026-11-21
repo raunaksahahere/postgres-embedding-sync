@@ -86,16 +86,54 @@ type Field struct {
 	Column string `yaml:"column" json:"column"`
 }
 
-// Source describes the replicated table.
+// KeyColumns is a primary key: one column ("id") or several ([tenant_id, id]).
+type KeyColumns []string
+
+// UnmarshalYAML accepts a scalar or a sequence.
+func (k *KeyColumns) UnmarshalYAML(n *yaml.Node) error {
+	if n.Kind == yaml.ScalarNode {
+		var s string
+		if err := n.Decode(&s); err != nil {
+			return err
+		}
+		*k = KeyColumns{s}
+		return nil
+	}
+	var l []string
+	if err := n.Decode(&l); err != nil {
+		return err
+	}
+	*k = l
+	return nil
+}
+
+// Source describes the replication connection shared by every pipeline. The
+// table, key and fields here are the single-table form, kept valid: they
+// become one pipeline named "default".
 type Source struct {
-	DSNEnv        string  `yaml:"dsn_env"`
-	ReplDSNEnv    string  `yaml:"replication_dsn_env"`
-	Table         string  `yaml:"table"`
-	Key           string  `yaml:"key"`
-	Fields        []Field `yaml:"fields"`
-	Publication   string  `yaml:"publication"`
-	Slot          string  `yaml:"slot"`
-	ControlSchema string  `yaml:"control_schema"`
+	DSNEnv        string     `yaml:"dsn_env"`
+	ReplDSNEnv    string     `yaml:"replication_dsn_env"`
+	Table         string     `yaml:"table"`
+	Key           KeyColumns `yaml:"key"`
+	Fields        []Field    `yaml:"fields"`
+	Publication   string     `yaml:"publication"`
+	Slot          string     `yaml:"slot"`
+	ControlSchema string     `yaml:"control_schema"`
+}
+
+// DefaultPipeline is the name the single-table form (source.table) gets.
+const DefaultPipeline = "default"
+
+// PipelineDef is one replicated table (a "pipeline"): its key columns,
+// allowlisted fields and transform. Every pipeline shares the slot,
+// publication, embedder and generations; documents are identified by
+// (pipeline, key).
+type PipelineDef struct {
+	Name      string     `yaml:"name" json:"name"`
+	Table     string     `yaml:"table" json:"table"`
+	Key       KeyColumns `yaml:"key" json:"key"`
+	Fields    []Field    `yaml:"fields" json:"fields"`
+	Transform *Transform `yaml:"transform" json:"transform"` // nil: inherit the top-level transform
 }
 
 // Sink describes the pgvector database.
@@ -210,6 +248,7 @@ type Alerts struct {
 // Config is the whole embedsync.yaml.
 type Config struct {
 	Source            Source           `yaml:"source"`
+	Pipelines         []PipelineDef    `yaml:"pipelines"`
 	Sink              Sink             `yaml:"sink"`
 	Transform         Transform        `yaml:"transform"`
 	Embedder          Embedder         `yaml:"embedder"`
@@ -224,6 +263,7 @@ type Config struct {
 
 var identRe = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
 var genRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,30}$`)
+var pipeRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,30}$`)
 
 // Load reads, defaults and validates a config file.
 func Load(path string) (*Config, error) {
@@ -243,6 +283,9 @@ func Parse(b []byte) (*Config, error) {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
 	c.applyDefaults()
+	if err := c.normalize(); err != nil {
+		return nil, err
+	}
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}
@@ -273,6 +316,11 @@ func (c *Config) applyDefaults() {
 	def(&c.Sink.DSNEnv, "EMBEDSYNC_SINK_DSN")
 	def(&c.Sink.Schema, "embedsync")
 	defI(&c.Transform.ChunkWords, 120)
+	for i := range c.Pipelines {
+		if t := c.Pipelines[i].Transform; t != nil {
+			defI(&t.ChunkWords, 120)
+		}
+	}
 	defI(&c.Embedder.BatchSize, 32)
 	defI(&c.Embedder.Concurrency, 2)
 	defI(&c.Embedder.Burst, 4)
@@ -330,28 +378,72 @@ func (c *Config) applyDefaults() {
 func (c *Config) Validate() error {
 	var errs []string
 	add := func(f string, a ...any) { errs = append(errs, fmt.Sprintf(f, a...)) }
-	schema, table, ok := strings.Cut(c.Source.Table, ".")
-	if !ok || !identRe.MatchString(schema) || !identRe.MatchString(table) {
-		add("source.table must be schema-qualified lowercase identifiers, got %q", c.Source.Table)
+	if len(c.Pipelines) == 0 {
+		add("configure source.table (one table) or pipelines (one or more tables)")
 	}
-	if !identRe.MatchString(c.Source.Key) {
-		add("source.key must be a lowercase identifier")
-	}
-	if len(c.Source.Fields) == 0 {
-		add("source.fields must list at least one allowlisted column")
-	}
-	seen := map[string]bool{}
-	for _, f := range c.Source.Fields {
-		if !identRe.MatchString(f.Name) || !identRe.MatchString(f.Column) {
-			add("source.fields entries need lowercase identifier name/column, got %+v", f)
+	names, tables := map[string]bool{}, map[string]bool{}
+	for i := range c.Pipelines {
+		p := &c.Pipelines[i]
+		where := fmt.Sprintf("pipeline %q", p.Name)
+		if !pipeRe.MatchString(p.Name) {
+			add("pipeline name %q must match %s", p.Name, pipeRe)
 		}
-		if seen[f.Name] {
-			add("duplicate field %q", f.Name)
+		if names[p.Name] {
+			add("duplicate pipeline name %q", p.Name)
 		}
-		seen[f.Name] = true
-		if f.Column == c.Source.Key {
-			// allowed: key may also be rendered
+		names[p.Name] = true
+		schema, table, ok := strings.Cut(p.Table, ".")
+		if !ok || !identRe.MatchString(schema) || !identRe.MatchString(table) {
+			add("%s: table must be schema-qualified lowercase identifiers, got %q", where, p.Table)
+		}
+		if tables[p.Table] {
+			add("%s: table %s is already used by another pipeline", where, p.Table)
+		}
+		tables[p.Table] = true
+		if schema == c.Source.ControlSchema {
+			add("%s: table must not live in the control schema %q", where, c.Source.ControlSchema)
+		}
+		if len(p.Key) == 0 {
+			add("%s: key must name at least one primary-key column", where)
+		}
+		if len(p.Key) > 8 {
+			add("%s: key has more than 8 columns", where)
+		}
+		keySeen := map[string]bool{}
+		for _, k := range p.Key {
+			if !identRe.MatchString(k) {
+				add("%s: key column %q must be a lowercase identifier", where, k)
+			}
+			if keySeen[k] {
+				add("%s: duplicate key column %q", where, k)
+			}
+			keySeen[k] = true
+		}
+		if len(p.Fields) == 0 {
+			add("%s: fields must list at least one allowlisted column", where)
+		}
+		seen := map[string]bool{}
+		for _, f := range p.Fields {
+			if !identRe.MatchString(f.Name) || !identRe.MatchString(f.Column) {
+				add("%s: fields entries need lowercase identifier name/column, got %+v", where, f)
+			}
+			if seen[f.Name] {
+				add("%s: duplicate field %q", where, f.Name)
+			}
+			seen[f.Name] = true
+		}
+		t := p.Transform
+		if t == nil {
 			continue
+		}
+		if t.Template == "" {
+			add("%s: transform.template is required", where)
+		}
+		if t.ChunkWords < 8 {
+			add("%s: transform.chunk_words must be >= 8", where)
+		}
+		if t.ChunkOverlap < 0 || t.ChunkOverlap >= t.ChunkWords {
+			add("%s: transform.chunk_overlap must be in [0, chunk_words)", where)
 		}
 	}
 	for _, s := range []string{c.Source.Publication, c.Source.Slot, c.Source.ControlSchema, c.Sink.Schema} {
@@ -361,15 +453,6 @@ func (c *Config) Validate() error {
 	}
 	if c.Sink.ReaderRole != "" && !identRe.MatchString(c.Sink.ReaderRole) {
 		add("invalid sink.reader_role")
-	}
-	if c.Transform.Template == "" {
-		add("transform.template is required")
-	}
-	if c.Transform.ChunkWords < 8 {
-		add("transform.chunk_words must be >= 8")
-	}
-	if c.Transform.ChunkOverlap < 0 || c.Transform.ChunkOverlap >= c.Transform.ChunkWords {
-		add("transform.chunk_overlap must be in [0, chunk_words)")
 	}
 	if !c.Embedder.Managed && c.Embedder.URL == "" && c.Embedder.URLEnv == "" {
 		add("embedder.url or embedder.url_env is required (or embedder.managed: true)")
@@ -410,53 +493,121 @@ func (c *Config) Validate() error {
 	return nil
 }
 
-// SourceSchemaTable splits source.table.
-func (c *Config) SourceSchemaTable() (string, string) {
-	s, t, _ := strings.Cut(c.Source.Table, ".")
+// normalize turns the single-table form into the "default" pipeline and
+// gives every pipeline without its own transform the top-level one.
+func (c *Config) normalize() error {
+	legacy := c.Source.Table != "" || len(c.Source.Key) > 0 || len(c.Source.Fields) > 0
+	if legacy && len(c.Pipelines) > 0 {
+		return fmt.Errorf("invalid config:\n  - use either source.table/key/fields (one table) or pipelines, not both")
+	}
+	if legacy {
+		c.Pipelines = []PipelineDef{{Name: DefaultPipeline, Table: c.Source.Table, Key: c.Source.Key, Fields: c.Source.Fields}}
+	}
+	for i := range c.Pipelines {
+		if c.Pipelines[i].Transform == nil {
+			t := c.Transform
+			c.Pipelines[i].Transform = &t
+		}
+	}
+	return nil
+}
+
+// Pipe returns the named pipeline or nil.
+func (c *Config) Pipe(name string) *PipelineDef {
+	for i := range c.Pipelines {
+		if c.Pipelines[i].Name == name {
+			return &c.Pipelines[i]
+		}
+	}
+	return nil
+}
+
+// PipelineNames lists pipeline names in config order.
+func (c *Config) PipelineNames() []string {
+	out := make([]string, len(c.Pipelines))
+	for i, p := range c.Pipelines {
+		out[i] = p.Name
+	}
+	return out
+}
+
+// SchemaTable splits the pipeline's table.
+func (p *PipelineDef) SchemaTable() (string, string) {
+	s, t, _ := strings.Cut(p.Table, ".")
 	return s, t
 }
 
 // FieldColumns returns the physical allowlisted columns in config order.
-func (c *Config) FieldColumns() []string {
-	out := make([]string, 0, len(c.Source.Fields))
-	for _, f := range c.Source.Fields {
+func (p *PipelineDef) FieldColumns() []string {
+	out := make([]string, 0, len(p.Fields))
+	for _, f := range p.Fields {
 		out = append(out, f.Column)
 	}
 	return out
 }
 
+// FieldNames returns the logical field names in config order.
+func (p *PipelineDef) FieldNames() []string {
+	out := make([]string, 0, len(p.Fields))
+	for _, f := range p.Fields {
+		out = append(out, f.Name)
+	}
+	return out
+}
+
 // PublishedColumns is the key plus every allowlisted column, deduplicated.
-func (c *Config) PublishedColumns() []string {
-	out := []string{c.Source.Key}
-	for _, col := range c.FieldColumns() {
-		dup := false
-		for _, o := range out {
-			if o == col {
-				dup = true
-			}
-		}
-		if !dup {
+func (p *PipelineDef) PublishedColumns() []string {
+	out := []string{}
+	have := map[string]bool{}
+	for _, col := range append(append([]string{}, p.Key...), p.FieldColumns()...) {
+		if !have[col] {
+			have[col] = true
 			out = append(out, col)
 		}
 	}
 	return out
 }
 
-// TransformFingerprint hashes everything that affects chunk text. Logical field
-// names (not physical columns) are included so a column rename is not a
-// re-embedding event.
-func (c *Config) TransformFingerprint() string {
-	names := make([]string, 0, len(c.Source.Fields))
-	for _, f := range c.Source.Fields {
-		names = append(names, f.Name)
-	}
+// TransformFingerprint hashes everything that affects the pipeline's chunk
+// text. Logical field names (not physical columns) are included so a column
+// rename is not a re-embedding event. The formula is the one single-table
+// installations have always used, so their chunks keep their fingerprints.
+func (p *PipelineDef) TransformFingerprint() string {
 	payload, _ := json.Marshal(struct {
 		Fields    []string  `json:"fields"`
 		Transform Transform `json:"transform"`
 		Version   int       `json:"version"`
-	}{names, c.Transform, 1})
+	}{p.FieldNames(), *p.Transform, 1})
 	h := sha256.Sum256(payload)
 	return hex.EncodeToString(h[:16])
+}
+
+// PipelineFingerprints maps every pipeline to its transform fingerprint.
+func (c *Config) PipelineFingerprints() map[string]string {
+	out := make(map[string]string, len(c.Pipelines))
+	for i := range c.Pipelines {
+		out[c.Pipelines[i].Name] = c.Pipelines[i].TransformFingerprint()
+	}
+	return out
+}
+
+// CombinedFingerprint summarises every pipeline's transform for the
+// generation row. A single "default" pipeline keeps the single-table value.
+func (c *Config) CombinedFingerprint() string {
+	if len(c.Pipelines) == 1 && c.Pipelines[0].Name == DefaultPipeline {
+		return c.Pipelines[0].TransformFingerprint()
+	}
+	fps := c.PipelineFingerprints()
+	names := make([]string, 0, len(fps))
+	for n := range fps {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	h := sha256.New()
+	for _, n := range names {
+		fmt.Fprintf(h, "%s=%s\n", n, fps[n])
+	}
+	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
 // Env returns the value of an environment variable or an error naming it.

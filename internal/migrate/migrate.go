@@ -43,7 +43,7 @@ type Migrator struct {
 	Cfg      *config.Config
 	Store    *store.Store
 	Source   *pgxpool.Pool
-	Tr       *transform.Transformer
+	Trs      map[string]*transform.Transformer // per pipeline
 	Log      *slog.Logger
 	Searcher *search.Searcher
 	Embed    *embedclient.Client
@@ -239,7 +239,7 @@ func (m *Migrator) resolveTarget(ctx context.Context, target string, restart boo
 		}
 	}
 	if g == nil {
-		g, err = store.NewGeneration(target, modelKey, model, m.Cfg.TransformFingerprint())
+		g, err = store.NewGeneration(target, modelKey, model, m.Cfg)
 		if err != nil {
 			return nil, "", err
 		}
@@ -247,8 +247,12 @@ func (m *Migrator) resolveTarget(ctx context.Context, target string, restart boo
 			return nil, "", err
 		}
 		m.printf("registered generation %s (%s@%s, dim %d); backfill queued", g.ID, model.Name, model.Revision, model.Dimension)
-	} else if err := g.MatchesModel(model, m.Cfg.TransformFingerprint()); err != nil {
+	} else if err := g.MatchesModel(model, m.Cfg.PipelineFingerprints()); err != nil {
 		return nil, "", err
+	} else if miss := g.MissingPipelines(m.Cfg.PipelineFingerprints()); len(miss) > 0 {
+		// `embedsync run` extends live generations to new pipelines at
+		// startup; a candidate that does not cover them cannot pass coverage.
+		return nil, "", fmt.Errorf("generation %s does not cover pipeline(s) %s yet; restart `embedsync run` so it extends the generation and backfills them", g.ID, strings.Join(miss, ", "))
 	}
 	return g, modelKey, nil
 }
@@ -609,8 +613,8 @@ func (m *Migrator) Evaluate(ctx context.Context, from, to string, boundary pglog
 		if err != nil {
 			return err
 		}
-		rep.StateRows = len(rows)
-		rep.Coverage, err = verify.Generation(ctx, tx, m.Store.Schema, cand, m.Tr, rows, m.Cfg.Pipeline.MaxDocumentBytes)
+		rep.StateRows = rows.Count()
+		rep.Coverage, err = verify.Generation(ctx, tx, m.Store.Schema, cand, m.Trs, rows, m.Cfg.Pipeline.MaxDocumentBytes)
 		if err != nil {
 			return err
 		}
@@ -744,12 +748,23 @@ func scoresOf(h []search.Hit) []float64 {
 	return out
 }
 
-func keysOf(h []search.Hit) []string {
+// keysOf returns the evaluation document ids of hits. With one pipeline the
+// id is the source key (the qrels format single-table installations use);
+// with several it is "<pipeline>/<key>", which cannot collide across pipelines.
+func (m *Migrator) keysOf(h []search.Hit) []string {
 	out := make([]string, len(h))
 	for i, x := range h {
-		out[i] = x.Key
+		out[i] = EvalDocID(len(m.Cfg.Pipelines), x.Pipeline, x.Key)
 	}
 	return out
+}
+
+// EvalDocID is the corpus id a hit is judged under in eval_qrels.
+func EvalDocID(pipelines int, pipeline, key string) string {
+	if pipelines <= 1 {
+		return key
+	}
+	return pipeline + "/" + key
 }
 
 func (m *Migrator) quality(ctx context.Context, rep *GateReport, from, to string) error {
@@ -812,7 +827,7 @@ func (m *Migrator) quality(ctx context.Context, rep *GateReport, from, to string
 				if err != nil {
 					return err
 				}
-				ak, ek := keysOf(approx), keysOf(exact)
+				ak, ek := m.keysOf(approx), m.keysOf(exact)
 				pg.recall = append(pg.recall, RecallAt(ak, qrels[q.ID], 10))
 				pg.ndcg = append(pg.ndcg, NDCGAt(ak, qrels[q.ID], 10))
 				pg.ann = append(pg.ann, TieAwareOverlap(ak, scoresOf(approx), ek, scoresOf(exact), 1e-6))

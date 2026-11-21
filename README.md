@@ -37,7 +37,8 @@ while serving searches.
 
 * Go service (pgx, pglogrepl), a local CPU embedding service (sentence-transformers, pinned
   revisions, no API key), PostgreSQL 16, 17 or 18 with pgvector.
-* Status: **v0.2.0**, single table, single process. See [limitations](#limitations).
+* Status: **v0.2.0** (next: several tables per process, composite keys), single process.
+  See [limitations](#limitations).
 
 ```mermaid
 flowchart LR
@@ -102,6 +103,7 @@ Each row is covered by a named integration test against real PostgreSQL 16, 17 a
 | Replication slot lost | detected on restart; `embedsync rebuild --confirm` recovers into a fresh generation | 0 |
 | Secret columns next to the text | only allowlisted columns are published, granted and selected | none leave the source |
 | Switching to a worse model | candidate generation must pass coverage, catch-up and quality gates; rollback window | readers see 0 errors |
+| One transaction writes to several synced tables | all tables share one slot; a source transaction is applied in one sink transaction, even when its embeddings finish out of order | readers never see half of it |
 
 ## Why embedsync
 
@@ -343,7 +345,7 @@ Methodology and full reports: [docs/evaluation.md](docs/evaluation.md).
 | `embedsync model list \| add <owner/name[@rev]>` | list models, add one from Hugging Face |
 | `embedsync init` | create control objects, publication and sink schema (admin DSNs) |
 | `embedsync run [--accept-schema-change]` | stream, backfill, serve `/metrics` `/status` `/search` `/readyz` |
-| `embedsync backfill [--generation G] [--wait]` | queue a watermark re-scan |
+| `embedsync backfill [--generation G] [--pipeline P] [--wait]` | queue a watermark re-scan |
 | `embedsync status [--json]` | checkpoint, slot and retained WAL, generations, DLQ, migrations |
 | `embedsync migrate --to <model> [--gate-only] [--restart]` | build, gate and promote a generation |
 | `embedsync migrate status \| rollback \| finalize [--force]` | inspect gates, roll back, retire |
@@ -381,7 +383,7 @@ Sources: [CocoIndex example][coco] and [connector docs][coco2]; [Pathway Postgre
 connector][pw] (licensed tiers) and [document indexing][pw2]; [Supabase guide][supa].
 "—" means the cited page does not say. CocoIndex and Pathway are general frameworks with
 far broader scope (many sources/targets, transformations); embedsync does one thing:
-one Postgres table into pgvector with transactional guarantees.
+Postgres tables into pgvector with transactional guarantees.
 
 [coco]: https://cocoindex.io/docs/examples/postgres-source/
 [coco2]: https://cocoindex.io/docs/connectors/postgres/
@@ -392,8 +394,10 @@ one Postgres table into pgvector with transactional guarantees.
 ## Limitations
 
 
-* One source table per process, single-column primary key (int, text or uuid); no
-  joins, no hybrid (lexical) search, no external vector stores (v1 scope).
+* One process per publication and slot; each synced table is a pipeline whose primary
+  key columns are int, text or uuid. A document comes from one row: no joins across
+  tables yet, no hybrid (lexical) search, no external vector stores. A pipeline's table
+  and key cannot change in place, and removing a pipeline needs a new sink schema.
 * Throughput is bounded by the CPU embedding model (~70 short documents/s for
   all-MiniLM-L6-v2 on the benchmark laptop); sustained writes above that grow the
   backlog (freshness alerts fire, WAL is retained up to `max_slot_wal_keep_size`).

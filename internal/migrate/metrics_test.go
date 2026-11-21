@@ -53,3 +53,15 @@ func TestTieAwareOverlap(t *testing.T) {
 		t.Fatalf("a worse result is a miss, got %v", o)
 	}
 }
+
+func TestEvalDocID(t *testing.T) {
+	// One pipeline: qrels keep using the bare source key (single-table format).
+	if got := EvalDocID(1, "default", "42"); got != "42" {
+		t.Fatalf("single pipeline id %q", got)
+	}
+	// Several pipelines: the same key in two tables are different documents.
+	a, b := EvalDocID(2, "docs", "42"), EvalDocID(2, "notes", "42")
+	if a == b || a != "docs/42" {
+		t.Fatalf("multi-pipeline ids %q %q", a, b)
+	}
+}

@@ -11,8 +11,10 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/config"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/dbinit"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/embedclient"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/metrics"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/pipeline"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/store"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/transform"
 )
@@ -24,7 +26,20 @@ type Env struct {
 	Store  *store.Store
 	Source *pgxpool.Pool
 	Embed  *embedclient.Client
-	Tr     *transform.Transformer
+	// Pipes holds every configured pipeline's transformer. Key codecs are
+	// filled in by `run` from the source catalog.
+	Pipes pipeline.Specs
+}
+
+// Trs returns each pipeline's transformer.
+func (e *Env) Trs() map[string]*transform.Transformer { return e.Pipes.Transformers() }
+
+// ErrSinkSchemaOutdated means the sink was created by an older embedsync and
+// `embedsync init` has not upgraded it yet.
+type ErrSinkSchemaOutdated struct{ Have, Want int }
+
+func (e *ErrSinkSchemaOutdated) Error() string {
+	return fmt.Sprintf("the sink schema is at version %d but this embedsync needs version %d: run `embedsync init` (with the admin DSNs) to upgrade it, see docs/operations.md", e.Have, e.Want)
 }
 
 // Open connects to sink and source and builds the transformer and embed client.
@@ -38,6 +53,18 @@ func Open(ctx context.Context, cfg *config.Config, log *slog.Logger, needSource 
 		return nil, err
 	}
 	e := &Env{Cfg: cfg, Log: log, Store: st}
+	want, err := dbinit.SchemaVersion()
+	if err != nil {
+		st.Close()
+		return nil, err
+	}
+	if have, err := st.SchemaVersion(ctx); err != nil {
+		st.Close()
+		return nil, fmt.Errorf("read sink schema version (has `embedsync init` been run?): %w", err)
+	} else if have < want {
+		st.Close()
+		return nil, &ErrSinkSchemaOutdated{Have: have, Want: want}
+	}
 	if needSource {
 		srcDSN, err := config.Env(cfg.Source.DSNEnv)
 		if err != nil {
@@ -61,11 +88,7 @@ func Open(ctx context.Context, cfg *config.Config, log *slog.Logger, needSource 
 			return nil, fmt.Errorf("connect source: %w", err)
 		}
 	}
-	names := make([]string, 0, len(cfg.Source.Fields))
-	for _, f := range cfg.Source.Fields {
-		names = append(names, f.Name)
-	}
-	e.Tr, err = transform.New(cfg.Source.Table, cfg.Transform.Template, names, cfg.Transform.ChunkWords, cfg.Transform.ChunkOverlap, cfg.TransformFingerprint())
+	e.Pipes, err = pipeline.NewSpecs(cfg)
 	if err != nil {
 		e.Close()
 		return nil, err

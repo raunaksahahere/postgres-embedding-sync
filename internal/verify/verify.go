@@ -1,5 +1,6 @@
 // Package verify recomputes the expected sink from source rows and compares it
-// with the entire sink: every chunk of every key, including stale leftovers.
+// with the entire sink: every chunk of every document of every pipeline,
+// including stale leftovers. Documents are identified by (pipeline, key).
 package verify
 
 import (
@@ -11,14 +12,27 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/config"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/keys"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/store"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/transform"
 )
 
-// Row is one expected document (allowlisted fields, nil = NULL).
+// Row is one expected document (encoded key, allowlisted fields, nil = NULL).
 type Row struct {
 	Key    string
 	Fields map[string]*string
+}
+
+// Rows holds each pipeline's rows.
+type Rows map[string][]Row
+
+// Count returns the total number of rows.
+func (r Rows) Count() int {
+	n := 0
+	for _, rs := range r {
+		n += len(rs)
+	}
+	return n
 }
 
 // GenReport compares one generation with the expected rows.
@@ -33,37 +47,56 @@ type GenReport struct {
 	MissingQuarant  int      `json:"missing_due_to_quarantine"`
 	PoisonExpected  int      `json:"expected_poison_keys"`
 	ExampleProblems []string `json:"example_problems,omitempty"`
+	// Pipelines breaks the chunk counts down per pipeline.
+	Pipelines map[string]*PipeCounts `json:"pipelines"`
+}
+
+// PipeCounts is one pipeline's share of a GenReport.
+type PipeCounts struct {
+	ExpectedChunks int `json:"expected_chunks"`
+	ActualChunks   int `json:"actual_chunks"`
+	Missing        int `json:"missing"`
+	Extra          int `json:"extra"`
+	Stale          int `json:"stale"`
 }
 
 // OK reports zero missing, extra and stale entries (quarantined rows are reported separately).
 func (r GenReport) OK() bool { return r.Missing == 0 && r.Extra == 0 && r.Stale == 0 }
 
 type chunkKey struct {
-	key string
-	no  int
+	pipeline string
+	key      string
+	no       int
 }
 
 type chunkVal struct{ fp, text string }
 
-// Expected computes chunks for rows under one generation. Rows whose rendered
-// document exceeds maxDocBytes are expected to be absent (quarantined).
-func Expected(tr *transform.Transformer, m transform.ModelIdentity, rows []Row, maxDocBytes int) (map[chunkKey]chunkVal, map[string]bool, error) {
+// Expected computes chunks for every pipeline's rows under one generation.
+// Rows whose rendered document exceeds maxDocBytes are expected to be absent
+// (quarantined).
+func Expected(trs map[string]*transform.Transformer, m transform.ModelIdentity, rows Rows, maxDocBytes int) (map[chunkKey]chunkVal, map[chunkKey]bool, error) {
 	out := map[chunkKey]chunkVal{}
-	poison := map[string]bool{}
-	for _, r := range rows {
-		vals := map[string]string{}
-		for k, v := range r.Fields {
-			if v != nil {
-				vals[k] = *v
+	poison := map[chunkKey]bool{}
+	for pipe, rs := range rows {
+		tr := trs[pipe]
+		if tr == nil {
+			return nil, nil, fmt.Errorf("no transform for pipeline %q", pipe)
+		}
+		for _, r := range rs {
+			vals := map[string]string{}
+			for k, v := range r.Fields {
+				if v != nil {
+					vals[k] = *v
+				}
 			}
-		}
-		text, err := tr.Render(vals)
-		if err != nil || len(text) > maxDocBytes {
-			poison[r.Key] = true
-			continue
-		}
-		for _, c := range tr.Chunks(r.Key, text, m) {
-			out[chunkKey{r.Key, c.No}] = chunkVal{c.Fingerprint, c.Text}
+			text, err := tr.Render(vals)
+			if err != nil || len(text) > maxDocBytes {
+				poison[chunkKey{pipeline: pipe, key: r.Key}] = true
+				continue
+			}
+			for _, c := range tr.Chunks(r.Key, text, m) {
+				out[chunkKey{pipe, r.Key, c.No}] = chunkVal{c.Fingerprint, c.Text}
+			}
 		}
 	}
 	return out, poison, nil
@@ -74,33 +107,48 @@ type Querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
-// Generation compares a generation's chunk table with rows.
-func Generation(ctx context.Context, q Querier, schema string, g *store.Generation, tr *transform.Transformer, rows []Row, maxDocBytes int) (*GenReport, error) {
+// Generation compares a generation's chunk table with every pipeline's rows.
+func Generation(ctx context.Context, q Querier, schema string, g *store.Generation, trs map[string]*transform.Transformer, rows Rows, maxDocBytes int) (*GenReport, error) {
 	m := transform.ModelIdentity{Name: g.ModelName, Revision: g.ModelRevision, DocumentPrefix: g.DocumentPrefix}
-	exp, poison, err := Expected(tr, m, rows, maxDocBytes)
+	exp, poison, err := Expected(trs, m, rows, maxDocBytes)
 	if err != nil {
 		return nil, err
 	}
-	quarantined := map[string]bool{}
-	qr, err := q.Query(ctx, `SELECT source_key FROM `+pgx.Identifier{schema, "dlq"}.Sanitize()+` WHERE generation_id = $1 AND state = 'open'`, g.ID)
+	quarantined := map[chunkKey]bool{}
+	qr, err := q.Query(ctx, `SELECT pipeline, source_key FROM `+pgx.Identifier{schema, "dlq"}.Sanitize()+` WHERE generation_id = $1 AND state = 'open'`, g.ID)
 	if err != nil {
 		return nil, err
 	}
 	for qr.Next() {
-		var k string
-		if err := qr.Scan(&k); err != nil {
+		var k chunkKey
+		if err := qr.Scan(&k.pipeline, &k.key); err != nil {
 			qr.Close()
 			return nil, err
 		}
 		quarantined[k] = true
 	}
 	qr.Close()
-	rs, err := q.Query(ctx, `SELECT source_key, chunk_no, fingerprint, content FROM `+pgx.Identifier{schema, g.ChunkTable}.Sanitize())
+	rs, err := q.Query(ctx, `SELECT pipeline, source_key, chunk_no, fingerprint, content FROM `+pgx.Identifier{schema, g.ChunkTable}.Sanitize())
 	if err != nil {
 		return nil, err
 	}
 	defer rs.Close()
-	rep := &GenReport{Generation: g.ID, ExpectedChunks: len(exp), Quarantined: len(quarantined), PoisonExpected: len(poison)}
+	rep := &GenReport{Generation: g.ID, ExpectedChunks: len(exp), Quarantined: len(quarantined), PoisonExpected: len(poison),
+		Pipelines: map[string]*PipeCounts{}}
+	pc := func(pipe string) *PipeCounts {
+		c := rep.Pipelines[pipe]
+		if c == nil {
+			c = &PipeCounts{}
+			rep.Pipelines[pipe] = c
+		}
+		return c
+	}
+	for pipe := range rows {
+		pc(pipe)
+	}
+	for ck := range exp {
+		pc(ck.pipeline).ExpectedChunks++
+	}
 	seen := map[chunkKey]bool{}
 	var problems []string
 	note := func(s string) {
@@ -111,19 +159,22 @@ func Generation(ctx context.Context, q Querier, schema string, g *store.Generati
 	for rs.Next() {
 		var ck chunkKey
 		var v chunkVal
-		if err := rs.Scan(&ck.key, &ck.no, &v.fp, &v.text); err != nil {
+		if err := rs.Scan(&ck.pipeline, &ck.key, &ck.no, &v.fp, &v.text); err != nil {
 			return nil, err
 		}
 		rep.ActualChunks++
+		pc(ck.pipeline).ActualChunks++
 		seen[ck] = true
 		want, ok := exp[ck]
 		switch {
 		case !ok:
 			rep.Extra++
-			note(fmt.Sprintf("extra key=%s chunk=%d", ck.key, ck.no))
+			pc(ck.pipeline).Extra++
+			note(fmt.Sprintf("extra pipeline=%s key=%s chunk=%d", ck.pipeline, ck.key, ck.no))
 		case want.fp != v.fp || want.text != v.text:
 			rep.Stale++
-			note(fmt.Sprintf("stale key=%s chunk=%d", ck.key, ck.no))
+			pc(ck.pipeline).Stale++
+			note(fmt.Sprintf("stale pipeline=%s key=%s chunk=%d", ck.pipeline, ck.key, ck.no))
 		}
 	}
 	if err := rs.Err(); err != nil {
@@ -133,12 +184,13 @@ func Generation(ctx context.Context, q Querier, schema string, g *store.Generati
 		if seen[ck] {
 			continue
 		}
-		if quarantined[ck.key] {
+		if quarantined[chunkKey{pipeline: ck.pipeline, key: ck.key}] {
 			rep.MissingQuarant++
 			continue
 		}
 		rep.Missing++
-		note(fmt.Sprintf("missing key=%s chunk=%d", ck.key, ck.no))
+		pc(ck.pipeline).Missing++
+		note(fmt.Sprintf("missing pipeline=%s key=%s chunk=%d", ck.pipeline, ck.key, ck.no))
 	}
 	sort.Strings(problems)
 	rep.ExampleProblems = problems
@@ -170,33 +222,45 @@ func fieldsEqual(a, b map[string]*string) bool {
 	return true
 }
 
-// State compares source_state rows (loaded by the caller) with source rows.
-func State(rows []Row, state map[string]map[string]*string) StateReport {
-	rep := StateReport{Expected: len(rows), Actual: len(state)}
-	seen := map[string]bool{}
-	for _, r := range rows {
-		seen[r.Key] = true
-		s, ok := state[r.Key]
-		switch {
-		case !ok:
-			rep.Missing++
-		case !fieldsEqual(s, r.Fields):
-			rep.Stale++
+// State compares source_state rows (loaded by the caller, pipeline -> key ->
+// fields) with every pipeline's source rows.
+func State(rows Rows, state map[string]map[string]map[string]*string) StateReport {
+	rep := StateReport{Expected: rows.Count()}
+	for pipe, st := range state {
+		rep.Actual += len(st)
+		seen := map[string]bool{}
+		for _, r := range rows[pipe] {
+			seen[r.Key] = true
+		}
+		for k := range st {
+			if !seen[k] {
+				rep.Extra++
+			}
 		}
 	}
-	for k := range state {
-		if !seen[k] {
-			rep.Extra++
+	for pipe, rs := range rows {
+		for _, r := range rs {
+			s, ok := state[pipe][r.Key]
+			switch {
+			case !ok:
+				rep.Missing++
+			case !fieldsEqual(s, r.Fields):
+				rep.Stale++
+			}
 		}
 	}
 	return rep
 }
 
-// SourceRows reads the allowlisted projection of the source table.
-func SourceRows(ctx context.Context, q Querier, cfg *config.Config) ([]Row, error) {
-	schema, table := cfg.SourceSchemaTable()
-	cols := []string{pgx.Identifier{cfg.Source.Key}.Sanitize() + "::text"}
-	for _, f := range cfg.Source.Fields {
+// SourceRows reads the allowlisted projection of one pipeline's table, with
+// keys encoded exactly as the stream and backfill encode them.
+func SourceRows(ctx context.Context, q Querier, p *config.PipelineDef) ([]Row, error) {
+	schema, table := p.SchemaTable()
+	cols := []string{}
+	for _, k := range p.Key {
+		cols = append(cols, pgx.Identifier{k}.Sanitize()+"::text")
+	}
+	for _, f := range p.Fields {
 		cols = append(cols, pgx.Identifier{f.Column}.Sanitize()+"::text")
 	}
 	rs, err := q.Query(ctx, `SELECT `+strings.Join(cols, ", ")+` FROM `+pgx.Identifier{schema, table}.Sanitize())
@@ -204,6 +268,7 @@ func SourceRows(ctx context.Context, q Querier, cfg *config.Config) ([]Row, erro
 		return nil, err
 	}
 	defer rs.Close()
+	nk := len(p.Key)
 	var out []Row
 	for rs.Next() {
 		vals := make([]*string, len(cols))
@@ -214,31 +279,60 @@ func SourceRows(ctx context.Context, q Querier, cfg *config.Config) ([]Row, erro
 		if err := rs.Scan(ptrs...); err != nil {
 			return nil, err
 		}
-		r := Row{Key: *vals[0], Fields: map[string]*string{}}
-		for i, f := range cfg.Source.Fields {
-			r.Fields[f.Name] = vals[i+1]
+		kv := make([]string, nk)
+		for i := range kv {
+			if vals[i] == nil {
+				return nil, fmt.Errorf("pipeline %s: NULL primary key value", p.Name)
+			}
+			kv[i] = *vals[i]
+		}
+		key, err := keys.EncodeValues(kv)
+		if err != nil {
+			return nil, fmt.Errorf("pipeline %s: %w", p.Name, err)
+		}
+		r := Row{Key: key, Fields: map[string]*string{}}
+		for i, f := range p.Fields {
+			r.Fields[f.Name] = vals[nk+i]
 		}
 		out = append(out, r)
 	}
 	return out, rs.Err()
 }
 
-// StateRows reads source_state as rows.
-func StateRows(ctx context.Context, q Querier, schema string) ([]Row, map[string]map[string]*string, error) {
-	rs, err := q.Query(ctx, `SELECT source_key, fields FROM `+pgx.Identifier{schema, "source_state"}.Sanitize())
+// AllSourceRows reads every pipeline's table (call inside one snapshot).
+func AllSourceRows(ctx context.Context, q Querier, cfg *config.Config) (Rows, error) {
+	out := Rows{}
+	for i := range cfg.Pipelines {
+		p := &cfg.Pipelines[i]
+		rs, err := SourceRows(ctx, q, p)
+		if err != nil {
+			return nil, err
+		}
+		out[p.Name] = rs
+	}
+	return out, nil
+}
+
+// StateRows reads source_state as rows per pipeline, and as pipeline -> key -> fields.
+func StateRows(ctx context.Context, q Querier, schema string) (Rows, map[string]map[string]map[string]*string, error) {
+	rs, err := q.Query(ctx, `SELECT pipeline, source_key, fields FROM `+pgx.Identifier{schema, "source_state"}.Sanitize())
 	if err != nil {
 		return nil, nil, err
 	}
 	defer rs.Close()
-	var rows []Row
-	m := map[string]map[string]*string{}
+	rows := Rows{}
+	m := map[string]map[string]map[string]*string{}
 	for rs.Next() {
+		var pipe string
 		var r Row
-		if err := rs.Scan(&r.Key, &r.Fields); err != nil {
+		if err := rs.Scan(&pipe, &r.Key, &r.Fields); err != nil {
 			return nil, nil, err
 		}
-		rows = append(rows, r)
-		m[r.Key] = r.Fields
+		rows[pipe] = append(rows[pipe], r)
+		if m[pipe] == nil {
+			m[pipe] = map[string]map[string]*string{}
+		}
+		m[pipe][r.Key] = r.Fields
 	}
 	return rows, m, rs.Err()
 }

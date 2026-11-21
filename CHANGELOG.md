@@ -1,5 +1,27 @@
 # Changelog
 
+## Unreleased
+
+Several tables in one process, and composite primary keys.
+
+* **Pipelines**: `pipelines:` lists several tables, each with its own key columns,
+  allowlisted fields and transform. They share one publication, one replication slot,
+  one embedder and every generation. A source transaction that touches several tables
+  is applied in one sink transaction, also when its embeddings finish out of order.
+  The single-table configuration is unchanged and becomes the pipeline `default`.
+* **Composite keys**: `key: [tenant_id, id]`. Keys are typed per column (int, text,
+  uuid); backfill windows, range deletes and the planner order them like PostgreSQL's
+  row comparison. Documents are identified by `(pipeline, key)`, so ids may repeat
+  across tables.
+* Search hits, `status`, `verify`, the DLQ and backfill jobs report the pipeline;
+  `embedsync backfill --pipeline P` re-scans one table. With several pipelines the
+  migration gate judges hits as `<pipeline>/<key>` in `eval_qrels`.
+* `embedsync init` reconciles the publication and column grants with the configured
+  pipelines on every run.
+* **Upgrade**: run `embedsync init` before starting the new version; it applies
+  `sink/0002_pipelines.sql` (see docs/operations.md). Existing documents are not
+  re-embedded and keep serving.
+
 ## v0.2.0
 
 Install embedsync from a native installer and run it without cloning the repository,

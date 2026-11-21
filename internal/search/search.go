@@ -34,12 +34,15 @@ type Options struct {
 	Exact      bool   // bypass the ANN index (sequential scan)
 }
 
-// Hit is one document (best chunk per source key).
+// Hit is one document (best chunk per pipeline and source key). Key is the
+// encoded source key: the column value for a single-column key, a JSON array
+// of the column values for a composite key.
 type Hit struct {
-	Key     string  `json:"key"`
-	ChunkNo int     `json:"chunk_no"`
-	Score   float64 `json:"score"`
-	Content string  `json:"content"`
+	Pipeline string  `json:"pipeline"`
+	Key      string  `json:"key"`
+	ChunkNo  int     `json:"chunk_no"`
+	Score    float64 `json:"score"`
+	Content  string  `json:"content"`
 }
 
 // Result is a search response.
@@ -193,10 +196,10 @@ func (s *Searcher) query(ctx context.Context, parent pgx.Tx, g *genRow, vec stri
 	// deterministic. Exact search also breaks ties inside the LIMIT.
 	inner := `embedding ` + op + ` $1::vector`
 	if exact {
-		inner += `, source_key, chunk_no`
+		inner += `, pipeline, source_key, chunk_no`
 	}
-	rows, err := tx.Query(ctx, `SELECT source_key, chunk_no, content, d FROM (SELECT source_key, chunk_no, content, embedding `+op+` $1::vector AS d FROM `+
-		pgx.Identifier{s.Schema, g.table}.Sanitize()+` ORDER BY `+inner+` LIMIT $2) c ORDER BY round(d::numeric, 6), source_key, chunk_no`, vec, candidates)
+	rows, err := tx.Query(ctx, `SELECT pipeline, source_key, chunk_no, content, d FROM (SELECT pipeline, source_key, chunk_no, content, embedding `+op+` $1::vector AS d FROM `+
+		pgx.Identifier{s.Schema, g.table}.Sanitize()+` ORDER BY `+inner+` LIMIT $2) c ORDER BY round(d::numeric, 6), pipeline, source_key, chunk_no`, vec, candidates)
 	if err != nil {
 		return nil, err
 	}
@@ -206,13 +209,14 @@ func (s *Searcher) query(ctx context.Context, parent pgx.Tx, g *genRow, vec stri
 	for rows.Next() {
 		var h Hit
 		var d float64
-		if err := rows.Scan(&h.Key, &h.ChunkNo, &h.Content, &d); err != nil {
+		if err := rows.Scan(&h.Pipeline, &h.Key, &h.ChunkNo, &h.Content, &d); err != nil {
 			return nil, err
 		}
-		if seen[h.Key] {
+		doc := h.Pipeline + "\x00" + h.Key
+		if seen[doc] {
 			continue
 		}
-		seen[h.Key] = true
+		seen[doc] = true
 		switch g.distance {
 		case "cosine":
 			h.Score = 1 - d

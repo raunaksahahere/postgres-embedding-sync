@@ -53,6 +53,10 @@ primary by sacrificing the slot, and other slots or archiving failures also reta
 
 ## Pauses
 
+All pipelines share one stream, so a pause stops every table; the pause detail and
+`embedsync status` name the pipeline that caused it, and `--accept-schema-change` accepts
+only that pipeline's change.
+
 ```
 embedsync status              # reason and detail
 ```
@@ -112,7 +116,29 @@ a failover without synced slots, treat it as slot loss.
 
 * **embedsync**: stop (`SIGTERM`, graceful: in-flight units finish or roll back), replace
   the binary or image, start. Sink schema migrations are versioned and applied by
-  `embedsync init`; run it before starting a version whose release notes say so.
+  `embedsync init`; run it before starting a version whose release notes say so. Every
+  command checks the sink schema version and refuses (with "run `embedsync init`") to
+  work against an older schema.
+* **From a single-table release (v0.2.0 and earlier) to pipelines**: stop `run`, replace
+  the binary, run `embedsync init` with the admin DSNs (it applies
+  `sink/0002_pipelines.sql`: existing rows of `source_state`, every chunk table, `dlq` and
+  `backfill_jobs` become the pipeline `default`, and the accepted relation moves to
+  `pipeline_relations`), then start `run` with the unchanged config. Nothing is
+  re-embedded; checkpoint, generations, rollback window and DLQ records carry over. The
+  migration rebuilds each chunk table's primary key, which takes a lock for a time
+  proportional to the table; searches wait meanwhile. Downgrading after `init` is not
+  supported (the old binary refuses to start on the upgraded checkpoint).
+* **Adding a table**: move the existing table under `pipelines:` with the name `default`
+  (any other name would be a new, empty pipeline), add the new pipeline, run
+  `embedsync init` (grants its columns to the replicator role and adds it to the
+  publication with its column list) and restart `run`. The new pipeline is registered,
+  and one backfill job per live generation fills it while streaming continues;
+  `embedsync status` lists pipelines and jobs. A migration candidate must cover every
+  configured pipeline before its gates run.
+* **Changing or removing a pipeline**: its table and key cannot change in place
+  (startup pauses with `identity_mismatch`); a new transform needs a new generation
+  (`embedsync migrate`), as before. Removing a pipeline from the config pauses startup
+  (`startup_check`); restore it or set up a new sink schema.
 * **PostgreSQL major upgrade** of the source: `pg_upgrade` does not keep logical slots
   before PG 17 (17+ migrates them if the subscriber/consumer is caught up). Stop writers,
   wait for `embedsync status` to show idle, upgrade, then either reuse the migrated slot

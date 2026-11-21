@@ -60,7 +60,7 @@ func (c *vectorCache) put(fp, vec string) {
 type EmbedStage struct {
 	Client    *embedclient.Client
 	Store     *store.Store
-	Tr        *transform.Transformer
+	Specs     Specs
 	BatchSize int
 	Log       *slog.Logger
 
@@ -69,8 +69,8 @@ type EmbedStage struct {
 }
 
 // NewEmbedStage bounds concurrent embedding requests.
-func NewEmbedStage(c *embedclient.Client, st *store.Store, tr *transform.Transformer, batch, concurrency int, log *slog.Logger) *EmbedStage {
-	return &EmbedStage{Client: c, Store: st, Tr: tr, BatchSize: batch, Log: log,
+func NewEmbedStage(c *embedclient.Client, st *store.Store, specs Specs, batch, concurrency int, log *slog.Logger) *EmbedStage {
+	return &EmbedStage{Client: c, Store: st, Specs: specs, BatchSize: batch, Log: log,
 		sem: make(chan struct{}, concurrency), cache: newVectorCache(4096)}
 }
 
@@ -103,14 +103,14 @@ func (e *EmbedStage) dispatch(ctx context.Context, u *Unit) {
 	var jobs []job
 	for genID, gi := range u.TargetGens() {
 		eff := u.Effective(genID)
-		chunks := map[string][]transform.Chunk{}
+		chunks := map[DocID][]transform.Chunk{}
 		need := map[string]string{} // fingerprint -> text
-		for k, d := range eff {
+		for id, d := range eff {
 			if d.Delete || d.Poison != "" {
 				continue
 			}
-			cs := e.Tr.Chunks(k, d.Text, gi.Model)
-			chunks[k] = cs
+			cs := e.Specs[id.Pipeline].Tr.Chunks(id.Key, d.Text, gi.Model)
+			chunks[id] = cs
 			for _, c := range cs {
 				need[c.Fingerprint] = c.Text
 			}

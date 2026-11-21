@@ -12,6 +12,12 @@
 // effects and the checkpoint in one sink transaction, so durable progress is
 // always contiguous: no worker, retry or slow response can move feedback past
 // unfinished work.
+//
+// Several pipelines (source tables) share the one stream. A unit holds whole
+// source transactions, whatever tables they touch, so a transaction that
+// changes two pipelines' tables commits in one sink transaction even when the
+// embeddings of its documents finish out of order. Documents are identified by
+// DocID{pipeline, key}.
 package pipeline
 
 import (
@@ -23,9 +29,69 @@ import (
 
 	"github.com/jackc/pglogrepl"
 
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/config"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/keys"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/store"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/transform"
 )
+
+// Spec is the runtime view of one configured pipeline.
+type Spec struct {
+	Def   *config.PipelineDef
+	Name  string
+	Codec keys.Codec // filled from the source catalog (or the accepted relation)
+	Tr    *transform.Transformer
+}
+
+// NewSpec builds a pipeline's transformer; the codec is set once key types are known.
+func NewSpec(p *config.PipelineDef) (*Spec, error) {
+	tr, err := transform.New(p.Table, p.Transform.Template, p.FieldNames(), p.Transform.ChunkWords, p.Transform.ChunkOverlap, p.TransformFingerprint())
+	if err != nil {
+		return nil, fmt.Errorf("pipeline %s: %w", p.Name, err)
+	}
+	return &Spec{Def: p, Name: p.Name, Tr: tr}, nil
+}
+
+// Specs indexes pipelines by name.
+type Specs map[string]*Spec
+
+// NewSpecs builds a Spec for every configured pipeline.
+func NewSpecs(cfg *config.Config) (Specs, error) {
+	out := Specs{}
+	for i := range cfg.Pipelines {
+		s, err := NewSpec(&cfg.Pipelines[i])
+		if err != nil {
+			return nil, err
+		}
+		out[s.Name] = s
+	}
+	return out, nil
+}
+
+// Transformers returns each pipeline's transformer.
+func (s Specs) Transformers() map[string]*transform.Transformer {
+	out := make(map[string]*transform.Transformer, len(s))
+	for n, p := range s {
+		out[n] = p.Tr
+	}
+	return out
+}
+
+// DocID identifies a document: a pipeline and its encoded source key.
+type DocID struct {
+	Pipeline string
+	Key      string
+}
+
+func (d DocID) String() string { return d.Pipeline + "/" + d.Key }
+
+// Less orders DocIDs (deterministic lock order in the committer).
+func (d DocID) Less(o DocID) bool {
+	if d.Pipeline != o.Pipeline {
+		return d.Pipeline < o.Pipeline
+	}
+	return d.Key < o.Key
+}
 
 // LSN aliases pglogrepl.LSN.
 type LSN = pglogrepl.LSN
@@ -50,10 +116,11 @@ type Marker struct {
 	WindowID string
 }
 
-// Change is one decoded row change of the source table or a marker.
+// Change is one decoded row change of a pipeline's source table or a marker.
 type Change struct {
 	Kind      ChangeKind
-	Key       string
+	Pipeline  string             // empty for markers
+	Key       string             // encoded key (keys.Codec)
 	OldKey    string             // set when an UPDATE changed the primary key
 	Fields    map[string]*string // logical field -> value (nil = SQL NULL); excludes unchanged TOAST
 	Unchanged []string           // logical fields whose TOAST value was not sent
@@ -82,6 +149,8 @@ type PauseError struct {
 	// InStream is set when the stream itself reached the condition (as
 	// opposed to a startup check), e.g. the first incompatible relation.
 	InStream bool
+	// Pipeline names the pipeline whose relation caused a schema pause.
+	Pipeline string
 }
 
 func (e *PauseError) Error() string { return fmt.Sprintf("paused (%s): %s", e.Reason, e.Detail) }
@@ -93,9 +162,9 @@ func IsPause(err error) (*PauseError, bool) {
 	return p, ok
 }
 
-// DocEffect is the final state of one key within a unit.
+// DocEffect is the final state of one document within a unit.
 type DocEffect struct {
-	Key        string
+	ID         DocID
 	Delete     bool
 	Fields     map[string]*string
 	Text       string
@@ -105,13 +174,14 @@ type DocEffect struct {
 	PoisonErr  string
 }
 
-// RangeDelete removes sink rows inside a backfill window's key range that were
-// neither in the snapshot nor changed during the window.
+// RangeDelete removes one pipeline's sink rows inside a backfill window's key
+// range that were neither in the snapshot nor changed during the window.
 type RangeDelete struct {
-	Gen  string
-	Lo   *string // exclusive; nil = unbounded
-	Hi   *string // inclusive; nil = unbounded
-	Keep []string
+	Gen      string
+	Pipeline string
+	Lo       *string // exclusive; nil = unbounded
+	Hi       *string // inclusive; nil = unbounded
+	Keep     []string
 }
 
 // GenStart records the stream position from which a generation consumes changes.
@@ -122,12 +192,13 @@ type GenStart struct {
 
 // WindowProgress is backfill progress persisted with the window's effects.
 type WindowProgress struct {
-	JobID   int64
-	Gen     string
-	LastKey *string
-	Rows    int
-	Final   bool
-	Entry   *WindowRows
+	JobID    int64
+	Gen      string
+	Pipeline string
+	LastKey  *string
+	Rows     int
+	Final    bool
+	Entry    *WindowRows
 }
 
 // TxnMeta is per-transaction metadata for latency metrics.
@@ -147,9 +218,9 @@ type Unit struct {
 	Seq          uint64
 	EndLSN       LSN
 	Txns         []TxnMeta
-	Truncate     bool
-	Stream       map[string]*DocEffect
-	Snapshot     map[string]map[string]*DocEffect
+	Truncates    map[string]bool // pipelines truncated in this unit (applied before every other effect)
+	Stream       map[DocID]*DocEffect
+	Snapshot     map[string]map[DocID]*DocEffect // gen -> doc -> effect
 	RangeDeletes []RangeDelete
 	GenStarts    []GenStart
 	Retires      []string
@@ -159,9 +230,9 @@ type Unit struct {
 	Pause        *PauseError
 
 	// Filled by the embed stage.
-	Chunks   map[string]map[string][]transform.Chunk // gen -> key -> chunks
-	Vectors  map[string]map[string]string            // gen -> fingerprint -> pgvector text
-	Rejected map[string]map[string]string            // gen -> fingerprint -> error
+	Chunks   map[string]map[DocID][]transform.Chunk // gen -> doc -> chunks
+	Vectors  map[string]map[string]string           // gen -> fingerprint -> pgvector text
+	Rejected map[string]map[string]string           // gen -> fingerprint -> error
 	ready    chan struct{}
 	err      error
 	docs     int
@@ -169,9 +240,9 @@ type Unit struct {
 
 func newUnit(seq uint64) *Unit {
 	return &Unit{
-		Seq: seq, Stream: map[string]*DocEffect{}, Snapshot: map[string]map[string]*DocEffect{},
+		Seq: seq, Truncates: map[string]bool{}, Stream: map[DocID]*DocEffect{}, Snapshot: map[string]map[DocID]*DocEffect{},
 		Gens: map[string]*GenInfo{}, SnapGens: map[string]*GenInfo{},
-		Chunks: map[string]map[string][]transform.Chunk{}, Vectors: map[string]map[string]string{},
+		Chunks: map[string]map[DocID][]transform.Chunk{}, Vectors: map[string]map[string]string{},
 		Rejected: map[string]map[string]string{}, ready: make(chan struct{}),
 	}
 }
@@ -179,8 +250,8 @@ func newUnit(seq uint64) *Unit {
 // Effective returns the effects for one generation: snapshot effects override
 // stream effects for the same key (the planner removes snapshot entries that a
 // later stream change supersedes).
-func (u *Unit) Effective(gen string) map[string]*DocEffect {
-	out := map[string]*DocEffect{}
+func (u *Unit) Effective(gen string) map[DocID]*DocEffect {
+	out := map[DocID]*DocEffect{}
 	if _, ok := u.Gens[gen]; ok {
 		for k, e := range u.Stream {
 			out[k] = e

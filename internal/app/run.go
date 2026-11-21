@@ -23,21 +23,27 @@ import (
 // ErrSlotLost means the source no longer retains the WAL this sink needs.
 var ErrSlotLost = errors.New("replication slot lost or invalidated")
 
-// Catalog is what startup learns about the source table.
+// Catalog is what startup learns about one pipeline's source table.
 type Catalog struct {
-	KeyKind   keys.Kind
+	Codec     keys.Codec
 	Signature string
 }
 
-// LoadCatalog validates the source table and publication against the config.
-func LoadCatalog(ctx context.Context, e *Env) (*Catalog, error) {
-	cfg := e.Cfg
-	schema, table := cfg.SourceSchemaTable()
+// Catalogs holds each pipeline's catalog; SchemaErrs holds pipelines whose
+// table no longer matches the configured mapping.
+type Catalogs struct {
+	Pipes      map[string]*Catalog
+	SchemaErrs map[string]*SchemaError
+}
+
+// loadPipeCatalog validates one pipeline's table against its configuration.
+func loadPipeCatalog(ctx context.Context, e *Env, p *config.PipelineDef) (*Catalog, error) {
+	schema, table := p.SchemaTable()
 	reg := pgx.Identifier{schema, table}.Sanitize()
 	types := map[string]uint32{}
 	rows, err := e.Source.Query(ctx, `SELECT attname, atttypid FROM pg_attribute WHERE attrelid = $1::regclass AND attnum > 0 AND NOT attisdropped`, reg)
 	if err != nil {
-		return nil, fmt.Errorf("read source columns: %w", err)
+		return nil, fmt.Errorf("pipeline %s: read source columns of %s: %w", p.Name, p.Table, err)
 	}
 	for rows.Next() {
 		var n string
@@ -55,24 +61,67 @@ func LoadCatalog(ctx context.Context, e *Env) (*Catalog, error) {
 		FROM pg_class c LEFT JOIN pg_index i ON i.indrelid = c.oid AND i.indisprimary
 		LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
 		WHERE c.oid = $1::regclass GROUP BY c.relreplident`, reg).Scan(&pk, &ident); err != nil {
-		return nil, fmt.Errorf("read primary key: %w", err)
+		return nil, fmt.Errorf("pipeline %s: read primary key: %w", p.Name, err)
 	}
-	if len(pk) != 1 || pk[0] != cfg.Source.Key {
-		return nil, schemaErr("source table %s must have a single-column primary key %q (found %v)", cfg.Source.Table, cfg.Source.Key, pk)
+	if !sameSet(pk, p.Key) {
+		return nil, schemaErr(p.Name, "pipeline %s: source table %s must have the primary key %v (found %v)", p.Name, p.Table, []string(p.Key), pk)
 	}
 	if ident != "d" && ident != "f" {
-		return nil, fmt.Errorf("source table %s replica identity must be DEFAULT (primary key) or FULL", cfg.Source.Table)
+		return nil, fmt.Errorf("pipeline %s: source table %s replica identity must be DEFAULT (primary key) or FULL", p.Name, p.Table)
 	}
-	kk, err := keys.FromTypeOID(types[cfg.Source.Key])
-	if err != nil {
-		return nil, err
+	var kinds []keys.Kind
+	for _, k := range p.Key {
+		kk, err := keys.FromTypeOID(types[k])
+		if err != nil {
+			return nil, fmt.Errorf("pipeline %s: key column %s: %w", p.Name, k, err)
+		}
+		kinds = append(kinds, kk)
 	}
-	for _, c := range cfg.FieldColumns() {
+	for _, c := range p.FieldColumns() {
 		if _, ok := types[c]; !ok {
-			return nil, schemaErr("allowlisted column %q does not exist on %s", c, cfg.Source.Table)
+			return nil, schemaErr(p.Name, "pipeline %s: allowlisted column %q does not exist on %s", p.Name, c, p.Table)
 		}
 	}
-	sig := pipeline.RelationSignature(cfg, func(col string) (uint32, bool) { t, ok := types[col]; return t, ok })
+	sig := pipeline.RelationSignature(p, func(col string) (uint32, bool) { t, ok := types[col]; return t, ok })
+	return &Catalog{Codec: keys.NewCodec(kinds...), Signature: sig}, nil
+}
+
+func sameSet(a []string, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	have := map[string]bool{}
+	for _, x := range a {
+		have[x] = true
+	}
+	for _, x := range b {
+		if !have[x] {
+			return false
+		}
+	}
+	return true
+}
+
+// LoadCatalog validates every pipeline's table and the shared publication
+// against the config. Per-pipeline schema mismatches are returned in
+// SchemaErrs (the stream may not have reached them yet); anything else is an
+// error.
+func LoadCatalog(ctx context.Context, e *Env) (*Catalogs, error) {
+	cfg := e.Cfg
+	out := &Catalogs{Pipes: map[string]*Catalog{}, SchemaErrs: map[string]*SchemaError{}}
+	for i := range cfg.Pipelines {
+		p := &cfg.Pipelines[i]
+		c, err := loadPipeCatalog(ctx, e, p)
+		var se *SchemaError
+		switch {
+		case errors.As(err, &se):
+			out.SchemaErrs[p.Name] = se
+		case err != nil:
+			return nil, err
+		default:
+			out.Pipes[p.Name] = c
+		}
+	}
 
 	var ins, upd, del, trunc bool
 	if err := e.Source.QueryRow(ctx, `SELECT pubinsert, pubupdate, pubdelete, pubtruncate FROM pg_publication WHERE pubname = $1`, cfg.Source.Publication).
@@ -87,38 +136,55 @@ func LoadCatalog(ctx context.Context, e *Env) (*Catalog, error) {
 		return nil, err
 	}
 	defer prow.Close()
-	sawSource, sawMarkers := false, false
+	byTable := map[string]*config.PipelineDef{}
+	for i := range cfg.Pipelines {
+		byTable[cfg.Pipelines[i].Table] = &cfg.Pipelines[i]
+	}
+	seen := map[string]bool{}
+	sawMarkers := false
 	for prow.Next() {
 		var s, t string
 		var cols []string
 		if err := prow.Scan(&s, &t, &cols); err != nil {
 			return nil, err
 		}
-		switch {
-		case s == schema && t == table:
-			sawSource = true
-			have := map[string]bool{}
-			for _, c := range cols {
-				have[c] = true
-			}
-			for _, c := range cfg.PublishedColumns() {
-				if !have[c] {
-					return nil, schemaErr("publication %q does not publish column %q", cfg.Source.Publication, c)
-				}
-			}
-			if len(cols) > len(cfg.PublishedColumns()) {
-				e.Log.Warn("publication publishes columns outside the allowlist; consider a column list", "publication", cfg.Source.Publication)
-			}
-		case s == cfg.Source.ControlSchema && t == "markers":
+		if s == cfg.Source.ControlSchema && t == "markers" {
 			sawMarkers = true
-		default:
-			return nil, fmt.Errorf("publication %q includes %s.%s; it must contain only the source table and the marker table", cfg.Source.Publication, s, t)
+			continue
+		}
+		p := byTable[s+"."+t]
+		if p == nil {
+			return nil, fmt.Errorf("publication %q includes %s.%s, which no pipeline names; it must contain only the pipelines' tables and the marker table (run `embedsync init` to reconcile it)", cfg.Source.Publication, s, t)
+		}
+		seen[p.Name] = true
+		have := map[string]bool{}
+		for _, c := range cols {
+			have[c] = true
+		}
+		for _, c := range p.PublishedColumns() {
+			if !have[c] {
+				if _, schemaPending := out.SchemaErrs[p.Name]; schemaPending {
+					continue // reported by the schema check of this pipeline
+				}
+				return nil, schemaErr(p.Name, "publication %q does not publish column %q of %s (run `embedsync init` after changing fields)", cfg.Source.Publication, c, p.Table)
+			}
+		}
+		if len(cols) > len(p.PublishedColumns()) {
+			e.Log.Warn("publication publishes columns outside the allowlist; consider a column list", "publication", cfg.Source.Publication, "table", p.Table)
 		}
 	}
-	if !sawSource || !sawMarkers {
-		return nil, fmt.Errorf("publication %q must include %s and %s.markers", cfg.Source.Publication, cfg.Source.Table, cfg.Source.ControlSchema)
+	if err := prow.Err(); err != nil {
+		return nil, err
 	}
-	return &Catalog{KeyKind: kk, Signature: sig}, prow.Err()
+	if !sawMarkers {
+		return nil, fmt.Errorf("publication %q must include %s.markers", cfg.Source.Publication, cfg.Source.ControlSchema)
+	}
+	for _, p := range cfg.Pipelines {
+		if !seen[p.Name] {
+			return nil, fmt.Errorf("publication %q does not include %s (pipeline %s); run `embedsync init` to add it", cfg.Source.Publication, p.Table, p.Name)
+		}
+	}
+	return out, nil
 }
 
 // SlotInfo is a row of pg_replication_slots.
@@ -191,24 +257,32 @@ type RunOptions struct {
 	AcceptSchemaChange bool
 }
 
-// pipelineRun is one attempt of the streaming pipeline with fresh connections.
 // atSchemaPause reports whether the stream paused on an incompatible relation
-// at the current checkpoint (nothing after it has been acknowledged since).
-func atSchemaPause(cp *store.Checkpoint) bool {
-	return cp.SchemaPauseLSN != nil && *cp.SchemaPauseLSN == cp.LSN
+// of pipeline at the current checkpoint (nothing after it has been
+// acknowledged since). A pause recorded before pipelines existed belongs to
+// the single table, i.e. the "default" pipeline.
+func atSchemaPause(cp *store.Checkpoint, pipe string) bool {
+	if cp.SchemaPauseLSN == nil || *cp.SchemaPauseLSN != cp.LSN {
+		return false
+	}
+	paused := cp.SchemaPausePipeline
+	if paused == "" {
+		paused = config.DefaultPipeline
+	}
+	return paused == pipe
 }
 
 // configMatchesSignature reports whether an accepted relation signature
-// ("col:typeoid,...") covers exactly the configured key and field columns.
-func configMatchesSignature(cfg *config.Config, sig string) bool {
-	want := cfg.PublishedColumns()
+// ("col:typeoid,...") covers exactly the pipeline's key and field columns.
+func configMatchesSignature(p *config.PipelineDef, sig string) bool {
+	want := append(append([]string{}, p.Key...), p.FieldColumns()...)
 	parts := strings.Split(sig, ",")
 	if len(parts) != len(want) {
 		return false
 	}
 	have := map[string]bool{}
-	for _, p := range parts {
-		name, typ, ok := strings.Cut(p, ":")
+	for _, part := range parts {
+		name, typ, ok := strings.Cut(part, ":")
 		if !ok || typ == "missing" {
 			return false
 		}
@@ -225,12 +299,104 @@ func configMatchesSignature(cfg *config.Config, sig string) bool {
 // SchemaError is a source schema that no longer matches the configured
 // mapping (a renamed or dropped allowlisted column, a changed key). It pauses
 // with the same reason as an incompatible change seen in the stream.
-type SchemaError struct{ msg string }
+type SchemaError struct {
+	Pipeline string
+	msg      string
+}
 
 func (e *SchemaError) Error() string { return e.msg }
 
-func schemaErr(format string, a ...any) error { return &SchemaError{msg: fmt.Sprintf(format, a...)} }
+func schemaErr(pipe, format string, a ...any) error {
+	return &SchemaError{Pipeline: pipe, msg: fmt.Sprintf(format, a...)}
+}
 
+// resolveRelations decides, per pipeline, which relation shape and key codec
+// the stream is consumed with: the accepted one, an operator-accepted new
+// one (only at a schema pause of that pipeline), or the catalog's for a
+// pipeline seen for the first time. New pipelines are returned in fresh.
+func resolveRelations(ctx context.Context, e *Env, cp *store.Checkpoint, rels map[string]*store.Relation, cats *Catalogs,
+	opts RunOptions) (accepted map[string]*Catalog, fresh []store.Relation, err error) {
+	cfg := e.Cfg
+	accepted = map[string]*Catalog{}
+	for i := range cfg.Pipelines {
+		p := &cfg.Pipelines[i]
+		rel := rels[p.Name]
+		cat, se := cats.Pipes[p.Name], cats.SchemaErrs[p.Name]
+		if rel == nil {
+			if se != nil {
+				return nil, nil, &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: p.Name, Detail: se.Error()}
+			}
+			accepted[p.Name] = cat
+			fresh = append(fresh, store.Relation{Pipeline: p.Name, SourceTable: p.Table, KeyColumns: p.Key, KeyKinds: cat.Codec.String(), RelationSignature: cat.Signature})
+			continue
+		}
+		if rel.SourceTable != p.Table || strings.Join(rel.KeyColumns, ",") != strings.Join(p.Key, ",") {
+			return nil, nil, &pipeline.PauseError{Reason: "identity_mismatch", Pipeline: p.Name, Detail: fmt.Sprintf(
+				"pipeline %s was registered for %s key %v but the config now says %s key %v; a pipeline's table and key cannot change (use a new pipeline name, or rebuild)",
+				p.Name, rel.SourceTable, rel.KeyColumns, p.Table, []string(p.Key))}
+		}
+		codec, perr := keys.ParseCodec(rel.KeyKinds)
+		if perr != nil {
+			return nil, nil, perr
+		}
+		paused := cp != nil && atSchemaPause(cp, p.Name)
+		if se != nil {
+			// The source changed but the stream may not have reached the
+			// change yet. If the configuration still matches the accepted
+			// shape, keep streaming with it: the reader pauses exactly at the
+			// change.
+			if !configMatchesSignature(p, rel.RelationSignature) || paused {
+				return nil, nil, &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: p.Name, Detail: se.Error() +
+					"; update the field mapping if a column was renamed, then restart with --accept-schema-change"}
+			}
+			e.Log.Warn("source table no longer matches the field mapping; streaming with the accepted mapping until the change is reached", "pipeline", p.Name, "detail", se.Error())
+			accepted[p.Name] = &Catalog{Codec: codec, Signature: rel.RelationSignature}
+			continue
+		}
+		if cat.Codec.String() != rel.KeyKinds {
+			return nil, nil, &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: p.Name, Detail: fmt.Sprintf(
+				"pipeline %s: primary key type changed from %s to %s; rebuild required", p.Name, rel.KeyKinds, cat.Codec.String())}
+		}
+		if rel.RelationSignature == cat.Signature {
+			accepted[p.Name] = cat
+			continue
+		}
+		switch {
+		case paused && opts.AcceptSchemaChange:
+			// The stream stopped at the change and nothing after it was
+			// acknowledged: accept the new shape from exactly here.
+			if err := e.Store.UpdateRelationSignature(ctx, p.Name, cat.Signature); err != nil {
+				return nil, nil, err
+			}
+			e.Log.Warn("accepted source schema change", "pipeline", p.Name, "from", rel.RelationSignature, "to", cat.Signature)
+			accepted[p.Name] = cat
+		case paused:
+			return nil, nil, &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: p.Name, Detail: fmt.Sprintf(
+				"pipeline %s: source table shape changed from %q to %q; review it, update field mappings if needed, then restart with --accept-schema-change", p.Name, rel.RelationSignature, cat.Signature)}
+		case configMatchesSignature(p, rel.RelationSignature):
+			// The catalog changed ahead of the stream: keep the accepted
+			// shape; the reader pauses when it reaches the change.
+			if opts.AcceptSchemaChange {
+				e.Log.Warn("--accept-schema-change ignored: the stream has not reached the schema change yet", "pipeline", p.Name)
+			}
+			e.Log.Warn("source table shape changed ahead of the stream; streaming with the accepted shape until the change is reached",
+				"pipeline", p.Name, "accepted", rel.RelationSignature, "catalog", cat.Signature)
+			accepted[p.Name] = &Catalog{Codec: codec, Signature: rel.RelationSignature}
+		default:
+			return nil, nil, &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: p.Name, Detail: fmt.Sprintf(
+				"pipeline %s: the field mapping no longer matches the accepted shape %q, but the stream has not reached the schema change yet; restore the previous mapping, let the pipeline pause at the change, then switch the mapping and restart with --accept-schema-change", p.Name, rel.RelationSignature)}
+		}
+	}
+	for name := range rels {
+		if cfg.Pipe(name) == nil {
+			return nil, nil, &pipeline.PauseError{Reason: "startup_check", Detail: fmt.Sprintf(
+				"pipeline %q is registered in this sink but no longer configured; restore it (removing a pipeline is not supported in place)", name)}
+		}
+	}
+	return accepted, fresh, nil
+}
+
+// pipelineRun is one attempt of the streaming pipeline with fresh connections.
 func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) error {
 	cfg := e.Cfg
 	lockConn, err := e.Store.TryAdvisoryLock(ctx)
@@ -244,26 +410,13 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 		lockConn.Release()
 	}()
 
-	cp0, err := e.Store.LoadCheckpoint(ctx)
-	if err != nil {
-		return err
-	}
-	cat, err := LoadCatalog(ctx, e)
+	cats, err := LoadCatalog(ctx, e)
 	if err != nil {
 		var se *SchemaError
-		if !errors.As(err, &se) {
-			return &pipeline.PauseError{Reason: "startup_check", Detail: err.Error()}
+		if errors.As(err, &se) {
+			return &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: se.Pipeline, Detail: se.Error()}
 		}
-		// The source changed but the stream may not have reached the change
-		// yet. If the configuration still matches the accepted shape, keep
-		// streaming with it: the reader pauses exactly at the change.
-		if cp0 == nil || !configMatchesSignature(cfg, cp0.RelationSignature) || atSchemaPause(cp0) {
-			return &pipeline.PauseError{Reason: "schema_incompatible", Detail: se.Error() +
-				"; update the field mapping if a column was renamed, then restart with --accept-schema-change"}
-		}
-		kk, _ := keys.Parse(cp0.KeyKind)
-		cat = &Catalog{KeyKind: kk, Signature: cp0.RelationSignature}
-		e.Log.Warn("source table no longer matches the field mapping; streaming with the accepted mapping until the change is reached", "detail", se.Error())
+		return &pipeline.PauseError{Reason: "startup_check", Detail: err.Error()}
 	}
 	replDSNRaw, err := config.Env(cfg.Source.ReplDSNEnv)
 	if err != nil {
@@ -287,7 +440,26 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 	if err != nil {
 		return err
 	}
+	rels, err := e.Store.Relations(ctx)
+	if err != nil {
+		return err
+	}
+	if cp == nil {
+		// A fresh slot starts every pipeline from the catalog's shape.
+		rels = map[string]*store.Relation{}
+	}
 	slot, err := LoadSlot(ctx, e)
+	if err != nil {
+		return err
+	}
+	// Identity first: an accepted schema change is only recorded against the
+	// slot and source this checkpoint belongs to.
+	if cp != nil {
+		if err := checkIdentity(cfg, cp, sys, slot); err != nil {
+			return err
+		}
+	}
+	accepted, fresh, err := resolveRelations(ctx, e, cp, rels, cats, opts)
 	if err != nil {
 		return err
 	}
@@ -306,43 +478,26 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 			return err
 		}
 		cp = &store.Checkpoint{SystemIdentifier: sys.SystemID, Timeline: sys.Timeline, Database: sys.DBName, SlotName: cfg.Source.Slot,
-			Publication: cfg.Source.Publication, SourceTable: cfg.Source.Table, SlotCreatedLSN: lsn, KeyKind: string(cat.KeyKind),
-			RelationSignature: cat.Signature, LSN: lsn}
+			Publication: cfg.Source.Publication, SlotCreatedLSN: lsn, LSN: lsn}
+		// Relations belong to the slot they were accepted on.
+		if _, err := e.Store.Pool.Exec(ctx, `DELETE FROM `+e.Store.T("pipeline_relations")); err != nil {
+			return err
+		}
 		if err := e.Store.InsertCheckpoint(ctx, *cp); err != nil {
 			return fmt.Errorf("insert checkpoint: %w", err)
 		}
 		e.Log.Info("created replication slot", "slot", cfg.Source.Slot, "consistent_point", lsn.String())
-	} else {
-		if err := checkIdentity(cfg, cp, sys, slot, cat); err != nil {
-			return err
+	}
+	for _, r := range fresh {
+		if err := e.Store.InsertRelation(ctx, r); err != nil {
+			return fmt.Errorf("register pipeline %s: %w", r.Pipeline, err)
 		}
-		if cp.RelationSignature != cat.Signature {
-			switch {
-			case atSchemaPause(cp) && opts.AcceptSchemaChange:
-				// The stream stopped at the change and nothing after it was
-				// acknowledged: accept the new shape from exactly here.
-				if err := e.Store.UpdateRelationSignature(ctx, cat.Signature); err != nil {
-					return err
-				}
-				e.Log.Warn("accepted source schema change", "from", cp.RelationSignature, "to", cat.Signature)
-				cp.RelationSignature = cat.Signature
-			case atSchemaPause(cp):
-				return &pipeline.PauseError{Reason: "schema_incompatible", Detail: fmt.Sprintf(
-					"source table shape changed from %q to %q; review it, update field mappings if needed, then restart with --accept-schema-change", cp.RelationSignature, cat.Signature)}
-			case configMatchesSignature(cfg, cp.RelationSignature):
-				// The catalog changed ahead of the stream: keep the accepted
-				// shape; the reader pauses when it reaches the change.
-				if opts.AcceptSchemaChange {
-					e.Log.Warn("--accept-schema-change ignored: the stream has not reached the schema change yet")
-				}
-				e.Log.Warn("source table shape changed ahead of the stream; streaming with the accepted shape until the change is reached",
-					"accepted", cp.RelationSignature, "catalog", cat.Signature)
-				cat.Signature = cp.RelationSignature
-			default:
-				return &pipeline.PauseError{Reason: "schema_incompatible", Detail: fmt.Sprintf(
-					"the field mapping no longer matches the accepted shape %q, but the stream has not reached the schema change yet; restore the previous mapping, let the pipeline pause at the change, then switch the mapping and restart with --accept-schema-change", cp.RelationSignature)}
-			}
-		}
+		e.Log.Info("registered pipeline", "pipeline", r.Pipeline, "table", r.SourceTable, "key", r.KeyColumns, "key_kinds", r.KeyKinds)
+	}
+	acceptedSig := map[string]string{}
+	for name, c := range accepted {
+		e.Pipes[name].Codec = c.Codec
+		acceptedSig[name] = c.Signature
 	}
 	if err := ensureGenerations(ctx, e); err != nil {
 		return err
@@ -352,13 +507,14 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 		return err
 	}
 	live := map[string]*pipeline.GenInfo{}
+	fps := cfg.PipelineFingerprints()
 	for _, g := range gens {
 		if store.IsLive(g.State) || g.State == store.StatePending {
 			m, ok := cfg.Models[g.ModelKey]
 			if !ok {
 				return &pipeline.PauseError{Reason: "startup_check", Detail: fmt.Sprintf("generation %s uses model key %q which is not in the config", g.ID, g.ModelKey)}
 			}
-			if err := g.MatchesModel(m, cfg.TransformFingerprint()); err != nil {
+			if err := g.MatchesModel(m, fps); err != nil {
 				return &pipeline.PauseError{Reason: "startup_check", Detail: err.Error()}
 			}
 		}
@@ -366,15 +522,13 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 			live[g.ID] = &pipeline.GenInfo{Gen: g, Model: ModelIdentity(g)}
 		}
 	}
-	activeJobs := map[int64]*string{}
-	jobs, err := e.Store.BackfillJobs(ctx)
+	activeJobs := map[int64]*pipeline.JobCursor{}
+	jobs, err := e.Store.ActiveBackfillJobs(ctx, "")
 	if err != nil {
 		return err
 	}
 	for _, j := range jobs {
-		if j.State == "pending" || j.State == "running" {
-			activeJobs[j.ID] = j.LastKey
-		}
+		activeJobs[j.ID] = &pipeline.JobCursor{Pipeline: j.Pipeline, Last: j.LastKey}
 	}
 
 	if err := e.Store.SetPipelineStatus(ctx, "running", "", ""); err != nil {
@@ -391,16 +545,15 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 	units := make(chan *pipeline.Unit, cfg.Pipeline.MaxInflightUnits)
 	commits := make(chan *pipeline.Unit, cfg.Pipeline.MaxInflightUnits)
 
-	planner := &pipeline.Planner{Cfg: cfg, KeyKind: cat.KeyKind, Tr: e.Tr, Registry: registry, Log: e.Log, Live: live, ActiveJob: activeJobs,
-		Lookup: func(ctx context.Context, ks []string) (map[string]store.SourceState, error) {
-			return e.Store.LoadSourceState(ctx, e.Store.Pool, ks)
+	planner := &pipeline.Planner{Cfg: cfg, Specs: e.Pipes, Registry: registry, Log: e.Log, Live: live, ActiveJob: activeJobs, Jobs: e.Store,
+		Lookup: func(ctx context.Context, pipe string, ks []string) (map[string]store.SourceState, error) {
+			return e.Store.LoadSourceState(ctx, e.Store.Pool, pipe, ks)
 		},
 		LoadGen: e.Store.Generation, ModelOf: ModelIdentity}
-	embed := pipeline.NewEmbedStage(e.Embed, e.Store, e.Tr, cfg.Embedder.BatchSize, cfg.Embedder.Concurrency, e.Log)
-	committer := &pipeline.Committer{Cfg: cfg, Store: e.Store, KeyKind: cat.KeyKind, Progress: progress, Planner: planner, Log: e.Log}
-	reader := &pipeline.Reader{Conn: conn, Cfg: cfg, Progress: progress, Out: items, StartLSN: cp.LSN, AcceptedSig: cp.RelationSignature, Log: e.Log}
-	bf := &pipeline.Backfill{Cfg: cfg, KeyKind: cat.KeyKind, Source: e.Source, Store: e.Store, Registry: registry, Log: e.Log}
-
+	embed := pipeline.NewEmbedStage(e.Embed, e.Store, e.Pipes, cfg.Embedder.BatchSize, cfg.Embedder.Concurrency, e.Log)
+	committer := &pipeline.Committer{Cfg: cfg, Store: e.Store, Specs: e.Pipes, Progress: progress, Planner: planner, Log: e.Log}
+	reader := &pipeline.Reader{Conn: conn, Cfg: cfg, Specs: e.Pipes, Progress: progress, Out: items, StartLSN: cp.LSN, AcceptedSig: acceptedSig, Log: e.Log}
+	bf := &pipeline.Backfill{Cfg: cfg, Specs: e.Pipes, Source: e.Source, Store: e.Store, Registry: registry, Log: e.Log}
 	// readerCtx stops intake on shutdown; workCtx lets in-flight units finish.
 	readerCtx, stopReader := context.WithCancel(context.Background())
 	workCtx, stopWork := context.WithCancel(context.Background())
@@ -486,16 +639,14 @@ func tagErr(stage string, err error) error {
 
 func firstPause(err error) (*pipeline.PauseError, bool) { return pipeline.IsPause(err) }
 
-func checkIdentity(cfg *config.Config, cp *store.Checkpoint, sys pglogrepl.IdentifySystemResult, slot *SlotInfo, cat *Catalog) error {
+func checkIdentity(cfg *config.Config, cp *store.Checkpoint, sys pglogrepl.IdentifySystemResult, slot *SlotInfo) error {
 	switch {
 	case cp.SystemIdentifier != sys.SystemID:
 		return &pipeline.PauseError{Reason: "identity_mismatch", Detail: fmt.Sprintf("checkpoint belongs to source system %s but connected to %s", cp.SystemIdentifier, sys.SystemID)}
 	case cp.Database != sys.DBName:
 		return &pipeline.PauseError{Reason: "identity_mismatch", Detail: fmt.Sprintf("checkpoint database %s != %s", cp.Database, sys.DBName)}
-	case cp.SlotName != cfg.Source.Slot || cp.Publication != cfg.Source.Publication || cp.SourceTable != cfg.Source.Table:
-		return &pipeline.PauseError{Reason: "identity_mismatch", Detail: "slot, publication or source table differ from the checkpoint; use a new sink schema or rebuild"}
-	case cp.KeyKind != string(cat.KeyKind):
-		return &pipeline.PauseError{Reason: "schema_incompatible", Detail: fmt.Sprintf("primary key type changed from %s to %s; rebuild required", cp.KeyKind, cat.KeyKind)}
+	case cp.SlotName != cfg.Source.Slot || cp.Publication != cfg.Source.Publication:
+		return &pipeline.PauseError{Reason: "identity_mismatch", Detail: "slot or publication differ from the checkpoint; use a new sink schema or rebuild"}
 	case !slot.Exists:
 		return &pipeline.PauseError{Reason: "slot_lost", Detail: fmt.Sprintf("%v: slot %q no longer exists; run `embedsync rebuild --confirm` (see docs/operations.md)", ErrSlotLost, cfg.Source.Slot)}
 	case slot.WALStatus == "lost":
@@ -511,7 +662,9 @@ func checkIdentity(cfg *config.Config, cp *store.Checkpoint, sys pglogrepl.Ident
 	return nil
 }
 
-// ensureGenerations creates the initial generation and serving alias on first run.
+// ensureGenerations creates the initial generation and serving alias on first
+// run, and extends every live or pending generation to pipelines added to the
+// configuration (queueing one backfill job per new pipeline and generation).
 func ensureGenerations(ctx context.Context, e *Env) error {
 	gens, err := e.Store.Generations(ctx)
 	if err != nil {
@@ -519,15 +672,33 @@ func ensureGenerations(ctx context.Context, e *Env) error {
 	}
 	if len(gens) == 0 {
 		m := e.Cfg.Models[e.Cfg.InitialGeneration]
-		g, err := store.NewGeneration(e.Cfg.InitialGeneration, e.Cfg.InitialGeneration, m, e.Cfg.TransformFingerprint())
+		g, err := store.NewGeneration(e.Cfg.InitialGeneration, e.Cfg.InitialGeneration, m, e.Cfg)
 		if err != nil {
 			return err
 		}
 		if err := e.Store.CreateGeneration(ctx, g, e.Cfg.Sink.ReaderRole); err != nil {
 			return err
 		}
-		e.Log.Info("created initial generation", "generation", g.ID, "model", m.Name, "revision", m.Revision)
+		e.Log.Info("created initial generation", "generation", g.ID, "model", m.Name, "revision", m.Revision, "pipelines", g.PipelineNames())
 		gens = append(gens, g)
+	}
+	fps := e.Cfg.PipelineFingerprints()
+	for _, g := range gens {
+		if !store.IsLive(g.State) && g.State != store.StatePending {
+			continue
+		}
+		miss := g.MissingPipelines(fps)
+		if len(miss) == 0 {
+			continue
+		}
+		add := map[string]string{}
+		for _, n := range miss {
+			add[n] = fps[n]
+		}
+		if err := e.Store.AddPipelines(ctx, g.ID, add); err != nil {
+			return fmt.Errorf("extend generation %s: %w", g.ID, err)
+		}
+		e.Log.Info("extended generation to new pipelines; backfill queued", "generation", g.ID, "pipelines", miss)
 	}
 	sv, err := e.Store.Serving(ctx)
 	if err != nil {

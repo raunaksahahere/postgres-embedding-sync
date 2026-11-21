@@ -177,8 +177,8 @@ func TestBackfillDuringWrites(t *testing.T) {
 
 	// Re-backfill a live generation that has stale leftovers: range deletes and
 	// snapshots must repair it without resurrecting deleted keys.
-	e.exec(`INSERT INTO embedsync.chunks_v1 (source_key, chunk_no, chunk_id, fingerprint, content, embedding, source_lsn)
-		SELECT '999999', 0, 'x', 'x', 'ghost', embedding, source_lsn FROM embedsync.chunks_v1 LIMIT 1`)
+	e.exec(`INSERT INTO embedsync.chunks_v1 (pipeline, source_key, chunk_no, chunk_id, fingerprint, content, embedding, source_lsn)
+		SELECT 'default', '999999', 0, 'x', 'x', 'ghost', embedding, source_lsn FROM embedsync.chunks_v1 LIMIT 1`)
 	e.exec(`UPDATE embedsync.chunks_v1 SET content = 'tampered', fingerprint = 'tampered' WHERE source_key = (SELECT min(source_key) FROM embedsync.chunks_v1 WHERE source_key <> '999999')`)
 	p = e.start()
 	e.waitReady()

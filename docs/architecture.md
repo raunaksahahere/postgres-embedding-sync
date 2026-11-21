@@ -1,15 +1,16 @@
 # Architecture
 
 embedsync is one Go process (`embedsync run`) plus a CPU embedding service. It reads
-one PostgreSQL table through logical replication and maintains one pgvector chunk
-table per *generation* (embedding model) in a sink schema, which can be in the same
-database or another one.
+one or more PostgreSQL tables (*pipelines*) through one publication and one logical
+replication slot and maintains one pgvector chunk table per *generation* (embedding
+model) in a sink schema, which can be in the same database or another one. Every
+generation covers every pipeline; a document is identified by `(pipeline, key)`.
 
 ```
  source PostgreSQL                                   sink PostgreSQL (+pgvector)
  ┌──────────────────────┐   pgoutput (proto 1)      ┌──────────────────────────────────┐
- │ public.documents     │──┐                        │ embedsync.checkpoints            │
- │ embedsync_control.   │  │  ┌────────┐ ┌───────┐  │ embedsync.source_state           │
+ │ pipelines' tables    │──┐                        │ embedsync.checkpoints            │
+ │ embedsync_control.   │  │  ┌────────┐ ┌───────┐  │ embedsync.source_state, relations│
  │   markers            │──┴─▶ reader ├─▶planner│  │ embedsync.generations / serving  │
  │ publication          │     └────────┘ └───┬───┘  │ embedsync.chunks_<generation>    │
  │  (key + allowlisted  │      ▲ standby     │units │ embedsync.dlq / backfill_jobs    │
@@ -51,6 +52,31 @@ database or another one.
 Delivery from PostgreSQL is at-least-once (anything after the slot's confirmed position
 is resent after a restart); effects are effectively-once because they and the position
 commit atomically and replays below the checkpoint are dropped.
+
+## Pipelines and keys
+
+A pipeline is one source table with its key columns, allowlisted fields and transform
+(`pipelines:` in the config; the single-table `source.table` form is the pipeline
+`default`). All pipelines share the reader, planner, embed stage and committer, so the
+ordering argument above covers them together: a unit contains whole source
+transactions whatever tables they touch, and it commits only after every embedding it
+needs has returned, in commit-LSN order. A transaction that writes two tables is
+therefore visible in the sink all at once or not at all.
+
+Keys are carried as text. `keys.Codec` encodes a one-column key as its value (the
+format of every installation before pipelines) and a composite key as a JSON array of
+its column values, and compares encoded keys column by column: integers numerically,
+text bytewise (`COLLATE "C"`), uuids as canonical strings. The backfill scan uses the
+same order through a row comparison over the typed source columns,
+`(t.tenant_id, t.slug COLLATE "C") > ($1::bigint, $2::text COLLATE "C") ORDER BY …`, and
+range deletes in the sink decode the encoded column (`(source_key::jsonb->>0)::bigint`)
+behind a `CASE` on the pipeline, so one pipeline's casts never touch another's keys.
+
+Per-pipeline sink state: `source_state`, chunk tables, `dlq` and `backfill_jobs` carry a
+`pipeline` column; `pipeline_relations` holds each pipeline's accepted table, key columns,
+key types and column signature; `generations.pipelines` holds each pipeline's transform
+fingerprint. A pipeline added to the config is registered at the next start and
+backfilled into every live generation (one job per pipeline and generation).
 
 ## Idle vs. stalled
 

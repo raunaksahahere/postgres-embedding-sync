@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgproto3"
 
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/config"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/keys"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/metrics"
 )
 
@@ -26,33 +27,39 @@ const (
 
 type relation struct {
 	kind    relKind
+	spec    *Spec
 	cols    []string
-	keyIdx  int
+	keyIdx  []int          // key column indexes in key order
 	fieldAt map[string]int // logical field -> column index
 	err     error
 }
 
 // Reader consumes pgoutput from a dedicated slot and assembles committed transactions.
 type Reader struct {
-	Conn        *pgconn.PgConn
-	Cfg         *config.Config
-	Progress    *Progress
-	Out         chan<- Item
-	StartLSN    LSN // checkpoint: transactions ending at or before it are already applied
-	AcceptedSig string
+	Conn     *pgconn.PgConn
+	Cfg      *config.Config
+	Specs    Specs
+	Progress *Progress
+	Out      chan<- Item
+	StartLSN LSN // checkpoint: transactions ending at or before it are already applied
+	// AcceptedSig is each pipeline's accepted relation signature.
+	AcceptedSig map[string]string
 	Log         *slog.Logger
 
-	rels           map[uint32]*relation
-	cur            *Txn
-	lastIdleSent   time.Time
-	nextStatus     time.Time
-	srcNS, srcName string
+	rels         map[uint32]*relation
+	cur          *Txn
+	lastIdleSent time.Time
+	nextStatus   time.Time
+	byTable      map[string]*Spec // "schema.table" -> pipeline
 }
 
 // Run streams until ctx is cancelled or the connection fails.
 func (r *Reader) Run(ctx context.Context) error {
 	r.rels = map[uint32]*relation{}
-	r.srcNS, r.srcName = r.Cfg.SourceSchemaTable()
+	r.byTable = map[string]*Spec{}
+	for _, s := range r.Specs {
+		r.byTable[s.Def.Table] = s
+	}
 	err := pglogrepl.StartReplication(ctx, r.Conn, r.Cfg.Source.Slot, r.StartLSN, pglogrepl.StartReplicationOptions{
 		PluginArgs: []string{"proto_version '1'", "publication_names '" + r.Cfg.Source.Publication + "'"},
 	})
@@ -184,7 +191,13 @@ func (r *Reader) handleMessage(ctx context.Context, wal []byte) error {
 		}
 		for _, id := range m.RelationIDs {
 			if rel := r.rels[id]; rel != nil && rel.kind == relSource {
-				r.append(Change{Kind: KTruncate})
+				if rel.err != nil {
+					if r.cur.Err == nil {
+						r.cur.Err = rel.err
+					}
+					continue
+				}
+				r.append(Change{Kind: KTruncate, Pipeline: rel.spec.Name})
 				metrics.Changes.WithLabelValues("truncate").Inc()
 			}
 		}
@@ -246,30 +259,38 @@ func (r *Reader) append(c Change) {
 }
 
 func (r *Reader) buildRelation(m *pglogrepl.RelationMessage) *relation {
-	rel := &relation{kind: relOther, keyIdx: -1, fieldAt: map[string]int{}}
+	rel := &relation{kind: relOther, fieldAt: map[string]int{}}
 	for _, c := range m.Columns {
 		rel.cols = append(rel.cols, c.Name)
 	}
+	spec := r.byTable[m.Namespace+"."+m.RelationName]
 	switch {
-	case m.Namespace == r.srcNS && m.RelationName == r.srcName:
+	case spec != nil:
 		rel.kind = relSource
+		rel.spec = spec
+		def := spec.Def
 		idx := map[string]int{}
 		types := map[string]uint32{}
 		for i, c := range m.Columns {
 			idx[c.Name] = i
 			types[c.Name] = c.DataType
 		}
-		sig := relationSignature(r.Cfg, func(col string) (uint32, bool) { t, ok := types[col]; return t, ok })
-		if sig != r.AcceptedSig {
-			rel.err = &PauseError{Reason: "schema_incompatible", InStream: true, Detail: fmt.Sprintf(
-				"source relation %s.%s changed: accepted signature %q, stream now has %q. Update the field mapping if a column was renamed, then restart with --accept-schema-change", r.srcNS, r.srcName, r.AcceptedSig, sig)}
+		sig := relationSignature(def, func(col string) (uint32, bool) { t, ok := types[col]; return t, ok })
+		if accepted := r.AcceptedSig[spec.Name]; sig != accepted {
+			rel.err = &PauseError{Reason: "schema_incompatible", InStream: true, Pipeline: spec.Name, Detail: fmt.Sprintf(
+				"pipeline %s: source relation %s changed: accepted signature %q, stream now has %q. Update the field mapping if a column was renamed, then restart with --accept-schema-change", spec.Name, def.Table, accepted, sig)}
 		}
-		if i, ok := idx[r.Cfg.Source.Key]; ok {
-			rel.keyIdx = i
-		} else if rel.err == nil {
-			rel.err = &PauseError{Reason: "schema_incompatible", InStream: true, Detail: "primary key column missing from stream"}
+		for _, k := range def.Key {
+			i, ok := idx[k]
+			if !ok {
+				if rel.err == nil {
+					rel.err = &PauseError{Reason: "schema_incompatible", InStream: true, Pipeline: spec.Name, Detail: fmt.Sprintf("pipeline %s: primary key column %q missing from stream", spec.Name, k)}
+				}
+				continue
+			}
+			rel.keyIdx = append(rel.keyIdx, i)
 		}
-		for _, f := range r.Cfg.Source.Fields {
+		for _, f := range def.Fields {
 			if i, ok := idx[f.Column]; ok {
 				rel.fieldAt[f.Name] = i
 			}
@@ -280,11 +301,13 @@ func (r *Reader) buildRelation(m *pglogrepl.RelationMessage) *relation {
 	return rel
 }
 
-// RelationSignature renders the accepted shape of the key and allowlisted
-// columns. lookup returns a column's type OID.
-func relationSignature(cfg *config.Config, lookup func(col string) (uint32, bool)) string {
+// RelationSignature renders the accepted shape of a pipeline's key and
+// allowlisted columns ("col:typeoid,..."; key columns first, then fields, the
+// format single-table installations already store). lookup returns a
+// column's type OID.
+func relationSignature(def *config.PipelineDef, lookup func(col string) (uint32, bool)) string {
 	parts := []string{}
-	cols := append([]string{cfg.Source.Key}, cfg.FieldColumns()...)
+	cols := append(append([]string{}, def.Key...), def.FieldColumns()...)
 	for _, c := range cols {
 		t, ok := lookup(c)
 		if !ok {
@@ -297,8 +320,8 @@ func relationSignature(cfg *config.Config, lookup func(col string) (uint32, bool
 }
 
 // RelationSignature is exported for startup checks.
-func RelationSignature(cfg *config.Config, lookup func(col string) (uint32, bool)) string {
-	return relationSignature(cfg, lookup)
+func RelationSignature(def *config.PipelineDef, lookup func(col string) (uint32, bool)) string {
+	return relationSignature(def, lookup)
 }
 
 func tupleValue(t *pglogrepl.TupleData, i int) (val *string, unchanged bool, err error) {
@@ -345,16 +368,20 @@ func (r *Reader) row(kind ChangeKind, relID uint32, oldT *pglogrepl.TupleData, o
 		}
 		return nil
 	}
-	ch := Change{Kind: kind}
+	ch := Change{Kind: kind, Pipeline: rel.spec.Name}
 	keyOf := func(t *pglogrepl.TupleData) (string, error) {
-		v, unchanged, err := tupleValue(t, rel.keyIdx)
-		if err != nil {
-			return "", err
+		vals := make([]string, len(rel.keyIdx))
+		for i, ki := range rel.keyIdx {
+			v, unchanged, err := tupleValue(t, ki)
+			if err != nil {
+				return "", err
+			}
+			if v == nil || unchanged {
+				return "", fmt.Errorf("pipeline %s: primary key value missing in change", rel.spec.Name)
+			}
+			vals[i] = *v
 		}
-		if v == nil || unchanged {
-			return "", fmt.Errorf("primary key value missing in change")
-		}
-		return *v, nil
+		return keys.EncodeValues(vals)
 	}
 	var err error
 	switch kind {

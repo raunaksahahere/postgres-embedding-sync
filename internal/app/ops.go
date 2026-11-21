@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/jackc/pglogrepl"
@@ -18,9 +19,10 @@ import (
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/verify"
 )
 
-// Backfill queues a watermark backfill for gen (serving generation when empty)
-// and optionally waits for the running pipeline to complete it.
-func Backfill(ctx context.Context, e *Env, gen string, wait bool, out io.Writer) error {
+// Backfill queues a watermark backfill of one pipeline (every pipeline when
+// pipe is empty) for gen (serving generation when empty) and optionally waits
+// for the running pipeline to complete it.
+func Backfill(ctx context.Context, e *Env, gen, pipe string, wait bool, out io.Writer) error {
 	if gen == "" {
 		sv, err := e.Store.Serving(ctx)
 		if err != nil {
@@ -38,26 +40,49 @@ func Backfill(ctx context.Context, e *Env, gen string, wait bool, out io.Writer)
 	if g == nil || !(store.IsLive(g.State) || g.State == store.StatePending) {
 		return fmt.Errorf("generation %q is not live", gen)
 	}
-	id, err := e.Store.RequestBackfill(ctx, gen)
-	if err != nil {
-		return err
+	pipes := e.Cfg.PipelineNames()
+	if pipe != "" {
+		if e.Cfg.Pipe(pipe) == nil {
+			return fmt.Errorf("unknown pipeline %q (configured: %s)", pipe, strings.Join(pipes, ", "))
+		}
+		pipes = []string{pipe}
 	}
-	fmt.Fprintf(out, "backfill job %d queued for %s; the running `embedsync run` process executes it\n", id, gen)
-	if !wait {
-		return nil
-	}
-	last := ""
-	for {
-		j, err := e.Store.BackfillJobByID(ctx, id)
+	var ids []int64
+	for _, p := range pipes {
+		if _, ok := g.Pipelines[p]; !ok {
+			return fmt.Errorf("generation %s does not cover pipeline %q yet; `embedsync run` extends it at startup", gen, p)
+		}
+		id, err := e.Store.RequestBackfill(ctx, gen, p)
 		if err != nil {
 			return err
 		}
-		msg := fmt.Sprintf("job %d %s: %d rows, %d windows", j.ID, j.State, j.RowsScanned, j.Windows)
-		if msg != last {
-			fmt.Fprintln(out, msg)
-			last = msg
+		ids = append(ids, id)
+		fmt.Fprintf(out, "backfill job %d queued for %s (pipeline %s); the running `embedsync run` process executes it\n", id, gen, p)
+	}
+	if !wait {
+		return nil
+	}
+	last := map[int64]string{}
+	for {
+		done := 0
+		for _, id := range ids {
+			j, err := e.Store.BackfillJobByID(ctx, id)
+			if err != nil {
+				return err
+			}
+			if j == nil {
+				return fmt.Errorf("backfill job %d disappeared", id)
+			}
+			msg := fmt.Sprintf("job %d (%s) %s: %d rows, %d windows", j.ID, j.Pipeline, j.State, j.RowsScanned, j.Windows)
+			if msg != last[id] {
+				fmt.Fprintln(out, msg)
+				last[id] = msg
+			}
+			if j.State == "done" || j.State == "cancelled" {
+				done++
+			}
 		}
-		if j.State == "done" || j.State == "cancelled" {
+		if done == len(ids) {
 			return nil
 		}
 		select {
@@ -68,14 +93,22 @@ func Backfill(ctx context.Context, e *Env, gen string, wait bool, out io.Writer)
 	}
 }
 
-// VerifyReport is the output of `embedsync verify`.
+// VerifyReport is the output of `embedsync verify`. Totals cover every
+// pipeline; Pipelines and each generation's pipelines break them down.
 type VerifyReport struct {
-	BoundaryLSN   string              `json:"boundary_lsn"`
-	CheckpointLSN string              `json:"checkpoint_lsn"`
-	SourceRows    int                 `json:"source_rows"`
-	SourceState   verify.StateReport  `json:"source_state"`
-	Generations   []*verify.GenReport `json:"generations"`
-	OK            bool                `json:"ok"`
+	BoundaryLSN   string                         `json:"boundary_lsn"`
+	CheckpointLSN string                         `json:"checkpoint_lsn"`
+	SourceRows    int                            `json:"source_rows"`
+	SourceState   verify.StateReport             `json:"source_state"`
+	Pipelines     map[string]*PipelineVerifyRows `json:"pipelines"`
+	Generations   []*verify.GenReport            `json:"generations"`
+	OK            bool                           `json:"ok"`
+}
+
+// PipelineVerifyRows is one pipeline's source and source_state comparison.
+type PipelineVerifyRows struct {
+	SourceRows  int                `json:"source_rows"`
+	SourceState verify.StateReport `json:"source_state"`
 }
 
 // Verify compares the entire sink with the source at a common boundary. It
@@ -112,16 +145,17 @@ func Verify(ctx context.Context, e *Env, timeout time.Duration) (*VerifyReport, 
 	if err != nil {
 		return nil, err
 	}
-	rep := &VerifyReport{BoundaryLSN: b.String(), CheckpointLSN: cp.String(), OK: true}
-	var rows []verify.Row
+	rep := &VerifyReport{BoundaryLSN: b.String(), CheckpointLSN: cp.String(), OK: true, Pipelines: map[string]*PipelineVerifyRows{}}
+	var rows verify.Rows
+	// Every pipeline's table is read in one source snapshot.
 	err = pgx.BeginTxFunc(ctx, e.Source, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
-		rows, err = verify.SourceRows(ctx, tx, e.Cfg)
+		rows, err = verify.AllSourceRows(ctx, tx, e.Cfg)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
-	rep.SourceRows = len(rows)
+	rep.SourceRows = rows.Count()
 	err = pgx.BeginTxFunc(ctx, e.Store.Pool, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
 		_, state, err := verify.StateRows(ctx, tx, e.Store.Schema)
 		if err != nil {
@@ -129,6 +163,17 @@ func Verify(ctx context.Context, e *Env, timeout time.Duration) (*VerifyReport, 
 		}
 		rep.SourceState = verify.State(rows, state)
 		rep.OK = rep.SourceState.OK()
+		for _, p := range e.Cfg.PipelineNames() {
+			pr := &PipelineVerifyRows{SourceRows: len(rows[p]), SourceState: verify.State(verify.Rows{p: rows[p]}, map[string]map[string]map[string]*string{p: state[p]})}
+			rep.Pipelines[p] = pr
+		}
+		for p := range state {
+			if e.Cfg.Pipe(p) == nil {
+				// State of a pipeline that is no longer configured.
+				rep.SourceState.Extra += len(state[p])
+				rep.OK = false
+			}
+		}
 		gens, err := e.Store.Generations(ctx)
 		if err != nil {
 			return err
@@ -137,7 +182,7 @@ func Verify(ctx context.Context, e *Env, timeout time.Duration) (*VerifyReport, 
 			if !store.IsLive(g.State) {
 				continue
 			}
-			gr, err := verify.Generation(ctx, tx, e.Store.Schema, g, e.Tr, rows, e.Cfg.Pipeline.MaxDocumentBytes)
+			gr, err := verify.Generation(ctx, tx, e.Store.Schema, g, e.Trs(), rows, e.Cfg.Pipeline.MaxDocumentBytes)
 			if err != nil {
 				return err
 			}
@@ -178,7 +223,13 @@ func ReplayDLQ(ctx context.Context, e *Env, id int64, out io.Writer) (*ReplayRes
 		if g == nil || !store.IsLive(g.State) {
 			continue
 		}
-		st, err := e.Store.LoadSourceState(ctx, e.Store.Pool, []string{d.SourceKey})
+		spec := e.Pipes[d.Pipeline]
+		if spec == nil {
+			fmt.Fprintf(out, "skipped dlq #%d: pipeline %q is not configured\n", d.ID, d.Pipeline)
+			res.StillBad++
+			continue
+		}
+		st, err := e.Store.LoadSourceState(ctx, e.Store.Pool, d.Pipeline, []string{d.SourceKey})
 		if err != nil {
 			return nil, err
 		}
@@ -195,13 +246,13 @@ func ReplayDLQ(ctx context.Context, e *Env, id int64, out io.Writer) (*ReplayRes
 					vals[k] = *v
 				}
 			}
-			text, err := e.Tr.Render(vals)
+			text, err := spec.Tr.Render(vals)
 			if err != nil || len(text) > e.Cfg.Pipeline.MaxDocumentBytes {
 				res.StillBad++
 				_, _ = e.Store.Pool.Exec(ctx, `UPDATE `+e.Store.T("dlq")+` SET attempts = attempts + 1, updated_at = now() WHERE id = $1`, d.ID)
 				continue
 			}
-			cs := e.Tr.Chunks(d.SourceKey, text, ModelIdentity(g))
+			cs := spec.Tr.Chunks(d.SourceKey, text, ModelIdentity(g))
 			inputs := make([]string, len(cs))
 			for i, c := range cs {
 				inputs[i] = g.DocumentPrefix + c.Text
@@ -229,7 +280,7 @@ func ReplayDLQ(ctx context.Context, e *Env, id int64, out io.Writer) (*ReplayRes
 		applied := false
 		err = pgx.BeginFunc(ctx, e.Store.Pool, func(tx pgx.Tx) error {
 			var lsn *string
-			err := tx.QueryRow(ctx, `SELECT source_lsn::text FROM `+e.Store.T("source_state")+` WHERE source_key = $1 FOR UPDATE`, d.SourceKey).Scan(&lsn)
+			err := tx.QueryRow(ctx, `SELECT source_lsn::text FROM `+e.Store.T("source_state")+` WHERE pipeline = $1 AND source_key = $2 FOR UPDATE`, d.Pipeline, d.SourceKey).Scan(&lsn)
 			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 				return err
 			}
@@ -245,12 +296,12 @@ func ReplayDLQ(ctx context.Context, e *Env, id int64, out io.Writer) (*ReplayRes
 				return nil
 			}
 			tbl := pgx.Identifier{e.Store.Schema, g.ChunkTable}.Sanitize()
-			if _, err := tx.Exec(ctx, `DELETE FROM `+tbl+` WHERE source_key = $1`, d.SourceKey); err != nil {
+			if _, err := tx.Exec(ctx, `DELETE FROM `+tbl+` WHERE pipeline = $1 AND source_key = $2`, d.Pipeline, d.SourceKey); err != nil {
 				return err
 			}
 			for _, c := range chunks {
-				if _, err := tx.Exec(ctx, `INSERT INTO `+tbl+` (source_key, chunk_no, chunk_id, fingerprint, content, embedding, source_lsn)
-					VALUES ($1, $2, $3, $4, $5, $6::vector, $7::pg_lsn)`, d.SourceKey, c.no, c.id, c.fp, c.text, vecs[c.fp], s.LSN.String()); err != nil {
+				if _, err := tx.Exec(ctx, `INSERT INTO `+tbl+` (pipeline, source_key, chunk_no, chunk_id, fingerprint, content, embedding, source_lsn)
+					VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::pg_lsn)`, d.Pipeline, d.SourceKey, c.no, c.id, c.fp, c.text, vecs[c.fp], s.LSN.String()); err != nil {
 					return err
 				}
 			}
@@ -265,7 +316,7 @@ func ReplayDLQ(ctx context.Context, e *Env, id int64, out io.Writer) (*ReplayRes
 		}
 		if applied {
 			res.Resolved++
-			fmt.Fprintf(out, "resolved dlq #%d (generation %s)\n", d.ID, d.GenerationID)
+			fmt.Fprintf(out, "resolved dlq #%d (generation %s, pipeline %s)\n", d.ID, d.GenerationID, d.Pipeline)
 		} else {
 			res.Superseded++
 			fmt.Fprintf(out, "skipped dlq #%d: superseded by a newer change\n", d.ID)
@@ -331,6 +382,7 @@ func Rebuild(ctx context.Context, e *Env, out io.Writer) (string, error) {
 	err = pgx.BeginFunc(ctx, e.Store.Pool, func(tx pgx.Tx) error {
 		stmts := []string{
 			`DELETE FROM ` + e.Store.T("checkpoints"),
+			`DELETE FROM ` + e.Store.T("pipeline_relations"),
 			`DELETE FROM ` + e.Store.T("source_state"),
 			`UPDATE ` + e.Store.T("backfill_jobs") + ` SET state = 'cancelled', updated_at = now() WHERE state IN ('pending','running')`,
 			`UPDATE ` + e.Store.T("generations") + ` SET state = 'stale' WHERE state IN ('pending','building','ready','active','previous')`,
@@ -348,7 +400,7 @@ func Rebuild(ctx context.Context, e *Env, out io.Writer) (string, error) {
 		return "", err
 	}
 	m := e.Cfg.Models[serving.ModelKey]
-	g, err := store.NewGeneration(newID, serving.ModelKey, m, e.Cfg.TransformFingerprint())
+	g, err := store.NewGeneration(newID, serving.ModelKey, m, e.Cfg)
 	if err != nil {
 		return "", err
 	}

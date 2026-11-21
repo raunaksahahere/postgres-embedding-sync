@@ -403,8 +403,9 @@ func checkExistingSetup(ctx context.Context, conn *pgx.Conn, t table) error {
 	if len(existing) == 0 || (len(existing) == 1 && existing[0] == t.qualified()) {
 		return nil
 	}
-	return errStop{fmt.Sprintf("this database is already set up for %s; embedsync syncs one table per database setup.\n"+
-		"To switch to %s, first stop `embedsync run`, then remove the old setup (this deletes its embeddings):\n\n"+
+	return errStop{fmt.Sprintf("this database is already set up for %s; the setup wizard configures one table.\n"+
+		"To sync more tables, add them as `pipelines:` to the existing config and run `embedsync init` (see docs/operations.md).\n"+
+		"To switch to %s instead, first stop `embedsync run`, then remove the old setup (this deletes its embeddings):\n\n"+
 		"  SELECT pg_drop_replication_slot('embedsync_slot') FROM pg_replication_slots WHERE slot_name = 'embedsync_slot';\n"+
 		"  DROP PUBLICATION embedsync_pub;\n  DROP SCHEMA embedsync CASCADE;\n  DROP SCHEMA embedsync_control CASCADE;\n\n"+
 		"and run `embedsync setup` again.", strings.Join(existing, ", "), t.qualified())}

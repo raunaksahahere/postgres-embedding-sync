@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -71,7 +72,11 @@ func Doctor(ctx context.Context, out io.Writer, configPath string, skipEmbedder 
 		d.fail("config %s: %v", configPath, err)
 		cfg = nil
 	} else {
-		d.ok("config %s (table %s, %d model(s))", configPath, cfg.Source.Table, len(cfg.Models))
+		tables := make([]string, 0, len(cfg.Pipelines))
+		for _, p := range cfg.Pipelines {
+			tables = append(tables, p.Table)
+		}
+		d.ok("config %s (table %s, %d model(s))", configPath, strings.Join(tables, ", "), len(cfg.Models))
 	}
 
 	if cfg != nil {

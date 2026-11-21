@@ -1,0 +1,62 @@
+# Several tables ("pipelines") through one publication, one replication slot and
+# one embedder. Everything outside `pipelines:` is shared and works exactly as
+# in examples/embedsync.yaml (see the comments there).
+#
+# The single-table form (source.table / key / fields + transform) is still
+# valid: it is one pipeline named "default". To add a table to an existing
+# single-table installation, move the table into `pipelines:` under the name
+# "default" (keeps every existing document), add the new pipeline, then run
+# `embedsync init` (adds the table to the publication and grants its columns)
+# and restart `embedsync run` (backfills the new table into every live
+# generation).
+
+source:
+  dsn_env: EMBEDSYNC_SOURCE_DSN
+  publication: embedsync_pub
+  slot: embedsync_slot
+  control_schema: embedsync_control
+
+sink:
+  dsn_env: EMBEDSYNC_SINK_DSN
+  reader_dsn_env: EMBEDSYNC_READER_DSN
+  schema: embedsync
+  reader_role: embedsync_reader
+
+# Default transform for pipelines that do not set their own.
+transform:
+  template: "{{.title}}\n\n{{.body}}"
+  chunk_words: 160
+  chunk_overlap: 24
+
+pipelines:
+  # Documents are identified by (pipeline, key): ids may overlap across tables.
+  - name: default                        # [a-z][a-z0-9_]*, at most 31 characters
+    table: public.documents
+    key: id                              # one column ...
+    fields:                              # the allowlist; only these columns are published
+      - { name: title, column: title }
+      - { name: body,  column: body }
+
+  - name: tickets
+    table: support.tickets
+    key: [tenant_id, id]                 # ... or the primary key's columns, in comparison order
+    fields:
+      - { name: subject, column: subject }
+      - { name: body,    column: body }
+    transform:                           # its own template and chunking
+      template: "Ticket: {{.subject}}\n\n{{.body}}"
+      chunk_words: 120
+      chunk_overlap: 16
+
+embedder:
+  url: http://embedder:8000
+  url_env: EMBEDSYNC_EMBEDDER_URL
+
+models:
+  minilm:
+    name: sentence-transformers/all-MiniLM-L6-v2
+    revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+    dimension: 384
+    distance: cosine
+
+initial_generation: minilm
