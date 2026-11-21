@@ -9,9 +9,48 @@ while serving searches.
 
 * Go service (pgx, pglogrepl), a local CPU embedding service (sentence-transformers,
   pinned revisions, no API key), PostgreSQL 16/17/18 with pgvector.
-* Status: **v0.1.0**, single table, single process. See [limitations](#limitations).
+* Status: **v0.2.0**, single table, single process. See [limitations](#limitations).
 
-## Install and run the demo
+## Install
+
+Download one installer from the [latest release](https://github.com/raunaksahahere/postgres-embedding-sync/releases/latest).
+Everything is included, the embedding service as well. You don't need Python, Docker
+or an API key.
+
+| your system | file | install |
+|---|---|---|
+| Windows 10/11 (x64) | `embedsync-<version>-<variant>-windows-x64-setup.exe` | double-click; adds `embedsync` to your PATH (no admin rights needed) |
+| macOS (Apple silicon) | `embedsync-<version>-<variant>-macos-arm64.dmg` | open it and run *Install embedsync.pkg* |
+| Debian / Ubuntu (x64, arm64) | `embedsync-<version>-<variant>-linux-<amd64\|arm64>.deb` | `sudo apt install ./embedsync-…deb` |
+
+Each comes in three variants. They differ only in which embedding models are included:
+
+| variant | models included | download size (approx.) | pick it when |
+|---|---|---|---|
+| `minilm` | all-MiniLM-L6-v2 | ~290 MB | you want to start right away (recommended) |
+| `nomodel` | none: setup downloads any Hugging Face model you name | ~210 MB | you know which model you want |
+| `full` | all-MiniLM-L6-v2, bge-small-en-v1.5, paraphrase-MiniLM-L3-v2 | ~480 MB | offline machines, or comparing models with `migrate` |
+
+Then, in a terminal:
+
+```sh
+embedsync setup          # guided: connects to your PostgreSQL, you pick the table, columns and
+                         # model; it creates least-privilege roles and writes the config
+embedsync run            # start syncing (leave it running)
+embedsync search "how do I keep my indoor cat busy"     # in another terminal
+```
+
+You need PostgreSQL 16, 17 or 18 with [pgvector](https://github.com/pgvector/pgvector).
+If PostgreSQL is missing, not running, has `wal_level` set wrong or lacks pgvector,
+`embedsync setup` tells you exactly what to run on your OS and can fix `wal_level` itself.
+`embedsync doctor` checks the whole installation at any time.
+
+The installers are not code-signed. Windows SmartScreen may show *More info → Run anyway*.
+On macOS, use *System Settings → Privacy & Security → Open Anyway* or
+`sudo installer -pkg "/Volumes/embedsync/Install embedsync.pkg" -target /`.
+Details, uninstalling and the CLI-only archives are covered in [docs/install.md](docs/install.md).
+
+## Try the demo with Docker (no install)
 
 Requirements: Docker with Compose v2.24+, ~3 GB RAM, ~2 GB disk.
 
@@ -179,6 +218,9 @@ More: [docs/architecture.md](docs/architecture.md).
 
 | command | |
 |---|---|
+| `embedsync setup [--yes --admin-url U --table T --columns a,b --model M]` | guided first-run setup (installed packages) |
+| `embedsync doctor [--skip-embedder]` | check installation, config, database and embedder |
+| `embedsync model list \| add <owner/name[@rev]>` | list models, add one from Hugging Face |
 | `embedsync init` | create control objects, publication and sink schema (admin DSNs) |
 | `embedsync run [--accept-schema-change]` | stream, backfill, serve `/metrics` `/status` `/search` `/readyz` |
 | `embedsync backfill [--generation G] [--wait]` | queue a watermark re-scan |
@@ -191,7 +233,11 @@ More: [docs/architecture.md](docs/architecture.md).
 | `embedsync rebuild --confirm` | recover from slot loss into a fresh generation |
 
 Configuration: [`examples/embedsync.yaml`](examples/embedsync.yaml) (every option
-commented). Credentials come only from environment variables named in the config.
+commented). Credentials come only from environment variables named in the config;
+`embedsync setup` writes them to an `embedsync.env` file next to the config, readable
+only by you, and the real environment always takes precedence. With
+`embedder.managed: true` (what setup writes), embedsync starts the bundled embedder on
+a private localhost port and stops it on exit.
 
 ## Operations
 
@@ -232,6 +278,9 @@ one Postgres table into pgvector with transactional guarantees.
   the table until an operator acts.
 * Search is eventually consistent with the source (see the measured latency).
 * The benchmark is one laptop and synthetic write workloads; your numbers will differ.
+* Installers: macOS builds are Apple silicon only (PyTorch no longer publishes Intel
+  macOS wheels); Linux packages need glibc 2.28+. Intel Macs and other systems can use
+  the CLI-only archives with the Docker embedder. The installers are not code-signed.
 
 ## Development
 
@@ -245,6 +294,7 @@ one Postgres table into pgvector with transactional guarantees.
 | pinned images check | `make images-check` |
 | benchmarks and evaluation | `make bench` (or `cd bench && uv run embedsync-bench freshness\|outage\|baselines\|retrieval`) |
 | release archives + install check | `make release-check` |
+| native installers (on each OS; CI: `.github/workflows/packages.yml`) | `packaging/build.sh <version> <goos> <goarch> <embedder_dist> <out>` |
 
 ## License
 
