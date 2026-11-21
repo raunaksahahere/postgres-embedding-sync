@@ -160,3 +160,169 @@ func TestViewAcceptance(t *testing.T) {
 	}
 	p.stop(t)
 }
+
+// kbWriters change every table of the view concurrently: section edits and
+// moves between documents (within the tenant), inserts and deletes, link
+// changes, tag renames, document deletes and re-inserts. ~20 % roll back.
+func (e *env) kbWriters(n int, seed uint64, tenants, docs int, pace time.Duration) *writer {
+	w := &writer{stop: make(chan struct{})}
+	for i := 0; i < n; i++ {
+		w.wg.Add(1)
+		go func(i int) {
+			defer w.wg.Done()
+			r := &mrand{x: seed + uint64(i)*6151 + 1}
+			ctx := context.Background()
+			for {
+				select {
+				case <-w.stop:
+					return
+				default:
+				}
+				tx, err := e.admin.Begin(ctx)
+				if err != nil {
+					w.errs.Add(1)
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+				failed := false
+				for j := 0; j < 1+r.Intn(5) && !failed; j++ {
+					t := 1 + r.Intn(tenants)
+					d := 1 + r.Intn(docs)
+					sec := d*100 + 1 + r.Intn(8)
+					var err error
+					switch op := r.Intn(14); {
+					case op < 3:
+						_, err = tx.Exec(ctx, `UPDATE kb_sections SET body = $3 WHERE tenant_id = $1 AND id = $2`, t, sec, sentence(r, 4+r.Intn(30)))
+					case op < 5: // move a section to another document
+						_, err = tx.Exec(ctx, `UPDATE kb_sections SET document_id = $3, position = $4 WHERE tenant_id = $1 AND id = $2`, t, sec, 1+r.Intn(docs), r.Intn(6))
+					case op < 6:
+						_, err = tx.Exec(ctx, `INSERT INTO kb_sections VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (tenant_id, id) DO UPDATE SET heading = EXCLUDED.heading`,
+							t, sec, d, r.Intn(6), sentence(r, 2), sentence(r, 10))
+					case op < 7:
+						_, err = tx.Exec(ctx, `DELETE FROM kb_sections WHERE tenant_id = $1 AND id = $2`, t, sec)
+					case op < 8:
+						_, err = tx.Exec(ctx, `INSERT INTO kb_document_tags VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`, t, d, 1+r.Intn(5))
+					case op < 9:
+						_, err = tx.Exec(ctx, `DELETE FROM kb_document_tags WHERE tenant_id = $1 AND document_id = $2 AND tag_id = $3`, t, d, 1+r.Intn(5))
+					case op < 10: // rename a tag shared by several documents
+						_, err = tx.Exec(ctx, `UPDATE kb_tags SET name = $3 WHERE tenant_id = $1 AND id = $2`, t, 1+r.Intn(5), sentence(r, 1))
+					case op < 11:
+						_, err = tx.Exec(ctx, `UPDATE kb_documents SET title = $3 WHERE tenant_id = $1 AND id = $2`, t, d, sentence(r, 3))
+					case op < 12:
+						_, err = tx.Exec(ctx, `DELETE FROM kb_documents WHERE tenant_id = $1 AND id = $2`, t, d)
+					case op < 13:
+						_, err = tx.Exec(ctx, `INSERT INTO kb_documents VALUES ($1, $2, $3, 'x') ON CONFLICT DO NOTHING`, t, d, sentence(r, 3))
+					default: // a document key change
+						_, err = tx.Exec(ctx, `UPDATE kb_documents SET id = $3 WHERE tenant_id = $1 AND id = $2
+							AND NOT EXISTS (SELECT 1 FROM kb_documents WHERE tenant_id = $1 AND id = $3)`, t, d, docs+1+r.Intn(docs))
+					}
+					if err != nil {
+						failed = true
+					}
+				}
+				if failed || r.Intn(5) == 0 {
+					tx.Rollback(ctx)
+					w.aborts.Add(1)
+				} else if err := tx.Commit(ctx); err != nil {
+					w.errs.Add(1)
+				} else {
+					w.commits.Add(1)
+				}
+				time.Sleep(pace/2 + time.Duration(r.Intn(int(pace/time.Millisecond)+1))*time.Millisecond)
+			}
+		}(i)
+	}
+	return w
+}
+
+// Concurrent writes to every table of the view during its state and render
+// backfills, crashes immediately before and after the sink commit, a TOASTed
+// section edited without touching its body, and a truncated child table:
+// after restart every document equals the independently assembled source at
+// a barrier, and feedback never passed the durable checkpoint.
+func TestViewWritesBackfillAndCrashes(t *testing.T) {
+	e := newEnv(t, envOpts{batch: 9, views: strings.Replace(kbView, "max_fanout_per_txn: 40", "max_fanout_per_txn: 100000", 1), setupSQL: kbSetup})
+	e.seedKB(3, 40, 5)
+	big := strings.Repeat("toasted section body word ", 400) // ~10 KB, stored out of line
+	e.exec(`UPDATE kb_sections SET body = $1 WHERE id % 50 = 1`, big)
+	e.emb.delayMS.Store(10)
+	w := e.kbWriters(3, 21, 3, 40, 40*time.Millisecond)
+	p := e.start()
+	waitFor(t, 60*time.Second, "backfill under way", func() bool {
+		return e.scalar(`SELECT coalesce(sum(windows), 0)::text FROM embedsync.backfill_jobs`) != "0"
+	})
+	if e.jobsDone() {
+		t.Fatal("backfill finished before the concurrent writes; slow it down")
+	}
+	e.emb.delayMS.Store(0)
+	waitFor(t, 180*time.Second, "state and render backfills", e.jobsDone)
+	p.kill()
+	e.assertFeedbackNotAhead()
+	crashes := 0
+	for _, fp := range []string{"before_sink_commit", "after_commit_before_feedback"} {
+		for _, hit := range []int{2, 4, 3} {
+			p := e.start(fmt.Sprintf("EMBEDSYNC_FAILPOINTS=%s=%d", fp, hit))
+			if code := p.wait(t, 60*time.Second); code != 86 {
+				t.Fatalf("%s=%d: expected failpoint exit 86, got %d", fp, hit, code)
+			}
+			crashes++
+			e.assertFeedbackNotAhead()
+		}
+	}
+	w.halt()
+	p = e.start()
+	e.waitReady()
+	r := e.requireConsistent("after concurrent view writes, backfill and crashes")
+	t.Logf("crashes=%d commits=%d aborts=%d writer_errors=%d", crashes, w.commits.Load(), w.aborts.Load(), w.errs.Load())
+	if w.commits.Load() < 50 || r.Generations[0].Pipelines["kb"].ActualChunks == 0 {
+		t.Fatal("workload too small")
+	}
+
+	// Unchanged TOAST: only the heading of a section with a large body.
+	e.exec(`UPDATE kb_sections SET heading = 'toast heading' WHERE id % 50 = 1 AND tenant_id = 1`)
+	e.requireConsistent("after heading-only updates of toasted sections")
+
+	// Truncating a child table empties every document's sections.
+	e.exec(`TRUNCATE kb_sections`)
+	e.exec(`INSERT INTO kb_sections VALUES (1, 101, 1, 0, 'after truncate', 'fresh section')`)
+	e.requireConsistent("after truncating the child table")
+	if n := e.scalar(`SELECT count(*)::text FROM embedsync.chunks_v1 WHERE pipeline = 'kb' AND content LIKE '%body of section%'`); n != "0" {
+		t.Fatal("truncated sections are still searchable")
+	}
+	e.assertFeedbackNotAhead()
+	p.stop(t)
+}
+
+// A transaction that changes more documents than max_fanout_per_txn pauses
+// before acknowledging it; raising the limit resumes and applies it whole.
+func TestViewFanoutLimitPauses(t *testing.T) {
+	e := newEnv(t, envOpts{views: kbView, setupSQL: kbSetup})
+	e.seedKB(1, 60, 1)
+	e.exec(`INSERT INTO kb_document_tags SELECT 1, d, 5 FROM generate_series(1, 60) d ON CONFLICT DO NOTHING`)
+	p := e.start()
+	e.waitReady()
+	waitFor(t, 60*time.Second, "backfill", e.jobsDone)
+	e.requireConsistent("initial")
+	cp := e.checkpointLSN()
+	e.exec(`UPDATE kb_tags SET name = 'everywhere' WHERE tenant_id = 1 AND id = 5`) // 60 documents > 40
+	waitFor(t, 20*time.Second, "fan-out pause", func() bool {
+		return e.scalar(`SELECT state || ':' || reason FROM embedsync.pipeline_status`) == "paused:fanout_limit"
+	})
+	if n := e.scalar(`SELECT count(*)::text FROM embedsync.chunks_v1 WHERE content LIKE '%everywhere%'`); n != "0" {
+		t.Fatal("a paused transaction was partly applied")
+	}
+	if e.scalar(`SELECT ($1::pg_lsn = (SELECT lsn FROM embedsync.checkpoints))::text`, cp) != "true" {
+		t.Fatal("the checkpoint moved past the paused transaction")
+	}
+	e.assertFeedbackNotAhead()
+	p.stop(t)
+	e.opts.views = strings.Replace(kbView, "max_fanout_per_txn: 40", "max_fanout_per_txn: 100", 1)
+	e.writeConfig()
+	p = e.start()
+	e.waitReady()
+	e.requireConsistent("after raising the limit")
+	if n := e.scalar(`SELECT count(DISTINCT source_key)::text FROM embedsync.chunks_v1 WHERE content LIKE '%everywhere%'`); n != "60" {
+		t.Fatalf("rename reached %s of 60 documents", n)
+	}
+	p.stop(t)
+}

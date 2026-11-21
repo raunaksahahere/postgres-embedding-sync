@@ -1,6 +1,10 @@
 package verify
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/config"
+)
 
 func TestOrderByClause(t *testing.T) {
 	text := map[string]bool{"name": true, "title": true}
@@ -36,5 +40,17 @@ func TestSelectListAndTableIdent(t *testing.T) {
 	}
 	if got, want := tableIdent("public.document_tags"), `"public"."document_tags"`; got != want {
 		t.Errorf("tableIdent: got %s, want %s", got, want)
+	}
+}
+
+// Regression: the child query sorted integer keys as text ("803" after
+// "3802") because ORDER BY bound to the unqualified ::text output columns.
+func TestChildQueryQualifiesOrderColumns(t *testing.T) {
+	ch := &config.ChildDef{Name: "sections", Table: "public.kb_sections", Key: config.KeyColumns{"tenant_id", "id"},
+		Parent: config.KeyColumns{"tenant_id", "document_id"}, OrderBy: []string{"position"}}
+	q := childQuery(ch, []string{"body"}, map[string]bool{"body": true})
+	want := `SELECT "c"."tenant_id"::text, "c"."id"::text, "c"."tenant_id"::text, "c"."document_id"::text, "c"."body"::text FROM "public"."kb_sections" AS "c" ORDER BY "c"."tenant_id", "c"."document_id", "c"."position" NULLS LAST, "c"."tenant_id", "c"."id"`
+	if q != want {
+		t.Fatalf("child query:\n got %s\nwant %s", q, want)
 	}
 }

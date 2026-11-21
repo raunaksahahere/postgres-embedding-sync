@@ -77,13 +77,7 @@ func addViewChildren(ctx context.Context, q Querier, v *config.ViewDef, ch *conf
 		return 0, fmt.Errorf("view %s child %s: %w", v.Name, ch.Name, err)
 	}
 	fieldCols := fieldColumns(ch.Fields)
-	order := []string{orderByClause(ch.Parent, "", nil, false)}
-	if len(ch.OrderBy) > 0 {
-		order = append(order, orderByClause(ch.OrderBy, "", textCols, true))
-	}
-	order = append(order, orderByClause(ch.Key, "", textCols, false))
-	sql := `SELECT ` + selectList("", ch.Key, ch.Parent, fieldCols) + ` FROM ` + tableIdent(ch.Table) +
-		` ORDER BY ` + strings.Join(order, ", ")
+	sql := childQuery(ch, fieldCols, textCols)
 	nk, np := len(ch.Key), len(ch.Parent)
 	orphans := 0
 	err = queryText(ctx, q, sql, nk+np+len(fieldCols), func(vals []*string) error {
@@ -394,3 +388,18 @@ func OnlyPipelines(rows Rows, cfg *config.Config) Rows {
 
 // StateSource returns a view-state reader over the sink (pool or transaction).
 func StateSource(q Querier, schema string) viewdoc.Source { return stateSource{q: q, schema: schema} }
+
+// childQuery selects a child table's key, parent and field columns as text,
+// ordered by parent, order columns and key. Every column is qualified with
+// the table alias: an unqualified ORDER BY "id" would bind to the ::text
+// output column and sort "803" after "3802".
+func childQuery(ch *config.ChildDef, fieldCols []string, textCols map[string]bool) string {
+	const a = "c"
+	order := []string{orderByClause(ch.Parent, a, nil, false)}
+	if len(ch.OrderBy) > 0 {
+		order = append(order, orderByClause(ch.OrderBy, a, textCols, true))
+	}
+	order = append(order, orderByClause(ch.Key, a, textCols, false))
+	return `SELECT ` + selectList(a, ch.Key, ch.Parent, fieldCols) + ` FROM ` + tableIdent(ch.Table) + ` AS ` + pgx.Identifier{a}.Sanitize() +
+		` ORDER BY ` + strings.Join(order, ", ")
+}
