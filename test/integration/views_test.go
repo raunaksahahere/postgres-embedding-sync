@@ -60,6 +60,10 @@ func (e *env) seedKB(tenants, docs, sections int) {
 		UNION SELECT t, d, 1 + ((d + 2) %% 5) FROM generate_series(1, %d) t, generate_series(1, %d) d`, tenants, docs, tenants, docs))
 }
 
+func (e *env) jobsDoneOrCancelled() bool {
+	return e.scalar(`SELECT (count(*) FILTER (WHERE state IN ('pending', 'running')) = 0)::text FROM embedsync.backfill_jobs`) == "true"
+}
+
 func (e *env) kbDoc(gen, key string) string {
 	e.t.Helper()
 	return e.scalar(`SELECT coalesce(string_agg(content, ' ' ORDER BY chunk_no), '') FROM embedsync.chunks_`+gen+` WHERE pipeline = 'kb' AND source_key = $1`, key)
@@ -189,6 +193,19 @@ func TestViewAcceptance(t *testing.T) {
 	r = e.requireConsistent("after migrating the view to v2")
 	if len(r.Generations) != 2 || r.Generations[1].Pipelines["kb"].ActualChunks == 0 {
 		t.Fatalf("both generations must hold the view: %s", r)
+	}
+
+	// Re-scanning a view pauses its rendering in every generation, so every
+	// live generation is re-rendered, not only the one named.
+	out, err = e.cli("backfill", "--pipeline", "kb", "--wait=false")
+	if err != nil || strings.Count(out, "render job") != 2 {
+		t.Fatalf("view re-scan must re-render both live generations: %v\n%s", err, out)
+	}
+	e.exec(`UPDATE kb_tags SET name = 'during rescan' WHERE tenant_id = 1 AND id = 3`)
+	waitFor(t, 60*time.Second, "view re-scan", e.jobsDoneOrCancelled)
+	r = e.requireConsistent("after re-scanning the view")
+	if len(r.Generations) != 2 {
+		t.Fatalf("generations: %s", r)
 	}
 	p.stop(t)
 }

@@ -58,6 +58,9 @@ func (p *Planner) markDirty(u *Unit, txn *Txn, view, key string) {
 		m = map[string]dirtyMark{}
 		u.dirty[view] = m
 	}
+	if _, seen := m[key]; !seen {
+		u.docs++ // counts toward max_batch_docs while the unit is planned
+	}
 	m[key] = dirtyMark{lsn: txn.EndLSN, ct: txn.CommitTime}
 	if !p.viewReady(view) || u.Pause != nil {
 		return
@@ -390,7 +393,6 @@ func (p *Planner) renderViews(ctx context.Context, u *Unit) error {
 		for _, k := range ks {
 			id := DocID{Pipeline: view, Key: k}
 			u.Stream[id] = p.renderDoc(spec, k, docs[k], marks[k].lsn, marks[k].ct)
-			u.docs++
 		}
 	}
 	for _, r := range u.renders {

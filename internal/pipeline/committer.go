@@ -262,7 +262,7 @@ func (c *Committer) applyState(ctx context.Context, tx pgx.Tx, u *Unit) error {
 		if c.isView(rd.Pipeline) {
 			continue
 		}
-		sig := fmt.Sprint(rd.Pipeline, rd.Lo, rd.Hi)
+		sig := rd.Pipeline + "\x00" + strOr(rd.Lo, "\x01") + "\x00" + strOr(rd.Hi, "\x01")
 		if seen[sig] {
 			continue
 		}
@@ -506,3 +506,11 @@ func truncate(s string, n int) string {
 }
 
 var _ = embedclient.FormatVector
+
+// strOr returns *s, or def for nil (keys never contain NUL or \x01).
+func strOr(s *string, def string) string {
+	if s == nil {
+		return def
+	}
+	return *s
+}

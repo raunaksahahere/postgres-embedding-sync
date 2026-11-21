@@ -63,12 +63,23 @@ func Backfill(ctx context.Context, e *Env, gen, pipe string, wait bool, out io.W
 				ids = append(ids, id)
 				fmt.Fprintf(out, "state backfill job %d queued for %s\n", id, c.Def.Name)
 			}
-			id, err := e.Store.RequestBackfill(ctx, gen, p, store.JobRender)
+			// While its tables are re-scanned the view renders nothing, in
+			// any generation: re-render it in every live generation.
+			gens, err := e.Store.Generations(ctx)
 			if err != nil {
 				return err
 			}
-			ids = append(ids, id)
-			fmt.Fprintf(out, "render job %d queued for %s (view %s)\n", id, gen, p)
+			for _, lg := range gens {
+				if _, covers := lg.Pipelines[p]; !covers || !(store.IsLive(lg.State) || lg.State == store.StatePending) {
+					continue
+				}
+				id, err := e.Store.RequestBackfill(ctx, lg.ID, p, store.JobRender)
+				if err != nil {
+					return err
+				}
+				ids = append(ids, id)
+				fmt.Fprintf(out, "render job %d queued for %s (view %s)\n", id, lg.ID, p)
+			}
 			continue
 		}
 		id, err := e.Store.RequestBackfill(ctx, gen, p, store.JobEmbed)
