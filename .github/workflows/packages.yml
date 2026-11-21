@@ -185,7 +185,9 @@ jobs:
           flags=""
           [ "${{ matrix.variant }}" = nomodel ] && flags="--model sentence-transformers/paraphrase-MiniLM-L3-v2"
           packaging/test-installed.sh "$(cat VERSION)" "$ADMIN" $flags
-          sudo /usr/local/embedsync/uninstall.sh && ! command -v embedsync && echo "uninstall OK"
+          sudo /usr/local/embedsync/uninstall.sh
+          hash -r   # forget the shell's cached path to embedsync
+          ! command -v embedsync && [ ! -e /usr/local/embedsync ] && [ ! -e /usr/local/bin/embedsync ] && echo "uninstall OK"
 
   test-windows:
     name: install + e2e (Windows x64, ${{ matrix.variant }})
