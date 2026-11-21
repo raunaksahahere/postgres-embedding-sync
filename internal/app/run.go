@@ -313,9 +313,11 @@ func schemaErr(pipe, format string, a ...any) error {
 // resolveRelations decides, per pipeline, which relation shape and key codec
 // the stream is consumed with: the accepted one, an operator-accepted new
 // one (only at a schema pause of that pipeline), or the catalog's for a
-// pipeline seen for the first time. New pipelines are returned in fresh.
-func resolveRelations(ctx context.Context, e *Env, cp *store.Checkpoint, rels map[string]*store.Relation, cats *Catalogs,
-	opts RunOptions) (accepted map[string]*Catalog, fresh []store.Relation, err error) {
+// pipeline seen for the first time. New pipelines are returned in fresh and
+// operator-accepted shape changes in accepts; the caller persists both only
+// after every startup check has passed.
+func resolveRelations(e *Env, cp *store.Checkpoint, rels map[string]*store.Relation, cats *Catalogs,
+	opts RunOptions) (accepted map[string]*Catalog, fresh, accepts []store.Relation, err error) {
 	cfg := e.Cfg
 	accepted = map[string]*Catalog{}
 	for i := range cfg.Pipelines {
@@ -324,20 +326,20 @@ func resolveRelations(ctx context.Context, e *Env, cp *store.Checkpoint, rels ma
 		cat, se := cats.Pipes[p.Name], cats.SchemaErrs[p.Name]
 		if rel == nil {
 			if se != nil {
-				return nil, nil, &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: p.Name, Detail: se.Error()}
+				return nil, nil, nil, &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: p.Name, Detail: se.Error()}
 			}
 			accepted[p.Name] = cat
 			fresh = append(fresh, store.Relation{Pipeline: p.Name, SourceTable: p.Table, KeyColumns: p.Key, KeyKinds: cat.Codec.String(), RelationSignature: cat.Signature})
 			continue
 		}
 		if rel.SourceTable != p.Table || strings.Join(rel.KeyColumns, ",") != strings.Join(p.Key, ",") {
-			return nil, nil, &pipeline.PauseError{Reason: "identity_mismatch", Pipeline: p.Name, Detail: fmt.Sprintf(
+			return nil, nil, nil, &pipeline.PauseError{Reason: "identity_mismatch", Pipeline: p.Name, Detail: fmt.Sprintf(
 				"pipeline %s was registered for %s key %v but the config now says %s key %v; a pipeline's table and key cannot change (use a new pipeline name, or rebuild)",
 				p.Name, rel.SourceTable, rel.KeyColumns, p.Table, []string(p.Key))}
 		}
 		codec, perr := keys.ParseCodec(rel.KeyKinds)
 		if perr != nil {
-			return nil, nil, perr
+			return nil, nil, nil, perr
 		}
 		paused := cp != nil && atSchemaPause(cp, p.Name)
 		if se != nil {
@@ -346,7 +348,7 @@ func resolveRelations(ctx context.Context, e *Env, cp *store.Checkpoint, rels ma
 			// shape, keep streaming with it: the reader pauses exactly at the
 			// change.
 			if !configMatchesSignature(p, rel.RelationSignature) || paused {
-				return nil, nil, &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: p.Name, Detail: se.Error() +
+				return nil, nil, nil, &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: p.Name, Detail: se.Error() +
 					"; update the field mapping if a column was renamed, then restart with --accept-schema-change"}
 			}
 			e.Log.Warn("source table no longer matches the field mapping; streaming with the accepted mapping until the change is reached", "pipeline", p.Name, "detail", se.Error())
@@ -354,7 +356,7 @@ func resolveRelations(ctx context.Context, e *Env, cp *store.Checkpoint, rels ma
 			continue
 		}
 		if cat.Codec.String() != rel.KeyKinds {
-			return nil, nil, &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: p.Name, Detail: fmt.Sprintf(
+			return nil, nil, nil, &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: p.Name, Detail: fmt.Sprintf(
 				"pipeline %s: primary key type changed from %s to %s; rebuild required", p.Name, rel.KeyKinds, cat.Codec.String())}
 		}
 		if rel.RelationSignature == cat.Signature {
@@ -365,13 +367,11 @@ func resolveRelations(ctx context.Context, e *Env, cp *store.Checkpoint, rels ma
 		case paused && opts.AcceptSchemaChange:
 			// The stream stopped at the change and nothing after it was
 			// acknowledged: accept the new shape from exactly here.
-			if err := e.Store.UpdateRelationSignature(ctx, p.Name, cat.Signature); err != nil {
-				return nil, nil, err
-			}
-			e.Log.Warn("accepted source schema change", "pipeline", p.Name, "from", rel.RelationSignature, "to", cat.Signature)
+			accepts = append(accepts, store.Relation{Pipeline: p.Name, RelationSignature: cat.Signature})
+			e.Log.Warn("accepting source schema change", "pipeline", p.Name, "from", rel.RelationSignature, "to", cat.Signature)
 			accepted[p.Name] = cat
 		case paused:
-			return nil, nil, &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: p.Name, Detail: fmt.Sprintf(
+			return nil, nil, nil, &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: p.Name, Detail: fmt.Sprintf(
 				"pipeline %s: source table shape changed from %q to %q; review it, update field mappings if needed, then restart with --accept-schema-change", p.Name, rel.RelationSignature, cat.Signature)}
 		case configMatchesSignature(p, rel.RelationSignature):
 			// The catalog changed ahead of the stream: keep the accepted
@@ -383,17 +383,17 @@ func resolveRelations(ctx context.Context, e *Env, cp *store.Checkpoint, rels ma
 				"pipeline", p.Name, "accepted", rel.RelationSignature, "catalog", cat.Signature)
 			accepted[p.Name] = &Catalog{Codec: codec, Signature: rel.RelationSignature}
 		default:
-			return nil, nil, &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: p.Name, Detail: fmt.Sprintf(
+			return nil, nil, nil, &pipeline.PauseError{Reason: "schema_incompatible", Pipeline: p.Name, Detail: fmt.Sprintf(
 				"pipeline %s: the field mapping no longer matches the accepted shape %q, but the stream has not reached the schema change yet; restore the previous mapping, let the pipeline pause at the change, then switch the mapping and restart with --accept-schema-change", p.Name, rel.RelationSignature)}
 		}
 	}
 	for name := range rels {
 		if cfg.Pipe(name) == nil {
-			return nil, nil, &pipeline.PauseError{Reason: "startup_check", Detail: fmt.Sprintf(
+			return nil, nil, nil, &pipeline.PauseError{Reason: "startup_check", Detail: fmt.Sprintf(
 				"pipeline %q is registered in this sink but no longer configured; restore it (removing a pipeline is not supported in place)", name)}
 		}
 	}
-	return accepted, fresh, nil
+	return accepted, fresh, accepts, nil
 }
 
 // pipelineRun is one attempt of the streaming pipeline with fresh connections.
@@ -459,8 +459,18 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 			return err
 		}
 	}
-	accepted, fresh, err := resolveRelations(ctx, e, cp, rels, cats, opts)
+	accepted, fresh, accepts, err := resolveRelations(e, cp, rels, cats, opts)
 	if err != nil {
+		return err
+	}
+	// Every check that can pause runs before anything is persisted for new
+	// pipelines (relations, generation coverage, backfill jobs): a paused
+	// start must leave the sink as it was, so reverting the config works.
+	gens, err := e.Store.Generations(ctx)
+	if err != nil {
+		return err
+	}
+	if err := checkGenerations(cfg, gens); err != nil {
 		return err
 	}
 	if cp == nil {
@@ -488,6 +498,13 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 		}
 		e.Log.Info("created replication slot", "slot", cfg.Source.Slot, "consistent_point", lsn.String())
 	}
+	for _, r := range accepts {
+		// The stream stopped at the change and nothing after it was
+		// acknowledged: the new shape is accepted from exactly here.
+		if err := e.Store.UpdateRelationSignature(ctx, r.Pipeline, r.RelationSignature); err != nil {
+			return err
+		}
+	}
 	for _, r := range fresh {
 		if err := e.Store.InsertRelation(ctx, r); err != nil {
 			return fmt.Errorf("register pipeline %s: %w", r.Pipeline, err)
@@ -502,22 +519,11 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 	if err := ensureGenerations(ctx, e); err != nil {
 		return err
 	}
-	gens, err := e.Store.Generations(ctx)
-	if err != nil {
+	if gens, err = e.Store.Generations(ctx); err != nil {
 		return err
 	}
 	live := map[string]*pipeline.GenInfo{}
-	fps := cfg.PipelineFingerprints()
 	for _, g := range gens {
-		if store.IsLive(g.State) || g.State == store.StatePending {
-			m, ok := cfg.Models[g.ModelKey]
-			if !ok {
-				return &pipeline.PauseError{Reason: "startup_check", Detail: fmt.Sprintf("generation %s uses model key %q which is not in the config", g.ID, g.ModelKey)}
-			}
-			if err := g.MatchesModel(m, fps); err != nil {
-				return &pipeline.PauseError{Reason: "startup_check", Detail: err.Error()}
-			}
-		}
 		if store.IsLive(g.State) && g.StreamFromLSN != nil {
 			live[g.ID] = &pipeline.GenInfo{Gen: g, Model: ModelIdentity(g)}
 		}
@@ -606,17 +612,45 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 	// A stage stopped: drain the rest, then prefer the most specific error.
 	shutdown()
 	close(errs)
+	all := []error{first}
 	for err := range errs {
-		if _, ok := pipeline.IsPause(err); ok {
-			first = err
-		}
-		if first == nil || errors.Is(first, context.Canceled) {
-			first = err
+		all = append(all, err)
+	}
+	return pickRunError(all)
+}
+
+// pickRunError chooses what one pipeline attempt reports: a pause if any
+// stage paused, otherwise the first real error. The planner and the
+// committer return the same pause; only the committer's return proves that
+// every unit before the paused one is durable, i.e. that the checkpoint is
+// exactly at the change. If the committer did not get there (for example it
+// was cancelled by the shutdown timeout), the pipeline still pauses, but the
+// pause is not recorded as a stream position: the next start replays up to
+// the change and records it there.
+func pickRunError(all []error) error {
+	var pause *pipeline.PauseError
+	committerPaused := false
+	for _, err := range all {
+		if pe, ok := pipeline.IsPause(err); ok {
+			pause = pe
+			var se *stageErr
+			if errors.As(err, &se) && se.stage == "committer" {
+				committerPaused = true
+			}
 		}
 	}
-	if _, ok := pipeline.IsPause(first); !ok {
-		if pe, ok2 := firstPause(first); ok2 {
-			first = pe
+	if pause != nil {
+		if pause.InStream && !committerPaused {
+			c := *pause
+			c.InStream = false
+			return &c
+		}
+		return pause
+	}
+	var first error
+	for _, err := range all {
+		if first == nil || errors.Is(first, context.Canceled) {
+			first = err
 		}
 	}
 	return first
@@ -637,8 +671,6 @@ func tagErr(stage string, err error) error {
 	return &stageErr{stage, err}
 }
 
-func firstPause(err error) (*pipeline.PauseError, bool) { return pipeline.IsPause(err) }
-
 func checkIdentity(cfg *config.Config, cp *store.Checkpoint, sys pglogrepl.IdentifySystemResult, slot *SlotInfo) error {
 	switch {
 	case cp.SystemIdentifier != sys.SystemID:
@@ -658,6 +690,26 @@ func checkIdentity(cfg *config.Config, cp *store.Checkpoint, sys pglogrepl.Ident
 			"slot confirmed_flush_lsn %s is ahead of checkpoint %s: changes in between were acknowledged without being applied here (slot recreated or shared?); rebuild required", slot.ConfirmedLSN, cp.LSN)}
 	case slot.ConfirmedLSN != nil && *slot.ConfirmedLSN < cp.SlotCreatedLSN:
 		return &pipeline.PauseError{Reason: "identity_mismatch", Detail: "slot is older than the checkpoint's slot; refusing to adopt it"}
+	}
+	return nil
+}
+
+// checkGenerations verifies that every live or pending generation was built
+// with a configured model and with the configured transform of every
+// pipeline it covers (pipelines it does not cover yet are added later).
+func checkGenerations(cfg *config.Config, gens []*store.Generation) error {
+	fps := cfg.PipelineFingerprints()
+	for _, g := range gens {
+		if !store.IsLive(g.State) && g.State != store.StatePending {
+			continue
+		}
+		m, ok := cfg.Models[g.ModelKey]
+		if !ok {
+			return &pipeline.PauseError{Reason: "startup_check", Detail: fmt.Sprintf("generation %s uses model key %q which is not in the config", g.ID, g.ModelKey)}
+		}
+		if err := g.MatchesModel(m, fps); err != nil {
+			return &pipeline.PauseError{Reason: "startup_check", Detail: err.Error()}
+		}
 	}
 	return nil
 }

@@ -167,13 +167,8 @@ func Verify(ctx context.Context, e *Env, timeout time.Duration) (*VerifyReport, 
 			pr := &PipelineVerifyRows{SourceRows: len(rows[p]), SourceState: verify.State(verify.Rows{p: rows[p]}, map[string]map[string]map[string]*string{p: state[p]})}
 			rep.Pipelines[p] = pr
 		}
-		for p := range state {
-			if e.Cfg.Pipe(p) == nil {
-				// State of a pipeline that is no longer configured.
-				rep.SourceState.Extra += len(state[p])
-				rep.OK = false
-			}
-		}
+		// State of a pipeline that is no longer configured is counted as
+		// extra by verify.State (it has no source rows), so OK is false.
 		gens, err := e.Store.Generations(ctx)
 		if err != nil {
 			return err
