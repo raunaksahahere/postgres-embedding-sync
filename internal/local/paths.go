@@ -61,7 +61,7 @@ func EmbedderBinary() (string, error) {
 		name += ".exe"
 	}
 	p := filepath.Join(dir, "embedder", name)
-	if _, err := os.Stat(p); err != nil {
+	if fi, err := os.Stat(p); err != nil || !fi.Mode().IsRegular() {
 		return "", fmt.Errorf("bundled embedder not found at %s: this embedsync was not installed from an "+
 			"installer package. Install a package from the GitHub releases page, set EMBEDSYNC_EMBEDDER_BIN, "+
 			"or set embedder.url to a running embedder", p)
