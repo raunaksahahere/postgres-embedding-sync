@@ -66,3 +66,22 @@ func TestTemplateAllowlist(t *testing.T) {
 		t.Fatalf("render = %q, %v", s, err)
 	}
 }
+
+func TestViewTemplate(t *testing.T) {
+	tmpl := "{{.title}}{{range .tags}} #{{.name}}{{end}}{{range .sections}}\n{{.heading}}: {{.body}}{{end}}"
+	tr, err := NewView("view:kb", tmpl, []string{"title"}, map[string][]string{"sections": {"heading", "body"}, "tags": {"name"}}, 50, 5, "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := tr.RenderData(map[string]any{
+		"title":    "Doc",
+		"tags":     []map[string]string{{"name": "a"}, {"name": "b"}},
+		"sections": []map[string]string{{"heading": "One", "body": "x"}, {"heading": "Two", "body": "y"}},
+	})
+	if err != nil || got != "Doc #a #b\nOne: x\nTwo: y" {
+		t.Fatalf("got %q %v", got, err)
+	}
+	if _, err := NewView("view:kb", "{{range .sections}}{{.secret}}{{end}}", nil, map[string][]string{"sections": {"body"}}, 50, 5, "fp"); err == nil {
+		t.Fatal("a child field outside the allowlist must be rejected")
+	}
+}

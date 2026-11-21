@@ -249,6 +249,7 @@ type Alerts struct {
 type Config struct {
 	Source            Source           `yaml:"source"`
 	Pipelines         []PipelineDef    `yaml:"pipelines"`
+	Views             []ViewDef        `yaml:"views"`
 	Sink              Sink             `yaml:"sink"`
 	Transform         Transform        `yaml:"transform"`
 	Embedder          Embedder         `yaml:"embedder"`
@@ -321,6 +322,14 @@ func (c *Config) applyDefaults() {
 			defI(&t.ChunkWords, 120)
 		}
 	}
+	for i := range c.Views {
+		v := &c.Views[i]
+		if t := v.Transform; t != nil {
+			defI(&t.ChunkWords, 120)
+		}
+		defI(&v.MaxChildren, 1000)
+		defI(&v.MaxFanoutPerTxn, 10000)
+	}
 	defI(&c.Embedder.BatchSize, 32)
 	defI(&c.Embedder.Concurrency, 2)
 	defI(&c.Embedder.Burst, 4)
@@ -378,8 +387,8 @@ func (c *Config) applyDefaults() {
 func (c *Config) Validate() error {
 	var errs []string
 	add := func(f string, a ...any) { errs = append(errs, fmt.Sprintf(f, a...)) }
-	if len(c.Pipelines) == 0 {
-		add("configure source.table (one table) or pipelines (one or more tables)")
+	if len(c.Pipelines) == 0 && len(c.Views) == 0 {
+		add("configure source.table (one table), pipelines (one or more tables) or views")
 	}
 	names, tables := map[string]bool{}, map[string]bool{}
 	for i := range c.Pipelines {
@@ -451,6 +460,7 @@ func (c *Config) Validate() error {
 			add("invalid identifier %q", s)
 		}
 	}
+	c.validateViews(add, tables, names)
 	if c.Sink.ReaderRole != "" && !identRe.MatchString(c.Sink.ReaderRole) {
 		add("invalid sink.reader_role")
 	}
@@ -507,6 +517,12 @@ func (c *Config) normalize() error {
 		if c.Pipelines[i].Transform == nil {
 			t := c.Transform
 			c.Pipelines[i].Transform = &t
+		}
+	}
+	for i := range c.Views {
+		if c.Views[i].Transform == nil {
+			t := c.Transform
+			c.Views[i].Transform = &t
 		}
 	}
 	return nil
@@ -582,11 +598,15 @@ func (p *PipelineDef) TransformFingerprint() string {
 	return hex.EncodeToString(h[:16])
 }
 
-// PipelineFingerprints maps every pipeline to its transform fingerprint.
+// PipelineFingerprints maps every document pipeline (standalone pipelines
+// and views) to the fingerprint of everything that shapes its text.
 func (c *Config) PipelineFingerprints() map[string]string {
-	out := make(map[string]string, len(c.Pipelines))
+	out := make(map[string]string, len(c.Pipelines)+len(c.Views))
 	for i := range c.Pipelines {
 		out[c.Pipelines[i].Name] = c.Pipelines[i].TransformFingerprint()
+	}
+	for i := range c.Views {
+		out[c.Views[i].Name] = c.Views[i].Fingerprint()
 	}
 	return out
 }

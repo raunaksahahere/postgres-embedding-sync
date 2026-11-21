@@ -55,10 +55,18 @@ func New(table, tmpl string, fieldNames []string, chunkWords, chunkOverlap int, 
 // Render executes the template over allowlisted field values. Missing values
 // (SQL NULL) must be passed as empty strings by the caller.
 func (t *Transformer) Render(fields map[string]string) (string, error) {
-	data := make(map[string]string, len(t.fieldNames))
+	data := make(map[string]any, len(t.fieldNames))
 	for _, f := range t.fieldNames {
 		data[f] = fields[f]
 	}
+	return t.execute(data)
+}
+
+// RenderData executes the template over structured data: a view's root
+// fields (strings) and, per child or link name, a list of row maps.
+func (t *Transformer) RenderData(data map[string]any) (string, error) { return t.execute(data) }
+
+func (t *Transformer) execute(data map[string]any) (string, error) {
 	var buf bytes.Buffer
 	if err := t.tmpl.Execute(&buf, data); err != nil {
 		return "", err
@@ -68,6 +76,33 @@ func (t *Transformer) Render(fields map[string]string) (string, error) {
 		return "", fmt.Errorf("rendered document is not valid UTF-8")
 	}
 	return s, nil
+}
+
+// NewView builds a Transformer for a view document. rootFields are the root
+// row's field names; lists maps each child or link name to the field names
+// of its rows. The template is probed with one row per list so a reference
+// to anything outside the allowlist fails here.
+func NewView(id, tmpl string, rootFields []string, lists map[string][]string, chunkWords, chunkOverlap int, transformFP string) (*Transformer, error) {
+	t, err := template.New("doc").Option("missingkey=error").Parse(tmpl)
+	if err != nil {
+		return nil, fmt.Errorf("parse template: %w", err)
+	}
+	tr := &Transformer{tmpl: t, chunkWords: chunkWords, chunkOverlap: chunkOverlap, table: id, transformFP: transformFP}
+	probe := map[string]any{}
+	for _, f := range rootFields {
+		probe[f] = "x"
+	}
+	for name, fs := range lists {
+		row := map[string]string{}
+		for _, f := range fs {
+			row[f] = "x"
+		}
+		probe[name] = []map[string]string{row}
+	}
+	if _, err := tr.execute(probe); err != nil {
+		return nil, fmt.Errorf("template references a field outside the allowlist: %w", err)
+	}
+	return tr, nil
 }
 
 // Split cuts text into overlapping word windows. Whitespace is normalised so
