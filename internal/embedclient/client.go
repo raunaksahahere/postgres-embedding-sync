@@ -33,12 +33,24 @@ const (
 	Query Kind = "query"
 )
 
-// Request is the wire request.
+// Request is the wire request of the built-in embedder and the provider-
+// neutral request every Provider takes.
 type Request struct {
 	Model    string   `json:"model"`
 	Revision string   `json:"revision"`
 	Kind     Kind     `json:"kind"`
 	Inputs   []string `json:"inputs"`
+	// Dimensions asks a provider that supports it for vectors of this
+	// length (OpenAI "dimensions"); 0 leaves the model's default. The
+	// built-in embedder ignores it.
+	Dimensions int `json:"-"`
+	// Expect is the vector length the caller requires; a provider rejects
+	// a response with any other length as invalid. 0 skips the check.
+	Expect int `json:"-"`
+	// InputType is sent as the provider's input-type field when set (e.g.
+	// "query" / "passage" for models trained with asymmetric inputs). The
+	// caller picks the document or query value from the generation.
+	InputType string `json:"-"`
 }
 
 // Response is the wire response.
