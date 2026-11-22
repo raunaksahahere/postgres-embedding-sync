@@ -558,7 +558,12 @@ func (e *env) chunkRows(table, pipelineFilter string) []chunkRow {
 	if pipelineFilter != "" {
 		q += ` WHERE pipeline = '` + pipelineFilter + `'`
 	}
-	rows, err := e.admin.Query(context.Background(), q+` ORDER BY pipeline, source_key, chunk_no`)
+	order := ` ORDER BY source_key, chunk_no`
+	// Pipelines share keys: order by pipeline too (tables from before 0.3.0 have no such column).
+	if e.scalar(`SELECT count(*)::text FROM information_schema.columns WHERE table_schema = 'embedsync' AND table_name = $1 AND column_name = 'pipeline'`, table) == "1" {
+		order = ` ORDER BY pipeline, source_key, chunk_no`
+	}
+	rows, err := e.admin.Query(context.Background(), q+order)
 	if err != nil {
 		e.t.Fatal(err)
 	}
