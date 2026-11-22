@@ -930,3 +930,11 @@ func FieldText(f Field, ident string) string {
 	}
 	return ident + "::text"
 }
+
+// TextSearchExpr is the full-text expression over a text column with the
+// configured text search configuration. The configuration is a constant in
+// the expression (it is validated as an identifier and checked against the
+// sink's catalog at startup) so queries match the expression index exactly.
+func (c *Config) TextSearchExpr(col string) string {
+	return "to_tsvector('" + strings.ReplaceAll(c.Search.TextConfig, "'", "''") + "'::regconfig, " + col + ")"
+}

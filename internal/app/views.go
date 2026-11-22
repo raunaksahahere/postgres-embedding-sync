@@ -97,9 +97,9 @@ func replayViewDoc(ctx context.Context, e *Env, d store.DLQEntry, g *store.Gener
 			return err
 		}
 		for i, c := range cs {
-			if _, err := tx.Exec(ctx, `INSERT INTO `+tbl+` (pipeline, source_key, chunk_no, chunk_id, fingerprint, content, embedding, source_lsn, meta, tsv)
-				VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::pg_lsn, $9::jsonb, to_tsvector($10::regconfig, $6))`, d.Pipeline, d.SourceKey, c.No, c.ID, c.Fingerprint, c.Text,
-				embedclient.FormatVector(vecs[i]), d.SourceLSN, pipeline.MetaJSON(spec.ViewDef.Metadata, doc.Root), e.Cfg.Search.TextConfig); err != nil {
+			if _, err := tx.Exec(ctx, `INSERT INTO `+tbl+` (pipeline, source_key, chunk_no, chunk_id, fingerprint, content, embedding, source_lsn, meta)
+				VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::pg_lsn, $9::jsonb)`, d.Pipeline, d.SourceKey, c.No, c.ID, c.Fingerprint, c.Text,
+				embedclient.FormatVector(vecs[i]), d.SourceLSN, pipeline.MetaJSON(spec.ViewDef.Metadata, doc.Root)); err != nil {
 				return err
 			}
 		}

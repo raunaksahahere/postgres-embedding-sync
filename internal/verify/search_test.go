@@ -146,7 +146,7 @@ func TestOKCountsSearchColumns(t *testing.T) {
 	if !(GenReport{}).OK() {
 		t.Fatal("empty report should be OK")
 	}
-	if (GenReport{MetaStale: 1}).OK() || (GenReport{TSVStale: 1}).OK() {
+	if (GenReport{MetaStale: 1}).OK() || (GenReport{FTSIndexMissing: true}).OK() {
 		t.Fatal("stale search columns must fail OK")
 	}
 	// Building is reported, not a failure.

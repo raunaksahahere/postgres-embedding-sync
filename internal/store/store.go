@@ -3,13 +3,14 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -478,14 +479,12 @@ func (s *Store) CreateGeneration(ctx context.Context, g *Generation, readerRole 
 				content            text NOT NULL,
 				embedding          vector(%d) NOT NULL,
 				meta               jsonb NOT NULL DEFAULT '{}',
-				tsv                tsvector,
 				source_lsn         pg_lsn NOT NULL,
 				source_commit_time timestamptz,
 				updated_at         timestamptz NOT NULL DEFAULT now(),
 				PRIMARY KEY (pipeline, source_key, chunk_no))`, tbl, g.Dimension),
 			fmt.Sprintf(`CREATE INDEX %s ON %s (fingerprint)`, pgx.Identifier{g.ChunkTable + "_fp"}.Sanitize(), tbl),
 			fmt.Sprintf(`CREATE INDEX %s ON %s USING gin (meta)`, pgx.Identifier{g.ChunkTable + "_meta"}.Sanitize(), tbl),
-			fmt.Sprintf(`CREATE INDEX %s ON %s USING gin (tsv)`, pgx.Identifier{g.ChunkTable + "_tsv"}.Sanitize(), tbl),
 			fmt.Sprintf(`CREATE INDEX %s ON %s USING hnsw (embedding %s) WITH (m = %d, ef_construction = %d)`,
 				pgx.Identifier{g.ChunkTable + "_hnsw"}.Sanitize(), tbl, g.OpsClass(), g.IndexParams.M, g.IndexParams.EFConstruction),
 		}
@@ -861,8 +860,8 @@ func (g *Generation) SearchReady(fp string) bool { return g.SearchFingerprint ==
 // for fp: it records the target and queues a source re-scan of the document
 // pipelines and views in rescan, the ones declaring metadata (embed jobs,
 // which reuse stored vectors; for a view, state jobs for its tables listed
-// in views, then a render job). The full-text column needs no re-scan: the
-// search builder fills it from the stored content.
+// in views, then a render job). Full text needs no re-scan: the search
+// builder indexes the stored content.
 //
 // A job already pending or running for the same pipeline would otherwise
 // absorb the re-scan and resume from its cursor, leaving the rows behind it
@@ -917,54 +916,88 @@ func (s *Store) QueueSearchRescan(ctx context.Context, g *Generation, fp string,
 	return err == nil, err
 }
 
-// FillSearchText brings a generation's full-text column (and the metadata of
-// pipelines that declare none, which must be empty) up to date for the next
-// limit rows after the cursor (pipeline, source_key, chunk_no), in primary
-// key order. It computes from each row's own stored content and changes
-// nothing else. Rows locked by a concurrent writer are skipped, never waited
-// for (so it cannot deadlock with the committer, which writes those rows'
-// columns itself); skipped reports how many, and a pass that skipped rows
-// must be repeated before the column can be called complete. last is nil
-// when the table is exhausted.
-func (s *Store) FillSearchText(ctx context.Context, g *Generation, textConfig string, noMeta []string, after []string, limit int) (last []string, changed, skipped int64, err error) {
-	tbl := pgx.Identifier{s.Schema, g.ChunkTable}.Sanitize()
-	if after == nil {
-		after = []string{"", "", "-1"}
+// FTSIndexName is the name of a chunk table's full-text expression index
+// for a text search configuration.
+func FTSIndexName(chunkTable, textConfig string) string {
+	n := chunkTable + "_fts_" + textConfig
+	if len(n) > 63 {
+		h := sha256.Sum256([]byte(n))
+		n = chunkTable[:min(len(chunkTable), 40)] + "_fts_" + hex.EncodeToString(h[:6])
 	}
-	var p, k string
-	var n, total int32
-	err = s.Pool.QueryRow(ctx, `SELECT pipeline, source_key, chunk_no, count(*) OVER () FROM (SELECT pipeline, source_key, chunk_no FROM `+tbl+`
-		WHERE (pipeline, source_key, chunk_no) > ($1, $2, $3::int) ORDER BY pipeline, source_key, chunk_no LIMIT $4) b
-		ORDER BY pipeline DESC, source_key DESC, chunk_no DESC LIMIT 1`, after[0], after[1], after[2], limit).Scan(&p, &k, &n, &total)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, 0, 0, nil
+	return n
+}
+
+// EnsureFTSIndex makes sure a generation's chunk table has a valid
+// full-text expression index for textConfig (expr is the indexed
+// expression, config.TextSearchExpr("content")), building it concurrently:
+// writes continue and no row is rewritten. An invalid index left by an
+// interrupted build is dropped and rebuilt. Other configurations' full-text
+// indexes are dropped once this one is valid. Must not run in a transaction.
+func (s *Store) EnsureFTSIndex(ctx context.Context, g *Generation, textConfig, expr string) error {
+	name := FTSIndexName(g.ChunkTable, textConfig)
+	var valid *bool
+	err := s.Pool.QueryRow(ctx, `SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2`, s.Schema, name).Scan(&valid)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return err
 	}
+	ident := pgx.Identifier{s.Schema, name}.Sanitize()
+	if valid != nil && !*valid {
+		if _, err := s.Pool.Exec(ctx, `DROP INDEX CONCURRENTLY IF EXISTS `+ident); err != nil {
+			return err
+		}
+		valid = nil
+	}
+	if valid == nil {
+		if _, err := s.Pool.Exec(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS `+pgx.Identifier{name}.Sanitize()+` ON `+s.T(g.ChunkTable)+` USING gin (`+expr+`)`); err != nil {
+			return fmt.Errorf("build full-text index %s: %w", name, err)
+		}
+	}
+	rows, err := s.Pool.Query(ctx, `SELECT c.relname FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_class t ON t.oid = i.indrelid
+		JOIN pg_namespace n ON n.oid = t.relnamespace WHERE n.nspname = $1 AND t.relname = $2 AND c.relname LIKE $3 AND c.relname <> $4`,
+		s.Schema, g.ChunkTable, strings.ReplaceAll(g.ChunkTable, "_", `\_`)+`\_fts\_%`, name)
 	if err != nil {
-		return nil, 0, 0, err
+		return err
 	}
-	last = []string{p, k, strconv.Itoa(int(n))}
-	var locked int64
-	err = s.Pool.QueryRow(ctx, `WITH l AS (
-			SELECT pipeline, source_key, chunk_no FROM `+tbl+`
-			WHERE (pipeline, source_key, chunk_no) > ($1, $2, $3::int) AND (pipeline, source_key, chunk_no) <= ($4, $5, $6::int)
-			ORDER BY pipeline, source_key, chunk_no FOR UPDATE SKIP LOCKED),
-		u AS (
-			UPDATE `+tbl+` t SET tsv = to_tsvector($7::regconfig, t.content),
-				meta = CASE WHEN t.pipeline = ANY($8::text[]) THEN '{}'::jsonb ELSE t.meta END
-			FROM l WHERE t.pipeline = l.pipeline AND t.source_key = l.source_key AND t.chunk_no = l.chunk_no
-			  AND (t.tsv IS DISTINCT FROM to_tsvector($7::regconfig, t.content) OR (t.pipeline = ANY($8::text[]) AND t.meta <> '{}'::jsonb))
-			RETURNING 1)
-		SELECT (SELECT count(*) FROM l), (SELECT count(*) FROM u)`,
-		after[0], after[1], after[2], last[0], last[1], last[2], textConfig, noMeta).Scan(&locked, &changed)
+	stale, err := pgx.CollectRows(rows, pgx.RowTo[string])
 	if err != nil {
-		return nil, 0, 0, err
+		return err
 	}
-	return last, changed, int64(total) - locked, nil
+	for _, old := range stale {
+		if _, err := s.Pool.Exec(ctx, `DROP INDEX CONCURRENTLY IF EXISTS `+pgx.Identifier{s.Schema, old}.Sanitize()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ClearStaleMeta empties the metadata of chunks whose pipeline declares
+// none (any left from a removed declaration), at most limit rows per call,
+// never waiting for a row a writer holds. It returns the rows changed and
+// whether rows remain (changed or held by a writer).
+func (s *Store) ClearStaleMeta(ctx context.Context, g *Generation, noMeta []string, limit int) (int64, bool, error) {
+	if len(noMeta) == 0 {
+		return 0, false, nil
+	}
+	tbl := s.T(g.ChunkTable)
+	var remaining bool
+	if err := s.Pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM `+tbl+` WHERE pipeline = ANY($1::text[]) AND meta <> '{}'::jsonb)`, noMeta).Scan(&remaining); err != nil || !remaining {
+		return 0, false, err
+	}
+	tag, err := s.Pool.Exec(ctx, `UPDATE `+tbl+` t SET meta = '{}'::jsonb FROM (
+			SELECT pipeline, source_key, chunk_no FROM `+tbl+` WHERE pipeline = ANY($1::text[]) AND meta <> '{}'::jsonb
+			LIMIT $2 FOR UPDATE SKIP LOCKED) l
+		WHERE t.pipeline = l.pipeline AND t.source_key = l.source_key AND t.chunk_no = l.chunk_no`, noMeta, limit)
+	if err != nil {
+		return 0, true, err
+	}
+	return tag.RowsAffected(), true, nil
 }
 
 // CompleteSearch marks a generation's search columns complete for fp once
-// its full-text pass is done (the caller's part) and no backfill job that
-// could still write metadata remains. It reports whether it did.
+// its full-text index is valid and stale metadata is cleared (the caller's
+// part) and no backfill job that could still write metadata remains. It
+// reports whether it did.
 func (s *Store) CompleteSearch(ctx context.Context, genID, fp string) (bool, error) {
 	tag, err := s.Pool.Exec(ctx, `UPDATE `+s.T("generations")+` g SET search_fingerprint = $2
 		WHERE id = $1 AND search_target = $2 AND search_fingerprint IS DISTINCT FROM $2

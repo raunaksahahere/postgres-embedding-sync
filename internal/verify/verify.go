@@ -53,14 +53,14 @@ type GenReport struct {
 	PoisonExpected  int      `json:"expected_poison_keys"`
 	ExampleProblems []string `json:"example_problems,omitempty"`
 	// MetaStale counts chunks whose meta differs from the document's
-	// declared metadata; TSVStale counts chunks whose tsv differs from
-	// to_tsvector(search.text_config, content). Both are checked only when
-	// the generation's search columns are complete for the configuration
-	// (SearchBuilding false); while they are still being rebuilt in the
-	// background they may legitimately lag and are not counted.
-	MetaStale      int  `json:"meta_stale"`
-	TSVStale       int  `json:"tsv_stale"`
-	SearchBuilding bool `json:"search_columns_building"`
+	// declared metadata; FTSIndexMissing reports that the full-text
+	// expression index for search.text_config is missing or invalid. Both
+	// are checked only when the generation's search columns are complete
+	// for the configuration (SearchBuilding false); while they are still
+	// being built in the background they are not counted.
+	MetaStale       int  `json:"meta_stale"`
+	FTSIndexMissing bool `json:"fts_index_missing"`
+	SearchBuilding  bool `json:"search_columns_building"`
 	// Pipelines breaks the chunk counts down per pipeline.
 	Pipelines map[string]*PipeCounts `json:"pipelines"`
 }
@@ -73,13 +73,12 @@ type PipeCounts struct {
 	Extra          int `json:"extra"`
 	Stale          int `json:"stale"`
 	MetaStale      int `json:"meta_stale"`
-	TSVStale       int `json:"tsv_stale"`
 }
 
 // OK reports zero missing, extra and stale entries, including stale search
 // columns (quarantined rows are reported separately).
 func (r GenReport) OK() bool {
-	return r.Missing == 0 && r.Extra == 0 && r.Stale == 0 && r.MetaStale == 0 && r.TSVStale == 0
+	return r.Missing == 0 && r.Extra == 0 && r.Stale == 0 && r.MetaStale == 0 && !r.FTSIndexMissing
 }
 
 // SearchCheck is what the search columns of a generation are compared with.
@@ -87,7 +86,7 @@ type SearchCheck struct {
 	// Fingerprint is the configuration's search fingerprint; the columns
 	// are checked only for a generation whose SearchFingerprint equals it.
 	Fingerprint string
-	// TextConfig is the text search configuration tsv is computed with.
+	// TextConfig is the text search configuration the full-text index uses.
 	TextConfig string
 	// Meta returns the metadata declarations of a pipeline or view.
 	Meta func(doc string) []config.MetaField
@@ -198,7 +197,7 @@ func ExpectedViews(trs map[string]*transform.Transformer, m transform.ModelIdent
 // Generation compares a generation's chunk table with every standalone
 // pipeline's rows and every view's assembled documents. When the
 // generation's search columns are complete for sc.Fingerprint, every
-// chunk's meta and tsv are compared too; otherwise they are still being
+// chunk's meta is compared and the full-text index checked; otherwise they are still being
 // rebuilt and the report says so (SearchBuilding) without counting them.
 func Generation(ctx context.Context, q Querier, schema string, g *store.Generation, trs map[string]*transform.Transformer, rows Rows, views map[string]ViewDocs, maxDocBytes int, sc SearchCheck) (*GenReport, error) {
 	m := g.Encoder()
@@ -227,10 +226,9 @@ func Generation(ctx context.Context, q Querier, schema string, g *store.Generati
 	tbl := pgx.Identifier{schema, g.ChunkTable}.Sanitize()
 	var rs pgx.Rows
 	if checkSearch {
-		rs, err = q.Query(ctx, `SELECT pipeline, source_key, chunk_no, fingerprint, content, meta::text,
-			tsv IS DISTINCT FROM to_tsvector($1::regconfig, content) FROM `+tbl, sc.TextConfig)
+		rs, err = q.Query(ctx, `SELECT pipeline, source_key, chunk_no, fingerprint, content, meta::text FROM `+tbl)
 	} else {
-		rs, err = q.Query(ctx, `SELECT pipeline, source_key, chunk_no, fingerprint, content, '{}'::text, false FROM `+tbl)
+		rs, err = q.Query(ctx, `SELECT pipeline, source_key, chunk_no, fingerprint, content, '{}'::text FROM `+tbl)
 	}
 	if err != nil {
 		return nil, err
@@ -265,8 +263,7 @@ func Generation(ctx context.Context, q Querier, schema string, g *store.Generati
 	for rs.Next() {
 		var ck chunkKey
 		var v chunkVal
-		var tsvStale bool
-		if err := rs.Scan(&ck.pipeline, &ck.key, &ck.no, &v.fp, &v.text, &v.meta, &tsvStale); err != nil {
+		if err := rs.Scan(&ck.pipeline, &ck.key, &ck.no, &v.fp, &v.text, &v.meta); err != nil {
 			return nil, err
 		}
 		rep.ActualChunks++
@@ -286,15 +283,29 @@ func Generation(ctx context.Context, q Querier, schema string, g *store.Generati
 		if !checkSearch {
 			continue
 		}
-		if tsvStale {
-			rep.TSVStale++
-			pc(ck.pipeline).TSVStale++
-			note(fmt.Sprintf("tsv stale pipeline=%s key=%s chunk=%d", ck.pipeline, ck.key, ck.no))
-		}
 		if ok && !JSONEqual(want.meta, v.meta) {
 			rep.MetaStale++
 			pc(ck.pipeline).MetaStale++
 			note(fmt.Sprintf("meta stale pipeline=%s key=%s chunk=%d: have %s want %s", ck.pipeline, ck.key, ck.no, v.meta, want.meta))
+		}
+	}
+	if err := rs.Err(); err != nil {
+		return nil, err
+	}
+	rs.Close()
+	if checkSearch {
+		ir, err := q.Query(ctx, `SELECT coalesce(bool_and(i.indisvalid), false) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+			JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = $2`, schema, store.FTSIndexName(g.ChunkTable, sc.TextConfig))
+		if err != nil {
+			return nil, err
+		}
+		valid, err := pgx.CollectExactlyOneRow(ir, pgx.RowTo[bool])
+		if err != nil {
+			return nil, err
+		}
+		if !valid {
+			rep.FTSIndexMissing = true
+			note("full-text index " + store.FTSIndexName(g.ChunkTable, sc.TextConfig) + " is missing or invalid")
 		}
 	}
 	if err := rs.Err(); err != nil {

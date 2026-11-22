@@ -20,7 +20,7 @@ The default is `vector`.
 | mode | what runs | score |
 |---|---|---|
 | `vector` | embedding similarity against the chunk vectors. The query is embedded by the searched generation's own encoder. Uses the ANN index unless `exact` is true. | `1 - cosine distance` for cosine generations, `-distance` for l2 and inner product |
-| `text` | PostgreSQL full-text search (`websearch_to_tsquery` over each chunk's `tsv`, in the `search.text_config` configuration). The query is not embedded. | `ts_rank_cd` of the document's best matching chunk |
+| `text` | PostgreSQL full-text search (`websearch_to_tsquery` matched against `to_tsvector(search.text_config, content)` of each chunk, served by an expression index). The query is not embedded. | `ts_rank_cd` of the document's best matching chunk |
 | `hybrid` | both branches, fused with reciprocal rank fusion (RRF) | the fused score below |
 
 **Hybrid.** Each branch returns up to `depth = max(4 * k, 50)` documents (one best chunk per
@@ -259,8 +259,8 @@ working while the search columns are being built.
 
 ## text_config
 
-`search.text_config` names the PostgreSQL text search configuration of the full-text column
-(`tsv`) and of the text branch. The default is `simple`. It must be a configuration that exists in
+`search.text_config` names the PostgreSQL text search configuration of the full-text index
+(`<chunk table>_fts_<config>`, on `to_tsvector(<config>, content)`) and of the text branch. The default is `simple`. It must be a configuration that exists in
 the sink database (`run` refuses to start otherwise).
 
 `simple` does not stem words and has no stop-word list, so the tokens of the query match the
@@ -273,18 +273,22 @@ change of metadata declarations.
 
 ## Upgrading an existing installation
 
-Search needs two new columns on each chunk table: `meta` (the metadata, `jsonb`) and `tsv` (the
-full-text vector), with GIN indexes on both. The upgrade is:
+Search needs one new column on each chunk table, `meta` (the metadata, `jsonb`, GIN-indexed),
+and a full-text expression index. Neither rewrites existing rows for pipelines without
+metadata, so their vector index and results stay exactly as they were. The upgrade is:
 
 1. Stop `embedsync run`, install the new version.
 2. Run `embedsync init --admin-url <admin URL>` (or the admin DSN variables). It applies
-   `sink/0005_search.sql`: it adds the two columns and the indexes and the generation columns
-   `search_target` and `search_fingerprint`. Existing rows get an empty `meta` and a null
-   `tsv`. Nothing is re-embedded.
+   `sink/0005_search.sql`: it adds the `meta` column (instant: a constant default) with its GIN
+   index, and the generation columns `search_target` and `search_fingerprint`. Existing rows
+   get an empty `meta`. Nothing is re-embedded.
 3. Start `embedsync run`. It fills the search columns in the background:
    * pipelines and views that declare `metadata:` are re-scanned from the source, reusing the
      stored vectors, so no input is embedded again;
-   * the full-text column is filled from each chunk's stored content;
+   * the full-text expression index is built with `CREATE INDEX CONCURRENTLY` (writes
+     continue; no row is rewritten);
+   * the rows of re-scanned pipelines are rewritten with their metadata (new row versions;
+     vacuum large tables afterwards);
    * when a generation's columns are complete for the current configuration, its search state
      becomes `ready`.
 
@@ -301,9 +305,9 @@ Progress is visible in two places:
 
 * `embedsync status` prints `search=building` or `search=ready` on each generation line. The
   JSON report has the same value per generation in `generations[].search`.
-* `embedsync verify` prints `search columns: meta_stale=N tsv_stale=M` per generation, or
-  `search columns: building (meta/tsv not checked)` while the rebuild runs. Zero stale rows means
-  the columns are complete.
+* `embedsync verify` prints `search columns: meta_stale=N fts_index_missing=false` per
+  generation, or `search columns: building (metadata and full-text index not checked)` while the
+  rebuild runs.
 
 A downgrade after `init` is not supported (the same rule as the earlier schema upgrades).
 

@@ -465,17 +465,17 @@ func (c *Committer) applyGen(ctx context.Context, tx pgx.Tx, u *Unit, gi *GenInf
 		}
 	}
 	if len(cKey) > 0 {
-		// A chunk is rewritten when its text, its document's metadata or its
-		// full-text vector changed: a metadata-only update changes filter
-		// results without re-embedding (the vector came from the sink).
-		if _, err := tx.Exec(ctx, `INSERT INTO `+tbl+` AS t (pipeline, source_key, chunk_no, chunk_id, fingerprint, content, embedding, source_lsn, source_commit_time, meta, tsv)
-			SELECT p, k, n, id, fp, txt, v::vector, l::pg_lsn, ct, m::jsonb, to_tsvector($11::regconfig, txt)
+		// A chunk is rewritten when its text or its document's metadata
+		// changed: a metadata-only update changes filter results without
+		// re-embedding (the vector came from the sink).
+		if _, err := tx.Exec(ctx, `INSERT INTO `+tbl+` AS t (pipeline, source_key, chunk_no, chunk_id, fingerprint, content, embedding, source_lsn, source_commit_time, meta)
+			SELECT p, k, n, id, fp, txt, v::vector, l::pg_lsn, ct, m::jsonb
 			FROM unnest($1::text[], $2::text[], $3::int[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::timestamptz[], $10::text[]) AS u(p, k, n, id, fp, txt, v, l, ct, m)
 			ON CONFLICT (pipeline, source_key, chunk_no) DO UPDATE SET chunk_id = EXCLUDED.chunk_id, fingerprint = EXCLUDED.fingerprint,
 				content = EXCLUDED.content, embedding = EXCLUDED.embedding, source_lsn = EXCLUDED.source_lsn,
-				source_commit_time = EXCLUDED.source_commit_time, meta = EXCLUDED.meta, tsv = EXCLUDED.tsv, updated_at = now()
-			WHERE t.fingerprint IS DISTINCT FROM EXCLUDED.fingerprint OR t.meta IS DISTINCT FROM EXCLUDED.meta OR t.tsv IS DISTINCT FROM EXCLUDED.tsv`,
-			cP, cKey, cNo, cID, cFP, cText, cV, cLSN, cTime, cMeta, c.Cfg.Search.TextConfig); err != nil {
+				source_commit_time = EXCLUDED.source_commit_time, meta = EXCLUDED.meta, updated_at = now()
+			WHERE t.fingerprint IS DISTINCT FROM EXCLUDED.fingerprint OR t.meta IS DISTINCT FROM EXCLUDED.meta`,
+			cP, cKey, cNo, cID, cFP, cText, cV, cLSN, cTime, cMeta); err != nil {
 			return fmt.Errorf("upsert chunks: %w", err)
 		}
 	}

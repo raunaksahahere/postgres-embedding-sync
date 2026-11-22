@@ -346,9 +346,9 @@ func ReplayDLQ(ctx context.Context, e *Env, id int64, out io.Writer) (*ReplayRes
 				return err
 			}
 			for _, c := range chunks {
-				if _, err := tx.Exec(ctx, `INSERT INTO `+tbl+` (pipeline, source_key, chunk_no, chunk_id, fingerprint, content, embedding, source_lsn, meta, tsv)
-					VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::pg_lsn, $9::jsonb, to_tsvector($10::regconfig, $6))`, d.Pipeline, d.SourceKey, c.no, c.id, c.fp, c.text,
-					vecs[c.fp], s.LSN.String(), pipeline.MetaJSON(e.Cfg.MetaFor(d.Pipeline), s.Fields), e.Cfg.Search.TextConfig); err != nil {
+				if _, err := tx.Exec(ctx, `INSERT INTO `+tbl+` (pipeline, source_key, chunk_no, chunk_id, fingerprint, content, embedding, source_lsn, meta)
+					VALUES ($1, $2, $3, $4, $5, $6, $7::vector, $8::pg_lsn, $9::jsonb)`, d.Pipeline, d.SourceKey, c.no, c.id, c.fp, c.text,
+					vecs[c.fp], s.LSN.String(), pipeline.MetaJSON(e.Cfg.MetaFor(d.Pipeline), s.Fields)); err != nil {
 					return err
 				}
 			}

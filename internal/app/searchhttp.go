@@ -29,7 +29,7 @@ func NewSearcher(e *Env, pool *pgxpool.Pool) *search.Searcher {
 		docs[n] = true
 	}
 	s := &search.Searcher{Pool: pool, Schema: e.Cfg.Sink.Schema, Providers: e.Providers, Meta: meta,
-		TextConfig: e.Cfg.Search.TextConfig, RRFK: e.Cfg.Search.RRFK, SearchFingerprint: e.Cfg.SearchFingerprint(), Docs: docs}
+		TextConfig: e.Cfg.Search.TextConfig, TextExpr: e.Cfg.TextSearchExpr("c.content"), RRFK: e.Cfg.Search.RRFK, SearchFingerprint: e.Cfg.SearchFingerprint(), Docs: docs}
 	if tf := e.Cfg.Search.TenantFilter; tf != nil {
 		s.TenantField, s.TenantHeader = tf.Field, tf.Header
 	}

@@ -42,9 +42,11 @@ type Searcher struct {
 
 	// Meta is the declared metadata fields filters may use.
 	Meta filter.Schema
-	// TextConfig is the text search configuration of the full-text branch
-	// (it must be the one the chunks' tsv was built with).
+	// TextConfig is the text search configuration of the full-text branch.
 	TextConfig string
+	// TextExpr is the full-text expression over c.content, identical to the
+	// chunk tables' expression index (config.TextSearchExpr("c.content")).
+	TextExpr string
 	// RRFK is the default reciprocal rank fusion constant.
 	RRFK int
 	// SearchFingerprint is what a generation's search columns must be
@@ -591,10 +593,10 @@ func (s *Searcher) textBranch(ctx context.Context, tx pgx.Tx, g *genRow, query s
 	// Rank per chunk, then keep each document's best chunk (DISTINCT ON),
 	// then order documents; every order ends with the key so ties are stable.
 	rows, err := tx.Query(ctx, `SELECT pipeline, source_key, chunk_no, content, r FROM (
-			SELECT DISTINCT ON (c.pipeline, c.source_key) c.pipeline, c.source_key, c.chunk_no, c.content, ts_rank_cd(c.tsv, q) AS r
+			SELECT DISTINCT ON (c.pipeline, c.source_key) c.pipeline, c.source_key, c.chunk_no, c.content, ts_rank_cd(`+s.TextExpr+`, q) AS r
 			FROM `+pgx.Identifier{s.Schema, g.table}.Sanitize()+` c, websearch_to_tsquery($1::regconfig, $2) q
-			WHERE c.tsv @@ q AND `+where+`
-			ORDER BY c.pipeline, c.source_key, ts_rank_cd(c.tsv, q) DESC, c.chunk_no) d
+			WHERE `+s.TextExpr+` @@ q AND `+where+`
+			ORDER BY c.pipeline, c.source_key, r DESC, c.chunk_no) d
 		ORDER BY round(r::numeric, 6) DESC, pipeline, source_key LIMIT `+strconv.Itoa(k), args...)
 	if err != nil {
 		return nil, err

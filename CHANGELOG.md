@@ -29,9 +29,11 @@ and by a tenant from a trusted gateway. Design and examples: [docs/search.md](do
 * **CLI**: `embedsync search` gains `--mode`, `--filter`, `--pipeline` and `--tenant`.
 * **Status**: each generation reports `search` (`building` or `ready`) in `embedsync status`
   (text and `--json`, field `generations[].search`). `embedsync verify` reports
-  `meta_stale` and `tsv_stale` per generation and pipeline.
-* **Schema**: `sink/0005_search.sql` adds `meta` (jsonb) and `tsv` (tsvector) with GIN indexes
-  to every chunk table, and `search_target` and `search_fingerprint` to `generations`.
+  `meta_stale` per generation and pipeline and `fts_index_missing` per generation.
+* **Schema**: `sink/0005_search.sql` adds `meta` (jsonb, GIN-indexed) to every chunk table, and
+  `search_target` and `search_fingerprint` to `generations`. Full text uses an expression index
+  per chunk table, `<table>_fts_<text_config>` on `to_tsvector(<text_config>, content)`, built
+  concurrently by `run`.
 * **Examples and docs**: `examples/embedsync-search.yaml` and `examples/seed-search.sql`,
   `docs/search.md`, and the search section of the README. The LangChain and LlamaIndex
   retrievers take `mode`, `pipelines`, `filter` and `headers`.
@@ -58,12 +60,14 @@ and by a tenant from a trusted gateway. Design and examples: [docs/search.md](do
 
 * Stop `embedsync run`, install the new version, run `embedsync init --admin-url <admin URL>`
   (or the admin DSN variables), then start `run`. `init` applies `sink/0005_search.sql`: it adds
-  the columns and indexes above and changes nothing else. Nothing is re-embedded. Adding the
-  columns is instant; building the two GIN indexes reads each chunk table once and blocks writes
-  to it meanwhile (reads, including search, continue), which is why `run` is stopped for `init`.
-* After the upgrade, `run` fills the search columns in the background: the full-text column from
-  the stored content, and the metadata of pipelines and views that declare `metadata:` by a
-  re-scan that reuses the stored vectors. Until a generation is complete, filtered, text and
+  the column and index above and changes nothing else. Nothing is re-embedded. Adding the
+  column is instant; building its GIN index reads each chunk table once and blocks writes to it
+  meanwhile (reads, including search, continue), which is why `run` is stopped for `init`.
+* After the upgrade, `run` completes search in the background: it builds the full-text
+  expression index concurrently (no row is rewritten, so chunks of pipelines without metadata,
+  and their vector index, stay exactly as they were) and fills the metadata of pipelines and
+  views that declare `metadata:` by a re-scan that reuses the stored vectors (those rows get new
+  versions; vacuum large tables afterwards). Until a generation is complete, filtered, text and
   hybrid requests to it answer `503 search_index_building` with `Retry-After: 30`. Vector
   requests without a filter or tenant keep their results. `embedsync status` shows
   `search=building`, then `search=ready`.

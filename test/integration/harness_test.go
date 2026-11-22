@@ -817,23 +817,22 @@ type pipeCounts struct {
 	Extra          int `json:"extra"`
 	Stale          int `json:"stale"`
 	MetaStale      int `json:"meta_stale"`
-	TSVStale       int `json:"tsv_stale"`
 }
 
 type genReport struct {
-	Generation     string                `json:"generation"`
-	ExpectedChunks int                   `json:"expected_chunks"`
-	ActualChunks   int                   `json:"actual_chunks"`
-	Missing        int                   `json:"missing"`
-	Extra          int                   `json:"extra"`
-	Stale          int                   `json:"stale"`
-	Quarantined    int                   `json:"quarantined_keys"`
-	MissingQ       int                   `json:"missing_due_to_quarantine"`
-	Examples       []string              `json:"example_problems"`
-	MetaStale      int                   `json:"meta_stale"`
-	TSVStale       int                   `json:"tsv_stale"`
-	SearchBuilding bool                  `json:"search_columns_building"`
-	Pipelines      map[string]pipeCounts `json:"pipelines"`
+	Generation      string                `json:"generation"`
+	ExpectedChunks  int                   `json:"expected_chunks"`
+	ActualChunks    int                   `json:"actual_chunks"`
+	Missing         int                   `json:"missing"`
+	Extra           int                   `json:"extra"`
+	Stale           int                   `json:"stale"`
+	Quarantined     int                   `json:"quarantined_keys"`
+	MissingQ        int                   `json:"missing_due_to_quarantine"`
+	Examples        []string              `json:"example_problems"`
+	MetaStale       int                   `json:"meta_stale"`
+	FTSIndexMissing bool                  `json:"fts_index_missing"`
+	SearchBuilding  bool                  `json:"search_columns_building"`
+	Pipelines       map[string]pipeCounts `json:"pipelines"`
 }
 
 type stateCounts struct {
@@ -881,11 +880,11 @@ func (e *env) requireConsistent(label string) verifyReport {
 		e.t.Fatalf("%s: sink differs from source: %s", label, r)
 	}
 	for _, g := range r.Generations {
-		if g.MetaStale != 0 || g.TSVStale != 0 {
-			e.t.Fatalf("%s: generation %s has stale search columns (meta_stale=%d tsv_stale=%d): %s", label, g.Generation, g.MetaStale, g.TSVStale, r)
+		if g.MetaStale != 0 || g.FTSIndexMissing {
+			e.t.Fatalf("%s: generation %s has stale search columns (meta_stale=%d fts_index_missing=%v): %s", label, g.Generation, g.MetaStale, g.FTSIndexMissing, r)
 		}
-		e.t.Logf("%s: %s expected=%d actual=%d missing=%d extra=%d stale=%d meta_stale=%d tsv_stale=%d search_building=%v quarantined=%d (source rows %d)",
-			label, g.Generation, g.ExpectedChunks, g.ActualChunks, g.Missing, g.Extra, g.Stale, g.MetaStale, g.TSVStale, g.SearchBuilding, g.Quarantined, r.SourceRows)
+		e.t.Logf("%s: %s expected=%d actual=%d missing=%d extra=%d stale=%d meta_stale=%d fts_index_missing=%v search_building=%v quarantined=%d (source rows %d)",
+			label, g.Generation, g.ExpectedChunks, g.ActualChunks, g.Missing, g.Extra, g.Stale, g.MetaStale, g.FTSIndexMissing, g.SearchBuilding, g.Quarantined, r.SourceRows)
 		if len(g.Pipelines) > 1 {
 			for name, c := range g.Pipelines {
 				e.t.Logf("%s:   %s pipeline %s: source rows %d, chunks expected=%d actual=%d missing=%d extra=%d stale=%d",

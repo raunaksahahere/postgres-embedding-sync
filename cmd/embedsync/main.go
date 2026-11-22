@@ -542,15 +542,15 @@ func cmdVerify(ctx context.Context, args []string) error {
 			fmt.Printf("%s: chunks expected=%d actual=%d missing=%d extra=%d stale=%d quarantined_keys=%d\n",
 				g.Generation, g.ExpectedChunks, g.ActualChunks, g.Missing, g.Extra, g.Stale, g.Quarantined)
 			if g.SearchBuilding {
-				fmt.Printf("  search columns: building (meta/tsv not checked)\n")
+				fmt.Printf("  search columns: building (metadata and full-text index not checked)\n")
 			} else {
-				fmt.Printf("  search columns: meta_stale=%d tsv_stale=%d\n", g.MetaStale, g.TSVStale)
+				fmt.Printf("  search columns: meta_stale=%d fts_index_missing=%v\n", g.MetaStale, g.FTSIndexMissing)
 			}
 			if multi {
 				for _, p := range e.Cfg.PipelineNames() {
 					if c := g.Pipelines[p]; c != nil {
-						fmt.Printf("  pipeline %s: chunks expected=%d actual=%d missing=%d extra=%d stale=%d meta_stale=%d tsv_stale=%d\n",
-							p, c.ExpectedChunks, c.ActualChunks, c.Missing, c.Extra, c.Stale, c.MetaStale, c.TSVStale)
+						fmt.Printf("  pipeline %s: chunks expected=%d actual=%d missing=%d extra=%d stale=%d meta_stale=%d\n",
+							p, c.ExpectedChunks, c.ActualChunks, c.Missing, c.Extra, c.Stale, c.MetaStale)
 					}
 				}
 			}

@@ -191,27 +191,30 @@ a failover without synced slots, treat it as slot loss.
   supported.
 * **From v0.5.0 to search** (v0.6.0): stop `run`, install the new version, run
   `embedsync init --admin-url <admin URL>`, then start `run`. `init` applies
-  `sink/0005_search.sql` (adds the `meta` and `tsv` columns and GIN indexes to every chunk
-  table, and two generation columns). Nothing is re-embedded. Then `run` fills the search
-  columns in the background. Filtered, text and hybrid requests answer
+  `sink/0005_search.sql` (adds the `meta` column and its GIN index to every chunk table, and
+  two generation columns). Nothing is re-embedded. Then `run` builds the full-text index and
+  fills declared metadata in the background. Filtered, text and hybrid requests answer
   `503 search_index_building` until `embedsync status` shows `search=ready` for the serving
   generation. Vector requests without a filter keep working. Details: [search](search.md#upgrading-an-existing-installation).
 
 ## Search
 
-* **Search builder.** `run` fills the search columns (metadata and full-text) of every live
-  generation that lacks them for the current configuration: after the upgrade, and after a
-  change of a `metadata:` declaration or of `search.text_config`. Pipelines and views that
+* **Search builder.** `run` completes the search columns of every live generation that lacks
+  them for the current configuration: after the upgrade, and after a change of a `metadata:`
+  declaration or of `search.text_config`. Full text is an expression index on
+  `to_tsvector(<text_config>, content)`, built with `CREATE INDEX CONCURRENTLY` (writes go on;
+  no chunk row is rewritten, so the vector index is untouched). Pipelines and views that
   declare metadata are re-scanned from the source with their stored vectors, so nothing is
-  re-embedded. The full-text column is filled from stored content. The log line
+  re-embedded; their chunk rows are rewritten with the metadata (new row versions, so plan a
+  `VACUUM` afterwards on large tables). The log line
   `search columns ready: filtered, text and hybrid search enabled` marks the end.
 * **Readiness.** `embedsync status` prints `search=building` or `search=ready` on each
   generation line (`generations[].search` in `--json`). Until a generation is ready,
   filtered, text and hybrid requests to it get `503 search_index_building` with
   `Retry-After: 30`. Vector search without a filter or tenant is not affected.
-* **Verification.** `embedsync verify` reports `meta_stale` and `tsv_stale` per generation
-  and pipeline. While the builder runs it reports `search columns: building (meta/tsv not
-  checked)`.
+* **Verification.** `embedsync verify` reports `meta_stale` per generation and pipeline and
+  `fts_index_missing` per generation. While the builder runs it reports `search columns:
+  building (metadata and full-text index not checked)`.
 * **Tenant trust boundary.** With `search.tenant_filter`, the tenant comes from a request
   header that embedsync trusts as given. embedsync does not authenticate callers, and
   `/search` is served on the metrics listener (`metrics.listen`, default `:9187`) without

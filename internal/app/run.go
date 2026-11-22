@@ -871,9 +871,9 @@ func searchRescanPlan(cfg *config.Config) (map[string]bool, map[string][]string)
 // current configuration: after the upgrade that adds them, and after a
 // metadata declaration or the text search configuration changes. Only the
 // pipelines and views that declare metadata are re-scanned from the source
-// (reusing stored vectors, so nothing is re-embedded); the full-text column
-// is filled from stored content by the search builder, which also turns
-// filtered and hybrid search on when everything is complete. It runs before
+// (reusing stored vectors, so nothing is re-embedded); the full-text index
+// is built by the search builder, which also turns filtered and hybrid
+// search on when everything is complete. It runs before
 // the backfill runner starts, so an unfinished job of a re-scanned pipeline
 // can safely start over.
 func queueSearchRescans(ctx context.Context, e *Env) error {
@@ -901,18 +901,19 @@ func queueSearchRescans(ctx context.Context, e *Env) error {
 	return nil
 }
 
-// searchBuilder fills the full-text column of generations whose search
-// columns are being built, then marks them complete once no backfill that
-// could still write metadata remains. It also starts the build of a live
-// generation built for another configuration (e.g. created by `migrate`
-// with a different config file) once its own jobs are done.
+// searchBuilder completes the search columns of generations being built
+// for the current configuration: it builds the full-text expression index
+// concurrently (no row is rewritten, so the vector index is untouched),
+// clears metadata left from removed declarations, and marks the generation
+// complete once no backfill that could still write metadata remains. It
+// also starts the build of a live generation built for another
+// configuration (e.g. created by `migrate` with a different config file)
+// once its own jobs are done.
 type searchBuilder struct {
-	e        *Env
-	passDone map[string]bool // generation + fingerprint whose full-text pass finished cleanly
+	e *Env
 }
 
 func (b *searchBuilder) run(ctx context.Context) {
-	b.passDone = map[string]bool{}
 	for {
 		if err := b.step(ctx); err != nil && ctx.Err() == nil {
 			b.e.Log.Warn("search builder: will retry", "err", err)
@@ -952,31 +953,20 @@ func (b *searchBuilder) step(ctx context.Context) error {
 			}
 			continue // next step sees the new target
 		}
-		if !b.passDone[g.ID+"/"+fp] {
-			var cur []string
-			var changed, skipped int64
-			for ctx.Err() == nil {
-				next, n, sk, err := b.e.Store.FillSearchText(ctx, g, b.e.Cfg.Search.TextConfig, noMeta, cur, 500)
-				if err != nil {
-					return fmt.Errorf("fill full-text column of %s: %w", g.ID, err)
-				}
-				changed += n
-				skipped += sk
-				if next == nil {
-					break
-				}
-				cur = next
+		if err := b.e.Store.EnsureFTSIndex(ctx, g, b.e.Cfg.Search.TextConfig, b.e.Cfg.TextSearchExpr("content")); err != nil {
+			return fmt.Errorf("generation %s: %w", g.ID, err)
+		}
+		for ctx.Err() == nil {
+			n, more, err := b.e.Store.ClearStaleMeta(ctx, g, noMeta, 500)
+			if err != nil {
+				return fmt.Errorf("clear stale metadata of %s: %w", g.ID, err)
 			}
-			if ctx.Err() != nil {
-				return ctx.Err()
+			if !more {
+				break
 			}
-			if skipped > 0 {
-				// Rows a writer held were not examined: pass again.
-				b.e.Log.Debug("full-text pass skipped locked rows; repeating", "generation", g.ID, "skipped", skipped)
-				continue
+			if n == 0 {
+				return nil // rows held by a writer: retry next step
 			}
-			b.passDone[g.ID+"/"+fp] = true
-			b.e.Log.Info("full-text column filled", "generation", g.ID, "rows_updated", changed)
 		}
 		done, err := b.e.Store.CompleteSearch(ctx, g.ID, fp)
 		if err != nil {

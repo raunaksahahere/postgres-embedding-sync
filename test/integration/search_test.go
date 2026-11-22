@@ -395,6 +395,31 @@ func TestSearchFiltersHybridAcceptance(t *testing.T) {
 		}
 	}
 	checkOpenAPI(t, e)
+	// The text branch's expression is the one the full-text index is built on.
+	tx, err := e.admin.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(context.Background())
+	if _, err := tx.Exec(context.Background(), `SET LOCAL enable_seqscan = off`); err != nil {
+		t.Fatal(err)
+	}
+	var plan strings.Builder
+	rows, err := tx.Query(context.Background(), `EXPLAIN SELECT c.source_key FROM embedsync.chunks_v1 c, websearch_to_tsquery('simple'::regconfig, 'shared') q
+		WHERE to_tsvector('simple'::regconfig, c.content) @@ q`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rows.Next() {
+		var l string
+		rows.Scan(&l)
+		plan.WriteString(l + "\n")
+	}
+	rows.Close()
+	if !strings.Contains(plan.String(), "chunks_v1_fts_simple") {
+		t.Fatalf("text query does not use the full-text index:\n%s", plan.String())
+	}
+	tx.Rollback(context.Background())
 	e.requireConsistent("after metadata updates")
 }
 
@@ -510,13 +535,14 @@ func TestUpgradeFrom050BuildsSearchColumns(t *testing.T) {
 	queries := []string{"shared summit", "seed body word 7", "SKU-48213"}
 	golden := map[string]string{}
 	for _, q := range queries {
-		code, r := e.searchReq(http.MethodGet, "/search?q="+url.QueryEscape(q)+"&k=8", nil, nil)
+		code, r := e.searchReq(http.MethodGet, "/search?q="+url.QueryEscape(q)+"&k=8&exact=true", nil, nil)
 		if code != 200 || len(r.Hits) == 0 {
 			t.Fatalf("v0.5.0 search %q: %d %+v", q, code, r)
 		}
 		golden[q] = fmt.Sprint(r.Hits)
 	}
 	before := append(e.chunkRows("chunks_v1", "docs"), e.chunkRows("chunks_v1", "articles")...)
+	docsBefore := e.chunkRows("chunks_v1", "docs")
 	p.stop(t)
 
 	e.bin = binary
@@ -540,7 +566,7 @@ func TestUpgradeFrom050BuildsSearchColumns(t *testing.T) {
 			sawBuilding = true
 		}
 		for _, q := range queries {
-			code, g := e.searchReq(http.MethodGet, "/search?q="+url.QueryEscape(q)+"&k=8", nil, nil)
+			code, g := e.searchReq(http.MethodGet, "/search?q="+url.QueryEscape(q)+"&k=8&exact=true", nil, nil)
 			if code != 200 || fmt.Sprint(g.Hits) != golden[q] {
 				t.Fatalf("legacy GET %q changed during the upgrade: %d\n got  %v\n want %s", q, code, g.Hits, golden[q])
 			}
@@ -554,6 +580,14 @@ func TestUpgradeFrom050BuildsSearchColumns(t *testing.T) {
 	if n := e.docEmbedInputs() - embeds; n != 0 {
 		t.Fatalf("building the search columns embedded %d inputs", n)
 	}
+	// A pipeline without metadata is not touched at all (no row version,
+	// so no vector index entry, changes); full text is an expression index.
+	if got := e.chunkRows("chunks_v1", "docs"); fmt.Sprint(got) != fmt.Sprint(docsBefore) {
+		t.Fatal("the upgrade rewrote chunks of a pipeline without metadata")
+	}
+	if n := e.scalar(`SELECT count(*)::text FROM pg_indexes WHERE schemaname = 'embedsync' AND indexname = 'chunks_v1_fts_simple'`); n != "1" {
+		t.Fatalf("full-text index missing: %s", n)
+	}
 	after := append(e.chunkRows("chunks_v1", "docs"), e.chunkRows("chunks_v1", "articles")...)
 	if len(after) != len(before) {
 		t.Fatalf("chunks %d -> %d", len(before), len(after))
@@ -566,7 +600,7 @@ func TestUpgradeFrom050BuildsSearchColumns(t *testing.T) {
 	r := e.mustPost(map[string]any{"query": "shared", "k": 100, "mode": "hybrid", "exact": true, "filter": json.RawMessage(`{"field":"lang","op":"eq","value":"en"}`)}, nil)
 	sameSet(t, "filter after upgrade", r.keys(), e.sqlKeys("articles", `SELECT id::text FROM articles WHERE lang = 'en'`))
 	for _, q := range queries {
-		_, g := e.searchReq(http.MethodGet, "/search?q="+url.QueryEscape(q)+"&k=8", nil, nil)
+		_, g := e.searchReq(http.MethodGet, "/search?q="+url.QueryEscape(q)+"&k=8&exact=true", nil, nil)
 		if fmt.Sprint(g.Hits) != golden[q] {
 			t.Fatalf("legacy GET %q changed after the upgrade", q)
 		}
