@@ -189,7 +189,7 @@ a failover without synced slots, treat it as slot loss.
   recorded as built by the built-in embedder and keep serving; nothing is re-embedded. Until
   `init` runs, every command says the sink needs it. Downgrading after `init` is not
   supported.
-* **From v0.5.0 to search** (v0.6.0): stop `run`, install the new version, run
+* **From v0.5.0 to search** (v0.6.1): stop `run`, install the new version, run
   `embedsync init --admin-url <admin URL>`, then start `run`. `init` applies
   `sink/0005_search.sql` (adds the `meta` column and its GIN index to every chunk table, and
   two generation columns). Nothing is re-embedded. Then `run` builds the full-text index and

@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: embedsync HTTP API
-  version: 0.6.0
+  version: 0.6.1
   summary: Search, status and health endpoints served by embedsync on its metrics listener.
   description: |
     embedsync keeps pgvector embeddings in sync with PostgreSQL and serves vector, full-text and

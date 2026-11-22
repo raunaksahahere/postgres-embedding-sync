@@ -54,7 +54,7 @@ sudo installer -pkg "/Volumes/embedsync/Install embedsync.pkg" -target /
 **Debian / Ubuntu.**
 
 ```sh
-sudo apt install ./embedsync-0.6.0-minilm-linux-amd64.deb
+sudo apt install ./embedsync-0.6.1-minilm-linux-amd64.deb
 ```
 
 It installs to `/opt/embedsync` with `/usr/bin/embedsync`. The three variants are

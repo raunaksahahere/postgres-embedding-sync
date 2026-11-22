@@ -37,7 +37,7 @@ while serving searches.
 
 * Go service (pgx, pglogrepl), a local CPU embedding service (sentence-transformers, pinned
   revisions, no API key), PostgreSQL 16, 17 or 18 with pgvector.
-* Status: **v0.6.0**: filtered, full-text and hybrid search with metadata filters and tenant
+* Status: **v0.6.1**: filtered, full-text and hybrid search with metadata filters and tenant
   scope; embedding providers (OpenAI-compatible and Gemini endpoints, routed per
   generation); document views from related tables; several tables per process (pipelines);
   composite primary keys; single process. See [limitations](#limitations).

@@ -1,6 +1,13 @@
 # Changelog
 
-## v0.6.0
+## v0.6.1
+
+The first release of filtered and hybrid search. The `v0.6.0` tag was created but never
+released: its upgrade filled a full-text column by rewriting every existing chunk row, which
+re-inserted every vector into the HNSW index and could change approximate results after the
+upgrade. v0.6.1 indexes full text with a concurrently built expression index instead, so an
+upgrade rewrites no chunk of a pipeline without metadata. Upgrade from v0.5.0 directly to
+v0.6.1.
 
 Filtered, full-text and hybrid search: `/search` can rank by full-text match as well as by
 embedding, fuse both with reciprocal rank fusion, and restrict results by typed metadata
