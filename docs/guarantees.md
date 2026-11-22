@@ -29,6 +29,11 @@
 | Queries use the searched generation's provider across promotion and rollback | the generation records its provider and request settings; search embeds with that provider; the gate report names both providers | `TestCrossProviderMigrationGate` (promotion to a model served by the mock provider: search reports `mock`; a regressing candidate is rejected and serving is unchanged; rollback returns search to `local`; a continuous reader sees zero errors and zero wrong top-1 results; both generations stay in the rollback window; identity `mock/openai` recorded) |
 | Real endpoints use the same code path as the mock | the same code paths against real servers; each endpoint runs only when its environment variable is set and is reported as not verified otherwise | `TestRealProviderThroughput`, `TestRealCrossProviderMigration` (`RUN=TestReal scripts/test-integration.sh 17`), gated by `EMBEDSYNC_IT_CPU_EMBEDDER_URL`, `EMBEDSYNC_IT_GPU_OPENAI_URL`, `GEMINI_API_KEY`; run for the built-in CPU embedder, Ollama on an AMD GPU (ROCm) and the Gemini free tier, with the gate results in the README; OpenAI, NVIDIA, CUDA GPUs and paid tiers were not run |
 
+| Filters, text and hybrid search return exactly the matching documents | filters compile to bound parameters over the chunk metadata, one restriction per branch; missing fields fail every comparison except `not`; fused ranks follow RRF | `TestSearchFiltersHybridAcceptance` (every filter operator against SQL on the source: eq, ne, in, range, contains, exists, timestamps, `or`, `not` including documents without the field; an exact identifier first in text and hybrid; a paraphrase found only by the vector branch; a metadata-only update changes results with zero embedded inputs; the 400 and 404 error codes and fields; the response fields are checked against `api/openapi.yaml`); unit tests in `internal/filter` and `internal/search` |
+| A tenant never sees another tenant's chunks | the tenant predicate is added to every branch from the gateway header; a filter on the tenant field is refused | `TestSearchTenantScope` (missing header refused, forced on vector, text and hybrid, a client filter cannot widen it, a GET with the header sees only its own tenant, an unknown tenant sees nothing) |
+| A search answers from one generation and one snapshot | the generation and its encoder are pinned in one repeatable-read transaction; a promotion between embedding and querying re-embeds the query for the new generation | `TestSearchPinnedAcrossPromotion` (a pinned search and a fresh v1 search agree during a promotion); the hybrid branches share one transaction |
+| Upgrading a populated v0.5.0 installation builds the search columns without re-embedding | `init` applies `sink/0005_search.sql` (additive); `run` fills the columns from stored content and re-scans only pipelines and views with metadata, reusing stored vectors; filtered, text and hybrid requests answer `503 search_index_building` until ready | `TestUpgradeFrom050BuildsSearchColumns` (installation built by v0.5.0 with documents in two pipelines: legacy GET answers identically throughout, no input is embedded during the build, filtered requests answer 503 with `Retry-After` until ready, and the chunks keep their keys, fingerprints and vectors) |
+
 What is **not** guaranteed:
 
 * Search results are eventually consistent with the source: a committed row is
@@ -43,3 +48,11 @@ What is **not** guaranteed:
   tables: one level of children and links to one target table, within one tenant.
   There is no other join, and a table cannot be in two pipelines or views.
 * A view document that exceeds `max_children` is quarantined, not truncated.
+* Metadata changes are eventually consistent, like the text: a filter sees a changed value
+  after the same freshness latency. A generation whose search columns are not complete
+  refuses filtered, text and hybrid requests (503) rather than answering from partial
+  metadata.
+* Filtered vector search on pgvector older than 0.8 can return fewer than `k` hits
+  (`exact: false`); `exact: true` is exact at the cost of a sequential scan.
+* The tenant header is trusted, not verified. Protecting the tenant boundary is the
+  gateway's job, not embedsync's.

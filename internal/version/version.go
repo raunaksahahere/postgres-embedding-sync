@@ -3,4 +3,4 @@
 package version
 
 // Version is the embedsync release version.
-var Version = "0.5.0"
+var Version = "0.6.0"

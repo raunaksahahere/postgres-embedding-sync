@@ -580,7 +580,8 @@ func TestUpgradeFrom050BuildsSearchColumns(t *testing.T) {
 	if out, err := e.cli("init"); err != nil {
 		t.Fatalf("init adding metadata: %v %s", err, out)
 	}
-	p = e.start()
+	p2 := e.start()
+	defer p2.stop(t)
 	e.waitReady()
 	e.waitSearchReady()
 	r = e.mustPost(map[string]any{"query": "shared", "k": 100, "mode": "text", "filter": json.RawMessage(`{"field":"note","op":"eq","value":"hidden"}`)}, nil)

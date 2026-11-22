@@ -189,6 +189,42 @@ a failover without synced slots, treat it as slot loss.
   recorded as built by the built-in embedder and keep serving; nothing is re-embedded. Until
   `init` runs, every command says the sink needs it. Downgrading after `init` is not
   supported.
+* **From v0.5.0 to search** (v0.6.0): stop `run`, install the new version, run
+  `embedsync init --admin-url <admin URL>`, then start `run`. `init` applies
+  `sink/0005_search.sql` (adds the `meta` and `tsv` columns and GIN indexes to every chunk
+  table, and two generation columns). Nothing is re-embedded. Then `run` fills the search
+  columns in the background. Filtered, text and hybrid requests answer
+  `503 search_index_building` until `embedsync status` shows `search=ready` for the serving
+  generation. Vector requests without a filter keep working. Details: [search](search.md#upgrading-an-existing-installation).
+
+## Search
+
+* **Search builder.** `run` fills the search columns (metadata and full-text) of every live
+  generation that lacks them for the current configuration: after the upgrade, and after a
+  change of a `metadata:` declaration or of `search.text_config`. Pipelines and views that
+  declare metadata are re-scanned from the source with their stored vectors, so nothing is
+  re-embedded. The full-text column is filled from stored content. The log line
+  `search columns ready: filtered, text and hybrid search enabled` marks the end.
+* **Readiness.** `embedsync status` prints `search=building` or `search=ready` on each
+  generation line (`generations[].search` in `--json`). Until a generation is ready,
+  filtered, text and hybrid requests to it get `503 search_index_building` with
+  `Retry-After: 30`. Vector search without a filter or tenant is not affected.
+* **Verification.** `embedsync verify` reports `meta_stale` and `tsv_stale` per generation
+  and pipeline. While the builder runs it reports `search columns: building (meta/tsv not
+  checked)`.
+* **Tenant trust boundary.** With `search.tenant_filter`, the tenant comes from a request
+  header that embedsync trusts as given. embedsync does not authenticate callers, and
+  `/search` is served on the metrics listener (`metrics.listen`, default `:9187`) without
+  authentication. Expose that listener only to a gateway that authenticates the caller and
+  overwrites the tenant header on every request. Requests without the header are refused
+  (`400 tenant_required`).
+* **Snapshot pinning.** Each request reads one generation in one repeatable-read
+  transaction. A promotion or rollback during a request is seen as a whole: the query is
+  re-embedded with the newly serving encoder, and every branch of a hybrid request reads the
+  same snapshot. A request that names a `generation` never changes generation.
+* **pgvector version.** Filtered vector search needs pgvector 0.8 or later (iterative index
+  scan). On an older version, a selective filter can return fewer than `k` hits. `exact: true`
+  is the workaround for a single request.
 
 ## Models: download, cache, offline
 

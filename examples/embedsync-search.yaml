@@ -1,0 +1,71 @@
+# Filtered, full-text and hybrid search over one table. Everything outside
+# `pipelines:` and `search:` works exactly as in examples/embedsync-multi.yaml
+# (see the comments there). See docs/search.md for the filter language, the
+# modes and the upgrade steps.
+#
+# Setup against the seeded table:
+#   psql "$SOURCE_DSN" -f examples/seed-search.sql     # the source database
+#   embedsync init --admin-url "$ADMIN_DSN"
+#   embedsync run
+#   embedsync search --mode hybrid --filter '{"field":"lang","op":"eq","value":"en"}' "order reference"
+
+source:
+  dsn_env: EMBEDSYNC_SOURCE_DSN
+  publication: embedsync_pub
+  slot: embedsync_slot
+  control_schema: embedsync_control
+
+sink:
+  dsn_env: EMBEDSYNC_SINK_DSN
+  reader_dsn_env: EMBEDSYNC_READER_DSN
+  schema: embedsync
+  reader_role: embedsync_reader
+
+transform:
+  template: "{{.title}}\n\n{{.body}}"
+  chunk_words: 160
+  chunk_overlap: 24
+
+pipelines:
+  - name: articles
+    table: public.articles
+    key: id
+    fields:                              # only these columns are embedded and published
+      - { name: title, column: title }
+      - { name: body,  column: body }
+    # Metadata columns are stored with every chunk and can be filtered on.
+    # They are not embedded: changing one never re-embeds the document.
+    # `internal` is deliberately not declared and never leaves the source.
+    metadata:
+      - { name: lang,      column: lang,      type: text }
+      - { name: year,      column: year,      type: int }
+      - { name: tags,      column: tags,      type: text_array }
+      - { name: published, column: published, type: timestamp }
+      - { name: org,       column: org,       type: text }
+      - { name: rating,    column: rating,    type: float }
+      - { name: featured,  column: featured,  type: bool }
+
+embedder:
+  url: http://embedder:8000
+  url_env: EMBEDSYNC_EMBEDDER_URL
+
+models:
+  minilm:
+    name: sentence-transformers/all-MiniLM-L6-v2
+    revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+    dimension: 384
+    distance: cosine
+
+initial_generation: minilm
+
+# Search settings. text_config and rrf_k may be omitted; these are the defaults.
+search:
+  # Text search configuration of the full-text branch. `simple` does not stem
+  # words, so identifiers such as SKU-48213 match exactly. `english` stems.
+  text_config: simple
+  # Reciprocal rank fusion constant for hybrid mode (1 to 1000).
+  rrf_k: 60
+  # Multi-tenant deployments: a trusted gateway sets the header, and every
+  # request is restricted to the tenant's rows. Requests without the header
+  # are refused (400 tenant_required). embedsync does not authenticate callers.
+  # tenant_filter: {field: org, header: X-Tenant-ID}

@@ -37,9 +37,10 @@ while serving searches.
 
 * Go service (pgx, pglogrepl), a local CPU embedding service (sentence-transformers, pinned
   revisions, no API key), PostgreSQL 16, 17 or 18 with pgvector.
-* Status: **v0.5.0**: embedding providers (OpenAI-compatible and Gemini endpoints, routed per
-  generation), document views from related tables, several tables per process (pipelines),
-  composite primary keys, single process. See [limitations](#limitations).
+* Status: **v0.6.0**: filtered, full-text and hybrid search with metadata filters and tenant
+  scope; embedding providers (OpenAI-compatible and Gemini endpoints, routed per
+  generation); document views from related tables; several tables per process (pipelines);
+  composite primary keys; single process. See [limitations](#limitations).
 
 ```mermaid
 flowchart LR
@@ -119,6 +120,7 @@ Each row is covered by a named integration test against real PostgreSQL 16, 17 a
 | 📦 | **Install and run** | Windows, macOS and Debian/Ubuntu installers with the embedding service inside; `embedsync setup` walks you through it. |
 | 📈 | **Observable** | Prometheus metrics, a Grafana dashboard, alert rules, `embedsync status` and a runbook ([operations](docs/operations.md)). |
 | 🔌 | **No API key** | A local CPU embedder with pinned model revisions; any sentence-transformers model works. |
+| 🔎 | **Filtered and hybrid search** | Vector, full-text or hybrid (reciprocal rank fusion) search, restricted by typed metadata filters, pipelines and a gateway-set tenant ([search](docs/search.md)). |
 
 ## Install
 
@@ -548,6 +550,49 @@ Metrics: `embedsync_provider_requests_total`, `embedsync_provider_request_second
 `embedsync doctor` check reports each provider's kind, its estimated price, and whether its
 API key variable is set (the endpoint itself is not called).
 
+## Filtered and hybrid search
+
+Declare the columns you want to filter on under `metadata:` (typed `text`, `int`, `float`,
+`bool`, `timestamp` or `text_array`). They are stored with every chunk and never embedded, so
+changing one does not re-embed the document. Then a request can combine the three modes with a
+filter:
+
+```sh
+# Hybrid search: vector and full-text branches fused with reciprocal rank fusion
+curl -s http://127.0.0.1:9187/search -H 'Content-Type: application/json' -d '{
+  "query": "how do I rotate credentials",
+  "k": 5,
+  "mode": "hybrid",
+  "pipelines": ["docs", "kb"],
+  "filter": {"and": [
+    {"field": "lang", "op": "eq", "value": "en"},
+    {"field": "year", "op": "range", "gte": 2020, "lt": 2025}
+  ]}
+}'
+
+# An exact identifier through the full-text branch
+curl -s http://127.0.0.1:9187/search -H 'Content-Type: application/json' \
+  -d '{"query": "SKU-48213", "k": 3, "mode": "text"}'
+```
+
+Each hit carries `ranks` in hybrid mode (its rank in each branch that returned it). A tenant
+gateway can force a tenant predicate on every branch with `search.tenant_filter`; the header
+must be set by a trusted gateway, because embedsync does not authenticate callers.
+
+Errors are typed: `400` (`invalid_filter`, `unknown_field`, `invalid_value`, `unsupported_op`,
+`too_complex`, `invalid_request`, `tenant_required`, `tenant_filter_forbidden`), `404`
+(`unknown_generation`, `unknown_pipeline`), `503` (`search_index_building` with `Retry-After`
+while an upgrade or metadata change is being indexed; vector search without filters keeps working).
+
+[`docs/search.md`](docs/search.md) has the modes and the RRF formula, the filter language with
+the semantics of missing fields, the tenant trust boundary, the consistency rules, the error
+table and the upgrade steps. The request and response schema is in
+[`api/openapi.yaml`](api/openapi.yaml). A runnable configuration and sample data are in
+[`examples/embedsync-search.yaml`](examples/embedsync-search.yaml) and
+[`examples/seed-search.sql`](examples/seed-search.sql). LangChain and LlamaIndex retrievers over
+`POST /search` are in [`examples/langchain`](examples/langchain/README.md) and
+[`examples/llamaindex`](examples/llamaindex/README.md).
+
 ## Commands
 
 
@@ -562,7 +607,7 @@ API key variable is set (the endpoint itself is not called).
 | `embedsync status [--json]` | checkpoint, slot and retained WAL, generations, DLQ, migrations |
 | `embedsync migrate --to <model> [--gate-only] [--restart]` | build, gate and promote a generation |
 | `embedsync migrate status \| rollback \| finalize [--force]` | inspect gates, roll back, retire |
-| `embedsync search [--k N] [--generation G] [--exact] <query>` | pinned search |
+| `embedsync search [--k N] [--generation G] [--exact] [--mode vector\|text\|hybrid] [--filter JSON] [--pipeline P,Q] [--tenant T] <query>` | pinned search |
 | `embedsync verify [--timeout D]` | full sink-vs-source comparison (exit 4 on differences) |
 | `embedsync dlq list \| inspect --id N \| replay [--id N]` | quarantined rows |
 | `embedsync rebuild --confirm` | recover from slot loss into a fresh generation |
@@ -611,8 +656,8 @@ Postgres tables into pgvector with transactional guarantees.
   key columns are int, text or uuid. A pipeline's document comes from one row. A view
   assembles one document from a root table, one level of children and links to one
   target table each, all scoped to a tenant column; no deeper nesting, no joins across
-  tenants, no table shared by two pipelines or views, no arbitrary SQL joins. No hybrid
-  (lexical) search, no external vector stores. A pipeline's table
+  tenants, no table shared by two pipelines or views, no arbitrary SQL joins. No external
+  vector stores. A pipeline's table
   and key cannot change in place, and removing a pipeline needs a new sink schema.
 * Throughput is bounded by the embedding model (~70 short documents/s for
   all-MiniLM-L6-v2 on the benchmark laptop with the built-in embedder; measured GPU and
@@ -638,6 +683,7 @@ Postgres tables into pgvector with transactional guarantees.
 | 🚀 [Install guide](docs/install.md) | Installers, variants, first run, uninstall, CLI-only archives |
 | 🧱 [Architecture](docs/architecture.md) | Data path, idle vs. stalled, watermark backfill, generations, failure handling, code map |
 | 🛡️ [Guarantees](docs/guarantees.md) | What is promised, the mechanism, and the test that tries to break it |
+| 🔎 [Search](docs/search.md) | Vector, text and hybrid modes, metadata filters, tenant scope, errors, upgrade of the search columns |
 | 🧯 [Operations](docs/operations.md) | Roles and least privilege, retained WAL and alerts, pauses, DLQ, slot loss, upgrades |
 | 📊 [Evaluation](docs/evaluation.md) | Methodology for the freshness, outage and SciFact migration results |
 | 🧭 [Changelog](CHANGELOG.md) | Release history |

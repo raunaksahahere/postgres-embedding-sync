@@ -6,7 +6,7 @@ RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 COPY migrations ./migrations
-ARG VERSION=0.5.0
+ARG VERSION=0.6.0
 RUN CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X github.com/raunaksahahere/postgres-embedding-sync/internal/version.Version=${VERSION}" \
     -o /out/embedsync ./cmd/embedsync
 

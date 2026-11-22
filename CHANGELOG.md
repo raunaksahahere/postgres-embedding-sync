@@ -1,5 +1,86 @@
 # Changelog
 
+## v0.6.0
+
+Filtered, full-text and hybrid search: `/search` can rank by full-text match as well as by
+embedding, fuse both with reciprocal rank fusion, and restrict results by typed metadata
+and by a tenant from a trusted gateway. Design and examples: [docs/search.md](docs/search.md).
+
+### Added
+
+* **Modes**: `mode` selects `vector` (default, unchanged), `text` (PostgreSQL full-text search,
+  `websearch_to_tsquery` over `search.text_config`, no embedding call) or `hybrid` (both
+  branches fused with reciprocal rank fusion, `score = sum of 1 / (rrf_k + rank)`, default
+  `rrf_k` 60 from `search.rrf_k`, overridable per request). Hybrid hits report `ranks`, their
+  rank in each branch that returned them.
+* **Metadata**: `metadata:` on a pipeline or view declares filterable columns (`text`, `int`,
+  `float`, `bool`, `timestamp`, `text_array`). Metadata is stored with every chunk and is not
+  embedded: changing it never re-embeds a document.
+* **Filters**: a recursive `filter` (`and`, `or`, `not` and the conditions `eq`, `ne`, `in`,
+  `range`, `contains`, `exists`), in the POST body or the URL-encoded `filter` parameter of GET.
+  A missing field fails every comparison, `ne` included; `not` of a condition matches documents
+  without the field.
+* **Pipeline restriction**: `pipelines` (POST) and `pipeline` (GET, comma-separated).
+* **Tenant scope**: `search.tenant_filter: {field, header}` adds `<field> eq <header>` to every
+  branch. Requests without the header get `400 tenant_required`; a filter on the tenant field gets
+  `400 tenant_filter_forbidden`. embedsync does not authenticate callers: the header must be set by
+  a gateway.
+* **Configuration**: `search.text_config` (default `simple`) and `search.rrf_k` (default 60).
+* **CLI**: `embedsync search` gains `--mode`, `--filter`, `--pipeline` and `--tenant`.
+* **Status**: each generation reports `search` (`building` or `ready`) in `embedsync status`
+  (text and `--json`, field `generations[].search`). `embedsync verify` reports
+  `meta_stale` and `tsv_stale` per generation and pipeline.
+* **Schema**: `sink/0005_search.sql` adds `meta` (jsonb) and `tsv` (tsvector) with GIN indexes
+  to every chunk table, and `search_target` and `search_fingerprint` to `generations`.
+* **Examples and docs**: `examples/embedsync-search.yaml` and `examples/seed-search.sql`,
+  `docs/search.md`, and the search section of the README. The LangChain and LlamaIndex
+  retrievers take `mode`, `pipelines`, `filter` and `headers`.
+* **Error bodies**: `/search` errors are JSON `{error, code, field}`. The codes are listed in
+  [docs/search.md](docs/search.md#errors) and in [`api/openapi.yaml`](api/openapi.yaml).
+
+### Changed
+
+* **`/search` errors**: client errors are now `400` (invalid request, filter or tenant),
+  `404` (unknown generation or pipeline), `405` (method other than GET or POST) and `413`
+  (POST body over 1 MiB). Previously every failure was `503`. `503` is kept for `search_index_building` (with `Retry-After`) and
+  for backend failures.
+* **POST /search** takes a JSON body. A POST that sends the legacy query string (`?q=`) without
+  a JSON content type is still answered as before.
+* **Responses**: every `/search` response carries `mode`. Hybrid hits carry `ranks`. Other
+  fields are unchanged.
+* **Snapshot metadata**: metadata columns are read during a snapshot with their type's output
+  function, the same text the replication stream sends (`bool` is `t` or `f`, not the output of
+  an explicit cast). A backfill and the stream therefore store identical metadata.
+* **Metadata validation**: `run` checks each metadata column against its declared type when it
+  starts (`float` accepts integer columns; `text` accepts any column).
+
+### Upgrade notes
+
+* Stop `embedsync run`, install the new version, run `embedsync init --admin-url <admin URL>`
+  (or the admin DSN variables), then start `run`. `init` applies `sink/0005_search.sql`: it adds
+  the columns and indexes above and changes nothing else. Nothing is re-embedded. Adding the
+  columns is instant; building the two GIN indexes reads each chunk table once and blocks writes
+  to it meanwhile (reads, including search, continue), which is why `run` is stopped for `init`.
+* After the upgrade, `run` fills the search columns in the background: the full-text column from
+  the stored content, and the metadata of pipelines and views that declare `metadata:` by a
+  re-scan that reuses the stored vectors. Until a generation is complete, filtered, text and
+  hybrid requests to it answer `503 search_index_building` with `Retry-After: 30`. Vector
+  requests without a filter or tenant keep their results. `embedsync status` shows
+  `search=building`, then `search=ready`.
+* Changing a `metadata:` declaration or `search.text_config` starts the same background rebuild
+  for each live generation.
+* Downgrading after `init` is not supported.
+
+### Compatibility
+
+* Legacy `GET /search?q=&k=&generation=&exact=` is unchanged: the same hits, the same fields,
+  and an out-of-range `k` still falls back to 10 on GET.
+* Clients that treated every `/search` failure as a transient `503` must handle `400`, `404`
+  and `405`.
+* Filtered vector search uses pgvector's iterative index scan, which needs pgvector 0.8.0 or
+  later. On an older pgvector a filtered request can return fewer than `k` hits with
+  `exact: false`; `exact: true` scans the table instead.
+
 ## v0.5.0
 
 Embedding providers: a model can be embedded by an OpenAI-compatible endpoint or the

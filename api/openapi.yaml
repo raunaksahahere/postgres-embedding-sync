@@ -81,6 +81,7 @@ paths:
                   $ref: '#/components/examples/LegacyVectorResponse'
         '400': {$ref: '#/components/responses/BadRequest'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '405': {$ref: '#/components/responses/MethodNotAllowed'}
         '503': {$ref: '#/components/responses/Unavailable'}
     post:
       tags: [search]
@@ -118,7 +119,7 @@ paths:
                   mode: hybrid
                   filter: {field: tags, op: contains, value: finance}
               invalidFilter:
-                summary: A request whose filter is rejected with 400 invalid_filter
+                summary: A request whose filter is rejected with 400 unsupported_op
                 value:
                   query: anything
                   filter: {field: year, op: between, value: 2020}
@@ -133,6 +134,8 @@ paths:
                   $ref: '#/components/examples/HybridResponse'
         '400': {$ref: '#/components/responses/BadRequest'}
         '404': {$ref: '#/components/responses/NotFound'}
+        '413': {$ref: '#/components/responses/TooLarge'}
+        '405': {$ref: '#/components/responses/MethodNotAllowed'}
         '503': {$ref: '#/components/responses/Unavailable'}
   /status:
     get:
@@ -210,14 +213,26 @@ components:
           schema: {$ref: '#/components/schemas/Error'}
           examples:
             invalidFilter:
-              summary: Invalid filter
-              value: {error: 'filter: unknown op "between" for field "year"', code: invalid_filter, field: year}
+              summary: Unknown filter operator
+              value: {error: 'unsupported_op: field "year": unknown op "between"', code: unsupported_op, field: year}
             unknownField:
               summary: Field not declared in the pipeline metadata
-              value: {error: 'filter: unknown field "colour"', code: unknown_field, field: colour}
+              value: {error: 'unknown_field: field "colour": field is not declared', code: unknown_field, field: colour}
             tenantRequired:
               summary: Tenant header missing
-              value: {error: 'missing tenant header X-Tenant-ID', code: tenant_required}
+              value: {error: 'the X-Tenant-ID header is required (it must be set by the gateway)', code: tenant_required, field: X-Tenant-ID}
+    MethodNotAllowed:
+      description: Only GET and POST are accepted.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {error: 'use GET or POST', code: method_not_allowed}
+    TooLarge:
+      description: The request body exceeds 1 MiB.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {error: 'request body exceeds 1048576 bytes', code: body_too_large}
     NotFound:
       description: Unknown generation or pipeline.
       content:
@@ -480,10 +495,13 @@ components:
             - unknown_pipeline
             - search_index_building
             - backend
+            - method_not_allowed
+            - body_too_large
           description: |
             400: invalid_filter, unknown_field, invalid_value, unsupported_op, too_complex,
             invalid_request, tenant_required, tenant_filter_forbidden.
-            404: unknown_generation, unknown_pipeline. 503: search_index_building, backend.
+            404: unknown_generation, unknown_pipeline. 405: method_not_allowed.
+            413: body_too_large. 503: search_index_building, backend.
         field: {type: string, description: Offending filter field, when applicable.}
     StatusReport:
       type: object
