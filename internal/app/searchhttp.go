@@ -3,6 +3,7 @@ package app
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -53,7 +54,13 @@ const maxSearchBody = 1 << 20
 // mode, pipeline, filter, rrf_k) and POST /search (a JSON body).
 func serveSearch(w http.ResponseWriter, r *http.Request, s *search.Searcher, tf *config.TenantFilter) {
 	var body searchBody
-	switch r.Method {
+	method := r.Method
+	// Before v0.6.0 every method took the query string; a POST that still
+	// sends one (and no JSON body) keeps doing so.
+	if method == http.MethodPost && r.URL.Query().Has("q") && !strings.HasPrefix(r.Header.Get("Content-Type"), "application/json") {
+		method = http.MethodGet
+	}
+	switch method {
 	case http.MethodGet, http.MethodHead:
 		q := r.URL.Query()
 		body.Query = q.Get("q")
@@ -79,9 +86,23 @@ func serveSearch(w http.ResponseWriter, r *http.Request, s *search.Searcher, tf 
 			body.RRFK = n
 		}
 	case http.MethodPost:
-		dec := json.NewDecoder(io.LimitReader(r.Body, maxSearchBody))
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxSearchBody))
 		dec.DisallowUnknownFields()
-		if err := dec.Decode(&body); err != nil {
+		err := dec.Decode(&body)
+		if err == nil && dec.More() {
+			err = errors.New("unexpected data after the JSON object")
+		}
+		if err == nil {
+			if _, terr := dec.Token(); terr != io.EOF {
+				err = errors.New("unexpected data after the JSON object")
+			}
+		}
+		if err != nil {
+			var mb *http.MaxBytesError
+			if errors.As(err, &mb) {
+				writeSearchError(w, &search.Error{Status: http.StatusRequestEntityTooLarge, Code: "body_too_large", Message: fmt.Sprintf("request body exceeds %d bytes", maxSearchBody)})
+				return
+			}
 			field := ""
 			var te *json.UnmarshalTypeError
 			if errors.As(err, &te) {

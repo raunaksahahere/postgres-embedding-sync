@@ -849,6 +849,23 @@ func warnMovedEndpoints(e *Env, gens []*store.Generation) {
 	}
 }
 
+// searchRescanPlan is what a search column rebuild re-scans from the
+// source: the document pipelines and views that declare metadata, and each
+// view's component tables.
+func searchRescanPlan(cfg *config.Config) (map[string]bool, map[string][]string) {
+	rescan := map[string]bool{}
+	for _, n := range cfg.DocNames() {
+		rescan[n] = len(cfg.MetaFor(n)) > 0
+	}
+	views := map[string][]string{}
+	for _, v := range cfg.Views {
+		for _, c := range v.Components() {
+			views[v.Name] = append(views[v.Name], c.Def.Name)
+		}
+	}
+	return rescan, views
+}
+
 // queueSearchRescans starts building the search columns (metadata and
 // full-text) of every live generation that does not have them for the
 // current configuration: after the upgrade that adds them, and after a
@@ -856,7 +873,9 @@ func warnMovedEndpoints(e *Env, gens []*store.Generation) {
 // pipelines and views that declare metadata are re-scanned from the source
 // (reusing stored vectors, so nothing is re-embedded); the full-text column
 // is filled from stored content by the search builder, which also turns
-// filtered and hybrid search on when everything is complete.
+// filtered and hybrid search on when everything is complete. It runs before
+// the backfill runner starts, so an unfinished job of a re-scanned pipeline
+// can safely start over.
 func queueSearchRescans(ctx context.Context, e *Env) error {
 	if _, err := e.Store.Pool.Exec(ctx, `SELECT $1::text::regconfig`, e.Cfg.Search.TextConfig); err != nil {
 		return fmt.Errorf("search.text_config %q is not a text search configuration in the sink database: %w", e.Cfg.Search.TextConfig, err)
@@ -866,21 +885,12 @@ func queueSearchRescans(ctx context.Context, e *Env) error {
 		return err
 	}
 	fp := e.Cfg.SearchFingerprint()
-	rescan := map[string]bool{}
-	for _, n := range e.Cfg.DocNames() {
-		rescan[n] = len(e.Cfg.MetaFor(n)) > 0
-	}
-	views := map[string][]string{}
-	for _, v := range e.Cfg.Views {
-		for _, c := range v.Components() {
-			views[v.Name] = append(views[v.Name], c.Def.Name)
-		}
-	}
+	rescan, views := searchRescanPlan(e.Cfg)
 	for _, g := range gens {
 		if !store.IsLive(g.State) && g.State != store.StatePending {
 			continue
 		}
-		queued, err := e.Store.QueueSearchRescan(ctx, g, fp, rescan, views)
+		queued, err := e.Store.QueueSearchRescan(ctx, g, fp, rescan, views, true)
 		if err != nil {
 			return fmt.Errorf("queue search re-scan of %s: %w", g.ID, err)
 		}
@@ -893,17 +903,19 @@ func queueSearchRescans(ctx context.Context, e *Env) error {
 
 // searchBuilder fills the full-text column of generations whose search
 // columns are being built, then marks them complete once no backfill that
-// could still write metadata remains.
+// could still write metadata remains. It also starts the build of a live
+// generation built for another configuration (e.g. created by `migrate`
+// with a different config file) once its own jobs are done.
 type searchBuilder struct {
 	e        *Env
-	passDone map[string]bool // generation + fingerprint whose full-text pass finished
+	passDone map[string]bool // generation + fingerprint whose full-text pass finished cleanly
 }
 
 func (b *searchBuilder) run(ctx context.Context) {
 	b.passDone = map[string]bool{}
 	for {
 		if err := b.step(ctx); err != nil && ctx.Err() == nil {
-			b.e.Log.Debug("search builder", "err", err)
+			b.e.Log.Warn("search builder: will retry", "err", err)
 		}
 		select {
 		case <-ctx.Done():
@@ -926,18 +938,30 @@ func (b *searchBuilder) step(ctx context.Context) error {
 		}
 	}
 	for _, g := range gens {
-		if !store.IsLive(g.State) || g.SearchTarget != fp || g.SearchFingerprint == fp {
+		if !store.IsLive(g.State) || g.SearchFingerprint == fp {
 			continue
+		}
+		if g.SearchTarget != fp {
+			rescan, views := searchRescanPlan(b.e.Cfg)
+			queued, err := b.e.Store.QueueSearchRescan(ctx, g, fp, rescan, views, false)
+			if err != nil {
+				return fmt.Errorf("queue search re-scan of %s: %w", g.ID, err)
+			}
+			if queued {
+				b.e.Log.Info("building search columns (metadata, full text) in the background; vector search is unaffected", "generation", g.ID)
+			}
+			continue // next step sees the new target
 		}
 		if !b.passDone[g.ID+"/"+fp] {
 			var cur []string
-			var changed int64
+			var changed, skipped int64
 			for ctx.Err() == nil {
-				next, n, err := b.e.Store.FillSearchText(ctx, g, b.e.Cfg.Search.TextConfig, noMeta, cur, 500)
+				next, n, sk, err := b.e.Store.FillSearchText(ctx, g, b.e.Cfg.Search.TextConfig, noMeta, cur, 500)
 				if err != nil {
 					return fmt.Errorf("fill full-text column of %s: %w", g.ID, err)
 				}
 				changed += n
+				skipped += sk
 				if next == nil {
 					break
 				}
@@ -945,6 +969,11 @@ func (b *searchBuilder) step(ctx context.Context) error {
 			}
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			if skipped > 0 {
+				// Rows a writer held were not examined: pass again.
+				b.e.Log.Debug("full-text pass skipped locked rows; repeating", "generation", g.ID, "skipped", skipped)
+				continue
 			}
 			b.passDone[g.ID+"/"+fp] = true
 			b.e.Log.Info("full-text column filled", "generation", g.ID, "rows_updated", changed)

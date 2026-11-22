@@ -558,7 +558,7 @@ func (e *env) chunkRows(table, pipelineFilter string) []chunkRow {
 	if pipelineFilter != "" {
 		q += ` WHERE pipeline = '` + pipelineFilter + `'`
 	}
-	rows, err := e.admin.Query(context.Background(), q+` ORDER BY source_key, chunk_no`)
+	rows, err := e.admin.Query(context.Background(), q+` ORDER BY pipeline, source_key, chunk_no`)
 	if err != nil {
 		e.t.Fatal(err)
 	}

@@ -120,7 +120,7 @@ func (e *env) searchReq(method, path string, body any, headers map[string]string
 		rd = bytes.NewReader(j)
 	}
 	req, _ := http.NewRequest(method, fmt.Sprintf("http://127.0.0.1:%d%s", e.port, path), rd)
-	if method == http.MethodPost {
+	if method == http.MethodPost && rd.Len() > 0 {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	for k, v := range headers {
@@ -329,6 +329,11 @@ func TestSearchFiltersHybridAcceptance(t *testing.T) {
 		if _, ok := g.raw[k]; !ok {
 			t.Fatalf("legacy response lost %q", k)
 		}
+	}
+	// A pre-v0.6.0 client POSTing the query string still gets vector search.
+	code, lp := e.searchReq(http.MethodPost, "/search?q="+url.QueryEscape("shared summit")+"&k=7", "", nil)
+	if code != 200 || fmt.Sprint(lp.Hits) != fmt.Sprint(pv.Hits) {
+		t.Fatalf("legacy POST with query string: %d %+v", code, lp)
 	}
 	// GET takes the new parameters too.
 	code, g = e.searchReq(http.MethodGet, "/search?q=shared&k=100&mode=text&pipeline=articles&filter="+url.QueryEscape(`{"field":"lang","op":"eq","value":"de"}`), nil, nil)

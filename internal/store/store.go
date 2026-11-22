@@ -862,75 +862,104 @@ func (g *Generation) SearchReady(fp string) bool { return g.SearchFingerprint ==
 // pipelines and views in rescan, the ones declaring metadata (embed jobs,
 // which reuse stored vectors; for a view, state jobs for its tables listed
 // in views, then a render job). The full-text column needs no re-scan: the
-// search builder fills it from the stored content. Returns false if fp is
-// already built or being built.
-func (s *Store) QueueSearchRescan(ctx context.Context, g *Generation, fp string, rescan map[string]bool, views map[string][]string) (bool, error) {
+// search builder fills it from the stored content.
+//
+// A job already pending or running for the same pipeline would otherwise
+// absorb the re-scan and resume from its cursor, leaving the rows behind it
+// with old metadata. With restart (only while no backfill runs, at startup)
+// such a job starts over from the beginning; without it nothing is queued
+// and (false, nil) is returned so the caller retries once the job is done.
+// Returns false as well if fp is already built or being built.
+func (s *Store) QueueSearchRescan(ctx context.Context, g *Generation, fp string, rescan map[string]bool, views map[string][]string, restart bool) (bool, error) {
 	if g.SearchFingerprint == fp || g.SearchTarget == fp {
 		return false, nil
 	}
+	errBusy := errors.New("busy")
 	err := pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `UPDATE `+s.T("generations")+` SET search_target = $2 WHERE id = $1`, g.ID, fp); err != nil {
 			return err
+		}
+		onConflict := `DO NOTHING`
+		if restart {
+			onConflict = `DO UPDATE SET last_key = NULL, updated_at = now()`
+		}
+		queue := func(q string, args ...any) error {
+			tag, err := tx.Exec(ctx, q+` `+onConflict, args...)
+			if err != nil {
+				return err
+			}
+			if tag.RowsAffected() == 0 {
+				return errBusy
+			}
+			return nil
 		}
 		for _, p := range g.PipelineNames() {
 			if !rescan[p] {
 				continue
 			}
 			kind := g.Pipelines[p].jobKind()
-			if comps, ok := views[p]; ok {
-				for _, c := range comps {
-					if _, err := tx.Exec(ctx, `INSERT INTO `+s.T("backfill_jobs")+` (generation_id, pipeline, kind, state) VALUES (NULL, $1, 'state', 'pending')
-						ON CONFLICT (pipeline) WHERE kind = 'state' AND state IN ('pending','running') DO NOTHING`, c); err != nil {
-						return err
-					}
+			for _, c := range views[p] {
+				if err := queue(`INSERT INTO `+s.T("backfill_jobs")+` (generation_id, pipeline, kind, state) VALUES (NULL, $1, 'state', 'pending')
+					ON CONFLICT (pipeline) WHERE kind = 'state' AND state IN ('pending','running')`, c); err != nil {
+					return err
 				}
 			}
-			if _, err := tx.Exec(ctx, `INSERT INTO `+s.T("backfill_jobs")+` (generation_id, pipeline, kind, state) VALUES ($1, $2, $3, 'pending')
-				ON CONFLICT (generation_id, pipeline) WHERE state IN ('pending','running') DO NOTHING`, g.ID, p, kind); err != nil {
+			if err := queue(`INSERT INTO `+s.T("backfill_jobs")+` (generation_id, pipeline, kind, state) VALUES ($1, $2, $3, 'pending')
+				ON CONFLICT (generation_id, pipeline) WHERE state IN ('pending','running')`, g.ID, p, kind); err != nil {
 				return err
 			}
 		}
 		return nil
 	})
+	if errors.Is(err, errBusy) {
+		return false, nil
+	}
 	return err == nil, err
 }
 
 // FillSearchText brings a generation's full-text column (and the metadata of
-// pipelines that declare none, which must be empty) up to date for rows
-// after the cursor (pipeline, source_key, chunk_no), at most limit rows. It
-// computes from each row's own stored content, so it is safe alongside the
-// committer: a row it waits for is re-evaluated at its new version. It
-// returns the last row examined (nil when the table is exhausted) and the
-// number of rows changed. Nothing else on the row changes.
-func (s *Store) FillSearchText(ctx context.Context, g *Generation, textConfig string, noMeta []string, after []string, limit int) ([]string, int64, error) {
+// pipelines that declare none, which must be empty) up to date for the next
+// limit rows after the cursor (pipeline, source_key, chunk_no), in primary
+// key order. It computes from each row's own stored content and changes
+// nothing else. Rows locked by a concurrent writer are skipped, never waited
+// for (so it cannot deadlock with the committer, which writes those rows'
+// columns itself); skipped reports how many, and a pass that skipped rows
+// must be repeated before the column can be called complete. last is nil
+// when the table is exhausted.
+func (s *Store) FillSearchText(ctx context.Context, g *Generation, textConfig string, noMeta []string, after []string, limit int) (last []string, changed, skipped int64, err error) {
 	tbl := pgx.Identifier{s.Schema, g.ChunkTable}.Sanitize()
 	if after == nil {
 		after = []string{"", "", "-1"}
 	}
-	var last []string
 	var p, k string
-	var n int32
-	err := s.Pool.QueryRow(ctx, `SELECT pipeline, source_key, chunk_no FROM (SELECT pipeline, source_key, chunk_no FROM `+tbl+`
-		WHERE (pipeline COLLATE "C", source_key COLLATE "C", chunk_no) > ($1 COLLATE "C", $2 COLLATE "C", $3::int)
-		ORDER BY pipeline COLLATE "C", source_key COLLATE "C", chunk_no LIMIT $4) b
-		ORDER BY pipeline COLLATE "C" DESC, source_key COLLATE "C" DESC, chunk_no DESC LIMIT 1`, after[0], after[1], after[2], limit).Scan(&p, &k, &n)
+	var n, total int32
+	err = s.Pool.QueryRow(ctx, `SELECT pipeline, source_key, chunk_no, count(*) OVER () FROM (SELECT pipeline, source_key, chunk_no FROM `+tbl+`
+		WHERE (pipeline, source_key, chunk_no) > ($1, $2, $3::int) ORDER BY pipeline, source_key, chunk_no LIMIT $4) b
+		ORDER BY pipeline DESC, source_key DESC, chunk_no DESC LIMIT 1`, after[0], after[1], after[2], limit).Scan(&p, &k, &n, &total)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, 0, nil
+		return nil, 0, 0, nil
 	}
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	last = []string{p, k, strconv.Itoa(int(n))}
-	tag, err := s.Pool.Exec(ctx, `UPDATE `+tbl+` t SET tsv = to_tsvector($7::regconfig, t.content),
-			meta = CASE WHEN t.pipeline = ANY($8::text[]) THEN '{}'::jsonb ELSE t.meta END
-		WHERE (t.pipeline COLLATE "C", t.source_key COLLATE "C", t.chunk_no) > ($1 COLLATE "C", $2 COLLATE "C", $3::int)
-		  AND (t.pipeline COLLATE "C", t.source_key COLLATE "C", t.chunk_no) <= ($4 COLLATE "C", $5 COLLATE "C", $6::int)
-		  AND (t.tsv IS DISTINCT FROM to_tsvector($7::regconfig, t.content) OR (t.pipeline = ANY($8::text[]) AND t.meta <> '{}'::jsonb))`,
-		after[0], after[1], after[2], last[0], last[1], last[2], textConfig, noMeta)
+	var locked int64
+	err = s.Pool.QueryRow(ctx, `WITH l AS (
+			SELECT pipeline, source_key, chunk_no FROM `+tbl+`
+			WHERE (pipeline, source_key, chunk_no) > ($1, $2, $3::int) AND (pipeline, source_key, chunk_no) <= ($4, $5, $6::int)
+			ORDER BY pipeline, source_key, chunk_no FOR UPDATE SKIP LOCKED),
+		u AS (
+			UPDATE `+tbl+` t SET tsv = to_tsvector($7::regconfig, t.content),
+				meta = CASE WHEN t.pipeline = ANY($8::text[]) THEN '{}'::jsonb ELSE t.meta END
+			FROM l WHERE t.pipeline = l.pipeline AND t.source_key = l.source_key AND t.chunk_no = l.chunk_no
+			  AND (t.tsv IS DISTINCT FROM to_tsvector($7::regconfig, t.content) OR (t.pipeline = ANY($8::text[]) AND t.meta <> '{}'::jsonb))
+			RETURNING 1)
+		SELECT (SELECT count(*) FROM l), (SELECT count(*) FROM u)`,
+		after[0], after[1], after[2], last[0], last[1], last[2], textConfig, noMeta).Scan(&locked, &changed)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
-	return last, tag.RowsAffected(), nil
+	return last, changed, int64(total) - locked, nil
 }
 
 // CompleteSearch marks a generation's search columns complete for fp once
