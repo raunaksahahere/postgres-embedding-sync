@@ -214,9 +214,9 @@ func TestMultiPipelineAcceptance(t *testing.T) {
 
 	// Overlapping ids are distinct documents: id 2 exists in documents and in
 	// notes (same encoded key "2"), and as (1, 2) in tickets.
-	e.exec(`INSERT INTO documents (id, title, body) VALUES (2, 'quartz doc', 'quartz meadow violin') ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body`)
-	e.exec(`INSERT INTO notes (id, body) VALUES (2, 'quartz meadow violin') ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body`)
-	e.exec(`INSERT INTO support.tickets (tenant_id, id, subject, body) VALUES (1, 2, 'quartz', 'quartz meadow violin')
+	e.exec(`INSERT INTO documents (id, title, body) VALUES (2, 'zephyr doc', 'zephyr obsidian xylophone') ON CONFLICT (id) DO UPDATE SET title = EXCLUDED.title, body = EXCLUDED.body`)
+	e.exec(`INSERT INTO notes (id, body) VALUES (2, 'zephyr obsidian xylophone') ON CONFLICT (id) DO UPDATE SET body = EXCLUDED.body`)
+	e.exec(`INSERT INTO support.tickets (tenant_id, id, subject, body) VALUES (1, 2, 'zephyr', 'zephyr obsidian xylophone')
 		ON CONFLICT (tenant_id, id) DO UPDATE SET subject = EXCLUDED.subject, body = EXCLUDED.body`)
 	e.requireConsistent("after overlapping-id writes")
 	n := e.scalar(`SELECT string_agg(pipeline || '=' || source_key, ' ' ORDER BY pipeline) FROM embedsync.chunks_v1
@@ -224,7 +224,7 @@ func TestMultiPipelineAcceptance(t *testing.T) {
 	if n != `docs=2 notes=2 tickets=["1","2"]` {
 		t.Fatalf("overlapping ids must be separate documents per pipeline, got %s", n)
 	}
-	_, body := e.httpGet("/search?q=quartz+meadow+violin&k=5")
+	_, body := e.httpGet("/search?q=zephyr+obsidian+xylophone&k=10&exact=true") // words the writers never use; exact, so ANN recall cannot hide a hit
 	var res struct {
 		Hits []struct{ Pipeline, Key string }
 	}
