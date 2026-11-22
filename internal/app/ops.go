@@ -217,7 +217,7 @@ func Verify(ctx context.Context, e *Env, timeout time.Duration) (*VerifyReport, 
 			if !store.IsLive(g.State) {
 				continue
 			}
-			gr, err := verify.Generation(ctx, tx, e.Store.Schema, g, e.Trs(), verify.OnlyPipelines(rows, e.Cfg), views, e.Cfg.Pipeline.MaxDocumentBytes)
+			gr, err := verify.Generation(ctx, tx, e.Store.Schema, g, e.Trs(), verify.OnlyPipelines(rows, e.Cfg), views, e.Cfg.Pipeline.MaxDocumentBytes, verify.SearchCheckFor(e.Cfg))
 			if err != nil {
 				return err
 			}

@@ -44,8 +44,15 @@ func SourceViewDocs(ctx context.Context, q Querier, v *config.ViewDef) (docs map
 }
 
 func viewRootDocs(ctx context.Context, q Querier, v *config.ViewDef) (map[string]*viewdoc.Doc, error) {
-	fieldCols := fieldColumns(v.Fields)
-	sql := `SELECT ` + selectList("", v.Key, fieldCols) + ` FROM ` + tableIdent(v.Table)
+	// The root row also carries the view's metadata columns as hidden
+	// fields (as the root component's state does); they are not rendered.
+	fields := viewRootFields(v)
+	fieldCols := fieldColumns(fields)
+	sel := []string{selectList("", v.Key)}
+	for _, f := range fields {
+		sel = append(sel, config.FieldText(f, pgx.Identifier{f.Column}.Sanitize()))
+	}
+	sql := `SELECT ` + strings.Join(sel, ", ") + ` FROM ` + tableIdent(v.Table)
 	docs := map[string]*viewdoc.Doc{}
 	err := queryText(ctx, q, sql, len(v.Key)+len(fieldCols), func(vals []*string) error {
 		key, err := encodeKey(vals[:len(v.Key)])
@@ -53,7 +60,7 @@ func viewRootDocs(ctx context.Context, q Querier, v *config.ViewDef) (map[string
 			return fmt.Errorf("view %s root: %w", v.Name, err)
 		}
 		d := &viewdoc.Doc{Key: key, Root: map[string]*string{}, Lists: map[string][]viewdoc.Row{}}
-		for i, f := range v.Fields {
+		for i, f := range fields {
 			d.Root[f.Name] = vals[len(v.Key)+i]
 		}
 		for _, ch := range v.Children {
@@ -69,6 +76,12 @@ func viewRootDocs(ctx context.Context, q Querier, v *config.ViewDef) (map[string
 		return nil, fmt.Errorf("view %s root %s: %w", v.Name, v.Table, err)
 	}
 	return docs, nil
+}
+
+// viewRootFields is what a view's root row is read with: its fields plus
+// its metadata columns as hidden fields.
+func viewRootFields(v *config.ViewDef) []config.Field {
+	return append(append([]config.Field{}, v.Fields...), config.MetaFields(v.Metadata)...)
 }
 
 func addViewChildren(ctx context.Context, q Querier, v *config.ViewDef, ch *config.ChildDef, docs map[string]*viewdoc.Doc) (int, error) {

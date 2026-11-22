@@ -105,3 +105,11 @@ func TestAsErrorBackend(t *testing.T) {
 		t.Fatalf("%+v", e)
 	}
 }
+
+func TestValidateKeepsExact(t *testing.T) {
+	s := &Searcher{RRFK: 60}
+	r, err := s.validate("x", Options{Exact: true})
+	if err != nil || !r.exact {
+		t.Fatalf("exact lost: %+v %v", r, err)
+	}
+}

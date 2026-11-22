@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -857,11 +858,13 @@ func (s *Store) TryAdvisoryLock(ctx context.Context) (*pgxpool.Conn, error) {
 func (g *Generation) SearchReady(fp string) bool { return g.SearchFingerprint == fp }
 
 // QueueSearchRescan starts (re)building a live generation's search columns
-// for fp: it records the target and queues a re-scan of every document
-// pipeline (embed jobs, which reuse stored vectors) and view (state jobs for
-// its tables, then a render job). Returns false if fp is already built or
-// being built.
-func (s *Store) QueueSearchRescan(ctx context.Context, g *Generation, fp string, views map[string][]string) (bool, error) {
+// for fp: it records the target and queues a source re-scan of the document
+// pipelines and views in rescan, the ones declaring metadata (embed jobs,
+// which reuse stored vectors; for a view, state jobs for its tables listed
+// in views, then a render job). The full-text column needs no re-scan: the
+// search builder fills it from the stored content. Returns false if fp is
+// already built or being built.
+func (s *Store) QueueSearchRescan(ctx context.Context, g *Generation, fp string, rescan map[string]bool, views map[string][]string) (bool, error) {
 	if g.SearchFingerprint == fp || g.SearchTarget == fp {
 		return false, nil
 	}
@@ -870,6 +873,9 @@ func (s *Store) QueueSearchRescan(ctx context.Context, g *Generation, fp string,
 			return err
 		}
 		for _, p := range g.PipelineNames() {
+			if !rescan[p] {
+				continue
+			}
 			kind := g.Pipelines[p].jobKind()
 			if comps, ok := views[p]; ok {
 				for _, c := range comps {
@@ -887,4 +893,56 @@ func (s *Store) QueueSearchRescan(ctx context.Context, g *Generation, fp string,
 		return nil
 	})
 	return err == nil, err
+}
+
+// FillSearchText brings a generation's full-text column (and the metadata of
+// pipelines that declare none, which must be empty) up to date for rows
+// after the cursor (pipeline, source_key, chunk_no), at most limit rows. It
+// computes from each row's own stored content, so it is safe alongside the
+// committer: a row it waits for is re-evaluated at its new version. It
+// returns the last row examined (nil when the table is exhausted) and the
+// number of rows changed. Nothing else on the row changes.
+func (s *Store) FillSearchText(ctx context.Context, g *Generation, textConfig string, noMeta []string, after []string, limit int) ([]string, int64, error) {
+	tbl := pgx.Identifier{s.Schema, g.ChunkTable}.Sanitize()
+	if after == nil {
+		after = []string{"", "", "-1"}
+	}
+	var last []string
+	var p, k string
+	var n int32
+	err := s.Pool.QueryRow(ctx, `SELECT pipeline, source_key, chunk_no FROM (SELECT pipeline, source_key, chunk_no FROM `+tbl+`
+		WHERE (pipeline COLLATE "C", source_key COLLATE "C", chunk_no) > ($1 COLLATE "C", $2 COLLATE "C", $3::int)
+		ORDER BY pipeline COLLATE "C", source_key COLLATE "C", chunk_no LIMIT $4) b
+		ORDER BY pipeline COLLATE "C" DESC, source_key COLLATE "C" DESC, chunk_no DESC LIMIT 1`, after[0], after[1], after[2], limit).Scan(&p, &k, &n)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, 0, nil
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	last = []string{p, k, strconv.Itoa(int(n))}
+	tag, err := s.Pool.Exec(ctx, `UPDATE `+tbl+` t SET tsv = to_tsvector($7::regconfig, t.content),
+			meta = CASE WHEN t.pipeline = ANY($8::text[]) THEN '{}'::jsonb ELSE t.meta END
+		WHERE (t.pipeline COLLATE "C", t.source_key COLLATE "C", t.chunk_no) > ($1 COLLATE "C", $2 COLLATE "C", $3::int)
+		  AND (t.pipeline COLLATE "C", t.source_key COLLATE "C", t.chunk_no) <= ($4 COLLATE "C", $5 COLLATE "C", $6::int)
+		  AND (t.tsv IS DISTINCT FROM to_tsvector($7::regconfig, t.content) OR (t.pipeline = ANY($8::text[]) AND t.meta <> '{}'::jsonb))`,
+		after[0], after[1], after[2], last[0], last[1], last[2], textConfig, noMeta)
+	if err != nil {
+		return nil, 0, err
+	}
+	return last, tag.RowsAffected(), nil
+}
+
+// CompleteSearch marks a generation's search columns complete for fp once
+// its full-text pass is done (the caller's part) and no backfill job that
+// could still write metadata remains. It reports whether it did.
+func (s *Store) CompleteSearch(ctx context.Context, genID, fp string) (bool, error) {
+	tag, err := s.Pool.Exec(ctx, `UPDATE `+s.T("generations")+` g SET search_fingerprint = $2
+		WHERE id = $1 AND search_target = $2 AND search_fingerprint IS DISTINCT FROM $2
+		AND state IN ('building', 'ready', 'active', 'previous')
+		AND NOT EXISTS (SELECT 1 FROM `+s.T("backfill_jobs")+` j WHERE j.state IN ('pending', 'running') AND (j.generation_id = $1 OR j.generation_id IS NULL))`, genID, fp)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }

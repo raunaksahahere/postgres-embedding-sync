@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/config"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/failpoint"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/keys"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/store"
 )
@@ -202,6 +203,7 @@ func (b *Backfill) runJob(ctx context.Context, job *store.BackfillJob) error {
 				return nil
 			}
 		}
+		failpoint.Pause("backfill_window")
 		var outcome string
 		if kind == store.JobRender {
 			outcome, err = b.renderWindow(ctx, spec, gen, job.ID, cur.LastKey, limit)
@@ -391,7 +393,7 @@ func ScanQuery(def *config.PipelineDef, codec keys.Codec, lo *string, limit int)
 		cols = append(cols, keyCols[i]+"::text")
 	}
 	for _, f := range fields {
-		cols = append(cols, "t."+pgx.Identifier{f.Column}.Sanitize()+"::text")
+		cols = append(cols, config.FieldText(f, "t."+pgx.Identifier{f.Column}.Sanitize()))
 	}
 	q := `SELECT ` + strings.Join(cols, ", ") + ` FROM ` + pgx.Identifier{schema, table}.Sanitize() + ` AS t`
 	var args []any

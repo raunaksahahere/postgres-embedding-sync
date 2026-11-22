@@ -217,6 +217,8 @@ func hash(seed, s string) uint64 {
 	return h.Sum64()
 }
 
+var synonyms = map[string]string{"automobile": "car", "vehicle": "car", "physician": "doctor", "medic": "doctor", "feline": "cat"}
+
 func encode(model, text string) []float32 {
 	v := make([]float64, dim)
 	switch model {
@@ -233,6 +235,11 @@ func encode(model, text string) []float32 {
 			text = strings.TrimPrefix(strings.TrimPrefix(text, "query: "), "passage: ")
 		}
 		for _, w := range wordRe.FindAllString(strings.ToLower(text), -1) {
+			// A few synonyms make the fake model "semantic": a paraphrase
+			// lands on the same vector while sharing no word with the text.
+			if s, ok := synonyms[w]; ok {
+				w = s
+			}
 			h := hash("a", w)
 			sign := 1.0
 			if h&1 == 1 {
@@ -394,6 +401,8 @@ type envOpts struct {
 	embedderURL    string
 	extraModels    string
 	extraProviders string
+	// search, when set, adds a `search:` block (YAML, indented by two spaces).
+	search string
 }
 
 func randHex(n int) string {
@@ -520,6 +529,9 @@ providers:%s
 	}
 	if o.views != "" {
 		tables, pipes = "", pipes+"\nviews:\n"+o.views
+	}
+	if o.search != "" {
+		pipes += "\nsearch:\n" + o.search
 	}
 	initialGen := o.initialGen
 	if initialGen == "" {
@@ -804,6 +816,8 @@ type pipeCounts struct {
 	Missing        int `json:"missing"`
 	Extra          int `json:"extra"`
 	Stale          int `json:"stale"`
+	MetaStale      int `json:"meta_stale"`
+	TSVStale       int `json:"tsv_stale"`
 }
 
 type genReport struct {
@@ -816,6 +830,9 @@ type genReport struct {
 	Quarantined    int                   `json:"quarantined_keys"`
 	MissingQ       int                   `json:"missing_due_to_quarantine"`
 	Examples       []string              `json:"example_problems"`
+	MetaStale      int                   `json:"meta_stale"`
+	TSVStale       int                   `json:"tsv_stale"`
+	SearchBuilding bool                  `json:"search_columns_building"`
 	Pipelines      map[string]pipeCounts `json:"pipelines"`
 }
 
@@ -864,8 +881,11 @@ func (e *env) requireConsistent(label string) verifyReport {
 		e.t.Fatalf("%s: sink differs from source: %s", label, r)
 	}
 	for _, g := range r.Generations {
-		e.t.Logf("%s: %s expected=%d actual=%d missing=%d extra=%d stale=%d quarantined=%d (source rows %d)",
-			label, g.Generation, g.ExpectedChunks, g.ActualChunks, g.Missing, g.Extra, g.Stale, g.Quarantined, r.SourceRows)
+		if g.MetaStale != 0 || g.TSVStale != 0 {
+			e.t.Fatalf("%s: generation %s has stale search columns (meta_stale=%d tsv_stale=%d): %s", label, g.Generation, g.MetaStale, g.TSVStale, r)
+		}
+		e.t.Logf("%s: %s expected=%d actual=%d missing=%d extra=%d stale=%d meta_stale=%d tsv_stale=%d search_building=%v quarantined=%d (source rows %d)",
+			label, g.Generation, g.ExpectedChunks, g.ActualChunks, g.Missing, g.Extra, g.Stale, g.MetaStale, g.TSVStale, g.SearchBuilding, g.Quarantined, r.SourceRows)
 		if len(g.Pipelines) > 1 {
 			for name, c := range g.Pipelines {
 				e.t.Logf("%s:   %s pipeline %s: source rows %d, chunks expected=%d actual=%d missing=%d extra=%d stale=%d",

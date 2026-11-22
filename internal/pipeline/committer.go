@@ -168,12 +168,6 @@ func (c *Committer) apply(ctx context.Context, u *Unit) error {
 			return err
 		}
 		if p.Final && p.Gen != "" {
-			// The generation's search columns are complete for the target
-			// once none of its backfills remains.
-			if _, err := tx.Exec(ctx, `UPDATE `+c.Store.T("generations")+` SET search_fingerprint = search_target WHERE id = $1 AND search_target IS NOT NULL
-				AND NOT EXISTS (SELECT 1 FROM `+c.Store.T("backfill_jobs")+` WHERE generation_id = $1 AND state IN ('pending', 'running'))`, p.Gen); err != nil {
-				return err
-			}
 			// A generation is ready once every pipeline's backfill into it is
 			// complete, not when the first one finishes. (State jobs of a
 			// view belong to no generation.)

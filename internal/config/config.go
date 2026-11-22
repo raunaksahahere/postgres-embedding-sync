@@ -918,3 +918,15 @@ func (c *Config) SearchFingerprint() string {
 	h := sha256.Sum256(b)
 	return hex.EncodeToString(h[:16])
 }
+
+// FieldText renders how a field's column (ident, already quoted) is read as
+// text for a snapshot: `::text` for allowlisted fields; metadata columns use
+// the type's output function, exactly what logical replication sends (an
+// explicit cast can differ: bool::text is "true", the stream sends "t"), so
+// state written from a snapshot and from the stream agree.
+func FieldText(f Field, ident string) string {
+	if strings.HasPrefix(f.Name, MetaFieldPrefix) {
+		return "(CASE WHEN " + ident + " IS NULL THEN NULL ELSE format('%s', " + ident + ") END)"
+	}
+	return ident + "::text"
+}

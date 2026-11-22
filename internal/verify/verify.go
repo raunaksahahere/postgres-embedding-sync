@@ -5,7 +5,10 @@ package verify
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math/big"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -13,6 +16,7 @@ import (
 
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/config"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/keys"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/pipeline"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/store"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/transform"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/viewdoc"
@@ -48,6 +52,15 @@ type GenReport struct {
 	MissingQuarant  int      `json:"missing_due_to_quarantine"`
 	PoisonExpected  int      `json:"expected_poison_keys"`
 	ExampleProblems []string `json:"example_problems,omitempty"`
+	// MetaStale counts chunks whose meta differs from the document's
+	// declared metadata; TSVStale counts chunks whose tsv differs from
+	// to_tsvector(search.text_config, content). Both are checked only when
+	// the generation's search columns are complete for the configuration
+	// (SearchBuilding false); while they are still being rebuilt in the
+	// background they may legitimately lag and are not counted.
+	MetaStale      int  `json:"meta_stale"`
+	TSVStale       int  `json:"tsv_stale"`
+	SearchBuilding bool `json:"search_columns_building"`
 	// Pipelines breaks the chunk counts down per pipeline.
 	Pipelines map[string]*PipeCounts `json:"pipelines"`
 }
@@ -59,10 +72,38 @@ type PipeCounts struct {
 	Missing        int `json:"missing"`
 	Extra          int `json:"extra"`
 	Stale          int `json:"stale"`
+	MetaStale      int `json:"meta_stale"`
+	TSVStale       int `json:"tsv_stale"`
 }
 
-// OK reports zero missing, extra and stale entries (quarantined rows are reported separately).
-func (r GenReport) OK() bool { return r.Missing == 0 && r.Extra == 0 && r.Stale == 0 }
+// OK reports zero missing, extra and stale entries, including stale search
+// columns (quarantined rows are reported separately).
+func (r GenReport) OK() bool {
+	return r.Missing == 0 && r.Extra == 0 && r.Stale == 0 && r.MetaStale == 0 && r.TSVStale == 0
+}
+
+// SearchCheck is what the search columns of a generation are compared with.
+type SearchCheck struct {
+	// Fingerprint is the configuration's search fingerprint; the columns
+	// are checked only for a generation whose SearchFingerprint equals it.
+	Fingerprint string
+	// TextConfig is the text search configuration tsv is computed with.
+	TextConfig string
+	// Meta returns the metadata declarations of a pipeline or view.
+	Meta func(doc string) []config.MetaField
+}
+
+// SearchCheckFor returns the search check for a configuration.
+func SearchCheckFor(cfg *config.Config) SearchCheck {
+	return SearchCheck{Fingerprint: cfg.SearchFingerprint(), TextConfig: cfg.Search.TextConfig, Meta: cfg.MetaFor}
+}
+
+func (s SearchCheck) meta(doc string) []config.MetaField {
+	if s.Meta == nil {
+		return nil
+	}
+	return s.Meta(doc)
+}
 
 type chunkKey struct {
 	pipeline string
@@ -70,12 +111,14 @@ type chunkKey struct {
 	no       int
 }
 
-type chunkVal struct{ fp, text string }
+// chunkVal is an expected chunk: fingerprint, text and its document's
+// metadata JSON (as stored in meta).
+type chunkVal struct{ fp, text, meta string }
 
 // Expected computes chunks for every pipeline's rows under one generation.
 // Rows whose rendered document exceeds maxDocBytes are expected to be absent
-// (quarantined).
-func Expected(trs map[string]*transform.Transformer, m transform.ModelIdentity, rows Rows, maxDocBytes int) (map[chunkKey]chunkVal, map[chunkKey]bool, error) {
+// (quarantined). meta returns a pipeline's metadata declarations (nil: none).
+func Expected(trs map[string]*transform.Transformer, m transform.ModelIdentity, rows Rows, maxDocBytes int, meta func(string) []config.MetaField) (map[chunkKey]chunkVal, map[chunkKey]bool, error) {
 	out := map[chunkKey]chunkVal{}
 	poison := map[chunkKey]bool{}
 	for pipe, rs := range rows {
@@ -95,12 +138,20 @@ func Expected(trs map[string]*transform.Transformer, m transform.ModelIdentity, 
 				poison[chunkKey{pipeline: pipe, key: r.Key}] = true
 				continue
 			}
+			mj := pipeline.MetaJSON(metaDecls(meta, pipe), r.Fields)
 			for _, c := range tr.Chunks(r.Key, text, m) {
-				out[chunkKey{pipe, r.Key, c.No}] = chunkVal{c.Fingerprint, c.Text}
+				out[chunkKey{pipe, r.Key, c.No}] = chunkVal{c.Fingerprint, c.Text, mj}
 			}
 		}
 	}
 	return out, poison, nil
+}
+
+func metaDecls(meta func(string) []config.MetaField, doc string) []config.MetaField {
+	if meta == nil {
+		return nil
+	}
+	return meta(doc)
 }
 
 // Querier is a pgx query interface (pool or tx).
@@ -116,9 +167,10 @@ type ViewDocs struct {
 
 // ExpectedViews computes chunks for assembled view documents under one
 // generation; documents over max_children or max_document_bytes, or that
-// fail to render, are expected to be absent (quarantined).
+// fail to render, are expected to be absent (quarantined). A document's
+// metadata comes from its root row (meta returns the view's declarations).
 func ExpectedViews(trs map[string]*transform.Transformer, m transform.ModelIdentity, views map[string]ViewDocs, maxDocBytes int,
-	out map[chunkKey]chunkVal, poison map[chunkKey]bool) error {
+	meta func(string) []config.MetaField, out map[chunkKey]chunkVal, poison map[chunkKey]bool) error {
 	for view, vd := range views {
 		tr := trs[view]
 		if tr == nil {
@@ -134,8 +186,9 @@ func ExpectedViews(trs map[string]*transform.Transformer, m transform.ModelIdent
 				poison[chunkKey{pipeline: view, key: key}] = true
 				continue
 			}
+			mj := pipeline.MetaJSON(metaDecls(meta, view), d.Root)
 			for _, c := range tr.Chunks(key, text, m) {
-				out[chunkKey{view, key, c.No}] = chunkVal{c.Fingerprint, c.Text}
+				out[chunkKey{view, key, c.No}] = chunkVal{c.Fingerprint, c.Text, mj}
 			}
 		}
 	}
@@ -143,14 +196,17 @@ func ExpectedViews(trs map[string]*transform.Transformer, m transform.ModelIdent
 }
 
 // Generation compares a generation's chunk table with every standalone
-// pipeline's rows and every view's assembled documents.
-func Generation(ctx context.Context, q Querier, schema string, g *store.Generation, trs map[string]*transform.Transformer, rows Rows, views map[string]ViewDocs, maxDocBytes int) (*GenReport, error) {
+// pipeline's rows and every view's assembled documents. When the
+// generation's search columns are complete for sc.Fingerprint, every
+// chunk's meta and tsv are compared too; otherwise they are still being
+// rebuilt and the report says so (SearchBuilding) without counting them.
+func Generation(ctx context.Context, q Querier, schema string, g *store.Generation, trs map[string]*transform.Transformer, rows Rows, views map[string]ViewDocs, maxDocBytes int, sc SearchCheck) (*GenReport, error) {
 	m := g.Encoder()
-	exp, poison, err := Expected(trs, m, rows, maxDocBytes)
+	exp, poison, err := Expected(trs, m, rows, maxDocBytes, sc.meta)
 	if err != nil {
 		return nil, err
 	}
-	if err := ExpectedViews(trs, m, views, maxDocBytes, exp, poison); err != nil {
+	if err := ExpectedViews(trs, m, views, maxDocBytes, sc.meta, exp, poison); err != nil {
 		return nil, err
 	}
 	quarantined := map[chunkKey]bool{}
@@ -167,13 +223,21 @@ func Generation(ctx context.Context, q Querier, schema string, g *store.Generati
 		quarantined[k] = true
 	}
 	qr.Close()
-	rs, err := q.Query(ctx, `SELECT pipeline, source_key, chunk_no, fingerprint, content FROM `+pgx.Identifier{schema, g.ChunkTable}.Sanitize())
+	checkSearch := g.SearchReady(sc.Fingerprint)
+	tbl := pgx.Identifier{schema, g.ChunkTable}.Sanitize()
+	var rs pgx.Rows
+	if checkSearch {
+		rs, err = q.Query(ctx, `SELECT pipeline, source_key, chunk_no, fingerprint, content, meta::text,
+			tsv IS DISTINCT FROM to_tsvector($1::regconfig, content) FROM `+tbl, sc.TextConfig)
+	} else {
+		rs, err = q.Query(ctx, `SELECT pipeline, source_key, chunk_no, fingerprint, content, '{}'::text, false FROM `+tbl)
+	}
 	if err != nil {
 		return nil, err
 	}
 	defer rs.Close()
 	rep := &GenReport{Generation: g.ID, ExpectedChunks: len(exp), Quarantined: len(quarantined), PoisonExpected: len(poison),
-		Pipelines: map[string]*PipeCounts{}}
+		SearchBuilding: !checkSearch, Pipelines: map[string]*PipeCounts{}}
 	pc := func(pipe string) *PipeCounts {
 		c := rep.Pipelines[pipe]
 		if c == nil {
@@ -201,7 +265,8 @@ func Generation(ctx context.Context, q Querier, schema string, g *store.Generati
 	for rs.Next() {
 		var ck chunkKey
 		var v chunkVal
-		if err := rs.Scan(&ck.pipeline, &ck.key, &ck.no, &v.fp, &v.text); err != nil {
+		var tsvStale bool
+		if err := rs.Scan(&ck.pipeline, &ck.key, &ck.no, &v.fp, &v.text, &v.meta, &tsvStale); err != nil {
 			return nil, err
 		}
 		rep.ActualChunks++
@@ -217,6 +282,19 @@ func Generation(ctx context.Context, q Querier, schema string, g *store.Generati
 			rep.Stale++
 			pc(ck.pipeline).Stale++
 			note(fmt.Sprintf("stale pipeline=%s key=%s chunk=%d", ck.pipeline, ck.key, ck.no))
+		}
+		if !checkSearch {
+			continue
+		}
+		if tsvStale {
+			rep.TSVStale++
+			pc(ck.pipeline).TSVStale++
+			note(fmt.Sprintf("tsv stale pipeline=%s key=%s chunk=%d", ck.pipeline, ck.key, ck.no))
+		}
+		if ok && !JSONEqual(want.meta, v.meta) {
+			rep.MetaStale++
+			pc(ck.pipeline).MetaStale++
+			note(fmt.Sprintf("meta stale pipeline=%s key=%s chunk=%d: have %s want %s", ck.pipeline, ck.key, ck.no, v.meta, want.meta))
 		}
 	}
 	if err := rs.Err(); err != nil {
@@ -237,6 +315,57 @@ func Generation(ctx context.Context, q Querier, schema string, g *store.Generati
 	sort.Strings(problems)
 	rep.ExampleProblems = problems
 	return rep, nil
+}
+
+// JSONEqual reports whether two JSON texts hold the same value the way
+// jsonb compares them: object key order and formatting are ignored and
+// numbers compare by value (jsonb prints 1.7e+09 as 1700000000).
+func JSONEqual(a, b string) bool {
+	va, err := decodeJSON(a)
+	if err != nil {
+		return false
+	}
+	vb, err := decodeJSON(b)
+	if err != nil {
+		return false
+	}
+	return reflect.DeepEqual(va, vb)
+}
+
+func decodeJSON(s string) (any, error) {
+	d := json.NewDecoder(strings.NewReader(s))
+	d.UseNumber()
+	var v any
+	if err := d.Decode(&v); err != nil {
+		return nil, err
+	}
+	return canonNumbers(v), nil
+}
+
+// jsonNum is a JSON number's exact value in canonical form (a distinct type,
+// so the number 1 never equals the string "1").
+type jsonNum string
+
+// canonNumbers replaces every json.Number with its exact rational value
+// rendered canonically, so equal numbers written differently compare equal.
+func canonNumbers(v any) any {
+	switch t := v.(type) {
+	case json.Number:
+		r, ok := new(big.Rat).SetString(string(t))
+		if !ok {
+			return jsonNum(t)
+		}
+		return jsonNum(r.RatString())
+	case map[string]any:
+		for k, x := range t {
+			t[k] = canonNumbers(x)
+		}
+	case []any:
+		for i, x := range t {
+			t[i] = canonNumbers(x)
+		}
+	}
+	return v
 }
 
 // StateReport compares source_state with source rows.
@@ -304,7 +433,7 @@ func SourceRows(ctx context.Context, q Querier, p *config.PipelineDef) ([]Row, e
 	}
 	fields := p.AllFields()
 	for _, f := range fields {
-		cols = append(cols, pgx.Identifier{f.Column}.Sanitize()+"::text")
+		cols = append(cols, config.FieldText(f, pgx.Identifier{f.Column}.Sanitize()))
 	}
 	rs, err := q.Query(ctx, `SELECT `+strings.Join(cols, ", ")+` FROM `+pgx.Identifier{schema, table}.Sanitize())
 	if err != nil {

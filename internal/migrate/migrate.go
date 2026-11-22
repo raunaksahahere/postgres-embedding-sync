@@ -677,7 +677,7 @@ func (m *Migrator) Evaluate(ctx context.Context, from, to string, boundary pglog
 				return err
 			}
 		}
-		rep.Coverage, err = verify.Generation(ctx, tx, m.Store.Schema, cand, m.Trs, verify.OnlyPipelines(rows, m.Cfg), views, m.Cfg.Pipeline.MaxDocumentBytes)
+		rep.Coverage, err = verify.Generation(ctx, tx, m.Store.Schema, cand, m.Trs, verify.OnlyPipelines(rows, m.Cfg), views, m.Cfg.Pipeline.MaxDocumentBytes, verify.SearchCheckFor(m.Cfg))
 		if err != nil {
 			return err
 		}

@@ -191,6 +191,7 @@ func (s *Searcher) loadGen(ctx context.Context, db querier, id string) (*genRow,
 type request struct {
 	mode      Mode
 	k, rrfK   int
+	exact     bool
 	filter    *filter.Node
 	tenant    *filter.Node
 	pipelines []string
@@ -201,7 +202,7 @@ func (r *request) restricted() bool {
 }
 
 func (s *Searcher) validate(query string, o Options) (*request, error) {
-	r := &request{mode: o.Mode, k: o.K, rrfK: o.RRFK}
+	r := &request{mode: o.Mode, k: o.K, rrfK: o.RRFK, exact: o.Exact}
 	if query == "" || len(query) > MaxQueryLen {
 		return nil, badRequest("invalid_request", "query", "query is required (max %d bytes)", MaxQueryLen)
 	}
@@ -305,6 +306,9 @@ func (s *Searcher) Search(ctx context.Context, query string, o Options) (res *Re
 		if embedded, err = s.loadGen(ctx, s.Pool, o.Generation); err != nil {
 			return nil, err
 		}
+		if err := s.searchReady(r, embedded); err != nil {
+			return nil, err // before spending an embedding call
+		}
 		if vec, err = s.embed(ctx, embedded, query); err != nil {
 			return nil, err
 		}
@@ -325,9 +329,8 @@ func (s *Searcher) Search(ctx context.Context, query string, o Options) (res *Re
 		}
 	}
 	embedDone := time.Now()
-	if (r.mode != ModeVector || r.restricted()) && g.searchFP != s.SearchFingerprint {
-		return nil, &Error{Status: http.StatusServiceUnavailable, Code: "search_index_building", RetryAfter: 30,
-			Message: fmt.Sprintf("generation %s is still building its metadata and full-text columns; vector search without filters works meanwhile", g.id)}
+	if err := s.searchReady(r, g); err != nil {
+		return nil, err
 	}
 
 	var hits []Hit
@@ -355,6 +358,18 @@ func (s *Searcher) Search(ctx context.Context, query string, o Options) (res *Re
 	}
 	return &Result{Generation: g.id, Model: g.model, Revision: g.revision, Provider: g.provider.Name, Mode: r.mode, Exact: o.Exact, Hits: hits,
 		EmbedMS: float64(embedDone.Sub(start).Microseconds()) / 1000, QueryMS: float64(time.Since(embedDone).Microseconds()) / 1000}, nil
+}
+
+// searchReady refuses filtered, text and hybrid requests on a generation
+// whose metadata and full-text columns are not complete for the current
+// configuration (they fill in the background after an upgrade or a change
+// of metadata declarations).
+func (s *Searcher) searchReady(r *request, g *genRow) error {
+	if (r.mode != ModeVector || r.restricted()) && g.searchFP != s.SearchFingerprint {
+		return &Error{Status: http.StatusServiceUnavailable, Code: "search_index_building", RetryAfter: 30,
+			Message: fmt.Sprintf("generation %s is still building its metadata and full-text columns; vector search without filters works meanwhile", g.id)}
+	}
+	return nil
 }
 
 func (s *Searcher) embed(ctx context.Context, g *genRow, query string) (string, error) {
@@ -465,7 +480,7 @@ func (s *Searcher) Encoder(ctx context.Context, genID string) (*QueryEncoder, er
 }
 
 func (s *Searcher) vectorBranch(ctx context.Context, tx pgx.Tx, g *genRow, vec string, r *request, k, candidates int) ([]Hit, error) {
-	return s.query(ctx, tx, g, vec, r, k, candidates, false)
+	return s.query(ctx, tx, g, vec, r, k, candidates, r.exact)
 }
 
 // query is the vector branch: the top documents by distance among the
