@@ -17,6 +17,7 @@ import (
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/config"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/embedclient"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/failpoint"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/filter"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/metrics"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/store"
 )
@@ -167,6 +168,12 @@ func (c *Committer) apply(ctx context.Context, u *Unit) error {
 			return err
 		}
 		if p.Final && p.Gen != "" {
+			// The generation's search columns are complete for the target
+			// once none of its backfills remains.
+			if _, err := tx.Exec(ctx, `UPDATE `+c.Store.T("generations")+` SET search_fingerprint = search_target WHERE id = $1 AND search_target IS NOT NULL
+				AND NOT EXISTS (SELECT 1 FROM `+c.Store.T("backfill_jobs")+` WHERE generation_id = $1 AND state IN ('pending', 'running'))`, p.Gen); err != nil {
+				return err
+			}
 			// A generation is ready once every pipeline's backfill into it is
 			// complete, not when the first one finishes. (State jobs of a
 			// view belong to no generation.)
@@ -393,7 +400,7 @@ func (c *Committer) applyGen(ctx context.Context, tx pgx.Tx, u *Unit, gi *GenInf
 		trimN                         []int32
 		cP, cKey, cID, cFP, cText, cV []string
 		cNo                           []int32
-		cLSN                          []string
+		cLSN, cMeta                   []string
 		cTime                         []*time.Time
 		qP, qKey, qLSN, qReason, qErr []string
 		upserts, deletes, poisoned    int
@@ -437,7 +444,9 @@ func (c *Committer) applyGen(ctx context.Context, tx pgx.Tx, u *Unit, gi *GenInf
 			t := d.CommitTime
 			ct = &t
 		}
+		meta := c.metaJSON(id.Pipeline, d.Fields)
 		for _, ch := range chunks {
+			cMeta = append(cMeta, meta)
 			cP = append(cP, id.Pipeline)
 			cKey = append(cKey, id.Key)
 			cNo = append(cNo, int32(ch.No))
@@ -462,14 +471,17 @@ func (c *Committer) applyGen(ctx context.Context, tx pgx.Tx, u *Unit, gi *GenInf
 		}
 	}
 	if len(cKey) > 0 {
-		if _, err := tx.Exec(ctx, `INSERT INTO `+tbl+` AS t (pipeline, source_key, chunk_no, chunk_id, fingerprint, content, embedding, source_lsn, source_commit_time)
-			SELECT p, k, n, id, fp, txt, v::vector, l::pg_lsn, ct
-			FROM unnest($1::text[], $2::text[], $3::int[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::timestamptz[]) AS u(p, k, n, id, fp, txt, v, l, ct)
+		// A chunk is rewritten when its text, its document's metadata or its
+		// full-text vector changed: a metadata-only update changes filter
+		// results without re-embedding (the vector came from the sink).
+		if _, err := tx.Exec(ctx, `INSERT INTO `+tbl+` AS t (pipeline, source_key, chunk_no, chunk_id, fingerprint, content, embedding, source_lsn, source_commit_time, meta, tsv)
+			SELECT p, k, n, id, fp, txt, v::vector, l::pg_lsn, ct, m::jsonb, to_tsvector($11::regconfig, txt)
+			FROM unnest($1::text[], $2::text[], $3::int[], $4::text[], $5::text[], $6::text[], $7::text[], $8::text[], $9::timestamptz[], $10::text[]) AS u(p, k, n, id, fp, txt, v, l, ct, m)
 			ON CONFLICT (pipeline, source_key, chunk_no) DO UPDATE SET chunk_id = EXCLUDED.chunk_id, fingerprint = EXCLUDED.fingerprint,
 				content = EXCLUDED.content, embedding = EXCLUDED.embedding, source_lsn = EXCLUDED.source_lsn,
-				source_commit_time = EXCLUDED.source_commit_time, updated_at = now()
-			WHERE t.fingerprint IS DISTINCT FROM EXCLUDED.fingerprint`,
-			cP, cKey, cNo, cID, cFP, cText, cV, cLSN, cTime); err != nil {
+				source_commit_time = EXCLUDED.source_commit_time, meta = EXCLUDED.meta, tsv = EXCLUDED.tsv, updated_at = now()
+			WHERE t.fingerprint IS DISTINCT FROM EXCLUDED.fingerprint OR t.meta IS DISTINCT FROM EXCLUDED.meta OR t.tsv IS DISTINCT FROM EXCLUDED.tsv`,
+			cP, cKey, cNo, cID, cFP, cText, cV, cLSN, cTime, cMeta, c.Cfg.Search.TextConfig); err != nil {
 			return fmt.Errorf("upsert chunks: %w", err)
 		}
 	}
@@ -513,4 +525,32 @@ func strOr(s *string, def string) string {
 		return def
 	}
 	return *s
+}
+
+// metaJSON renders a document's declared metadata from its fields (the
+// hidden __meta_ fields carried with the row) as the jsonb stored on each
+// of its chunks. A value that does not parse as its declared type is left
+// out (the catalog check rejects incompatible column types at startup).
+func (c *Committer) metaJSON(pipe string, fields map[string]*string) string {
+	return MetaJSON(c.Cfg.MetaFor(pipe), fields)
+}
+
+// MetaJSON is the metadata jsonb of a document with the given fields.
+func MetaJSON(decls []config.MetaField, fields map[string]*string) string {
+	if len(decls) == 0 {
+		return "{}"
+	}
+	m := map[string]any{}
+	for _, d := range decls {
+		v, err := filter.Type(d.Type).Normalize(fields[config.MetaFieldPrefix+d.Name])
+		if err != nil || v == nil {
+			continue
+		}
+		m[d.Name] = v
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
 }

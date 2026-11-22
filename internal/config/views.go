@@ -53,6 +53,8 @@ type ViewDef struct {
 	// MaxChildren caps the rows one document may assemble per child or link;
 	// a document over it is quarantined (too_many_children).
 	MaxChildren int `yaml:"max_children" json:"max_children"`
+	// Metadata are root-table columns stored with every chunk for filtering.
+	Metadata []MetaField `yaml:"metadata" json:"metadata,omitempty"`
 	// MaxFanoutPerTxn caps the documents one source transaction may change
 	// in this view (e.g. renaming a tag linked everywhere); above it the
 	// pipeline pauses before acknowledging, keeping the transaction atomic.
@@ -180,6 +182,9 @@ func (c *Config) Components() []*Component {
 // the link table and its target table.
 func (v *ViewDef) Components() []*Component {
 	root := &Component{View: v, Kind: CompRoot, Def: compDef(ComponentName(v.Name, "root"), v.Table, v.Key, v.Fields, nil)}
+	// Metadata travels like a standalone pipeline's (AllFields), outside the
+	// relation signature, so declaring it never pauses the stream.
+	root.Def.Metadata = v.Metadata
 	out := []*Component{root}
 	for i := range v.Children {
 		ch := &v.Children[i]
@@ -247,13 +252,14 @@ func (c *Config) DocNames() []string {
 
 // Fingerprint hashes everything that affects a view's document text: the
 // assembly (tables, keys, references, order, fields) and the transform. The
-// limits are left out: they decide whether a document is processed, not
-// what it says. Physical column names are included (order and reference
+// limits and metadata are left out: they decide whether a document is
+// processed or found, not what it says. Physical column names are included (order and reference
 // columns decide the text), so renaming a view's column means a new
 // generation, unlike a standalone pipeline's field column.
 func (v *ViewDef) Fingerprint() string {
 	d := *v
 	d.MaxChildren, d.MaxFanoutPerTxn = 0, 0
+	d.Metadata = nil // filterable metadata is not part of the text
 	b, _ := json.Marshal(struct {
 		View    ViewDef `json:"view"`
 		Version int     `json:"version"`

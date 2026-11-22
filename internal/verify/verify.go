@@ -302,7 +302,8 @@ func SourceRows(ctx context.Context, q Querier, p *config.PipelineDef) ([]Row, e
 	for _, k := range p.Key {
 		cols = append(cols, pgx.Identifier{k}.Sanitize()+"::text")
 	}
-	for _, f := range p.Fields {
+	fields := p.AllFields()
+	for _, f := range fields {
 		cols = append(cols, pgx.Identifier{f.Column}.Sanitize()+"::text")
 	}
 	rs, err := q.Query(ctx, `SELECT `+strings.Join(cols, ", ")+` FROM `+pgx.Identifier{schema, table}.Sanitize())
@@ -333,7 +334,7 @@ func SourceRows(ctx context.Context, q Querier, p *config.PipelineDef) ([]Row, e
 			return nil, fmt.Errorf("pipeline %s: %w", p.Name, err)
 		}
 		r := Row{Key: key, Fields: map[string]*string{}}
-		for i, f := range p.Fields {
+		for i, f := range fields {
 			r.Fields[f.Name] = vals[nk+i]
 		}
 		out = append(out, r)

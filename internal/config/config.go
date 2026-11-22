@@ -134,6 +134,49 @@ type PipelineDef struct {
 	Key       KeyColumns `yaml:"key" json:"key"`
 	Fields    []Field    `yaml:"fields" json:"fields"`
 	Transform *Transform `yaml:"transform" json:"transform"` // nil: inherit the top-level transform
+	// Metadata are columns stored with every chunk of a document for
+	// filtering search results. They are not rendered or embedded, so a
+	// metadata-only change never re-embeds.
+	Metadata []MetaField `yaml:"metadata" json:"metadata,omitempty"`
+}
+
+// MetaField declares one filterable metadata column.
+type MetaField struct {
+	Name   string `yaml:"name" json:"name"`
+	Column string `yaml:"column" json:"column"`
+	// Type is text, int, float, bool, timestamp or text_array.
+	Type string `yaml:"type" json:"type"`
+}
+
+// MetaFieldPrefix marks the hidden fields that carry metadata columns in
+// state and through the stream (never rendered).
+const MetaFieldPrefix = "__meta_"
+
+// MetaFields returns metadata columns as hidden fields.
+func MetaFields(ms []MetaField) []Field {
+	out := make([]Field, len(ms))
+	for i, m := range ms {
+		out[i] = Field{Name: MetaFieldPrefix + m.Name, Column: m.Column}
+	}
+	return out
+}
+
+// SearchConfig configures filtered and hybrid search.
+type SearchConfig struct {
+	// TextConfig is the PostgreSQL text search configuration of the
+	// full-text branch (default simple: no stemming, identifiers stay exact).
+	TextConfig string `yaml:"text_config" json:"text_config"`
+	// RRFK is the reciprocal rank fusion constant (default 60).
+	RRFK int `yaml:"rrf_k" json:"rrf_k"`
+	// TenantFilter forces a tenant predicate taken from a request header
+	// set by a trusted gateway (embedsync does not authenticate callers).
+	TenantFilter *TenantFilter `yaml:"tenant_filter" json:"tenant_filter,omitempty"`
+}
+
+// TenantFilter names the metadata field and the request header carrying the tenant.
+type TenantFilter struct {
+	Field  string `yaml:"field" json:"field"`
+	Header string `yaml:"header" json:"header"`
 }
 
 // Sink describes the pgvector database.
@@ -302,6 +345,7 @@ type Config struct {
 	Source            Source                 `yaml:"source"`
 	Pipelines         []PipelineDef          `yaml:"pipelines"`
 	Views             []ViewDef              `yaml:"views"`
+	Search            SearchConfig           `yaml:"search"`
 	Sink              Sink                   `yaml:"sink"`
 	Transform         Transform              `yaml:"transform"`
 	Embedder          Embedder               `yaml:"embedder"`
@@ -436,6 +480,8 @@ func (c *Config) applyDefaults() {
 		g.Seed = 20261120
 	}
 	def(&c.Metrics.Listen, ":9187")
+	def(&c.Search.TextConfig, "simple")
+	defI(&c.Search.RRFK, 60)
 	if c.Alerts.FreshnessSeconds == 0 {
 		c.Alerts.FreshnessSeconds = 10
 	}
@@ -525,6 +571,7 @@ func (c *Config) Validate() error {
 		}
 	}
 	c.validateViews(add, tables, names)
+	c.validateMetadata(add)
 	if c.Sink.ReaderRole != "" && !identRe.MatchString(c.Sink.ReaderRole) {
 		add("invalid sink.reader_role")
 	}
@@ -662,11 +709,21 @@ func (p *PipelineDef) FieldNames() []string {
 	return out
 }
 
-// PublishedColumns is the key plus every allowlisted column, deduplicated.
+// AllFields is the allowlisted fields plus the hidden metadata fields:
+// everything read from the table and kept in state.
+func (p *PipelineDef) AllFields() []Field {
+	return append(append([]Field{}, p.Fields...), MetaFields(p.Metadata)...)
+}
+
+// PublishedColumns is the key plus every allowlisted and metadata column, deduplicated.
 func (p *PipelineDef) PublishedColumns() []string {
 	out := []string{}
 	have := map[string]bool{}
-	for _, col := range append(append([]string{}, p.Key...), p.FieldColumns()...) {
+	cols := append(append([]string{}, p.Key...), p.FieldColumns()...)
+	for _, m := range p.Metadata {
+		cols = append(cols, m.Column)
+	}
+	for _, col := range cols {
 		if !have[col] {
 			have[col] = true
 			out = append(out, col)
@@ -761,4 +818,103 @@ func (p ProviderDef) ProviderURL() string {
 		}
 	}
 	return p.URL
+}
+
+var metaTypes = map[string]bool{"text": true, "int": true, "float": true, "bool": true, "timestamp": true, "text_array": true}
+
+// validateMetadata checks metadata declarations: names are identifiers,
+// types are known, and a name has one type everywhere (one filter schema
+// spans every pipeline searched together).
+func (c *Config) validateMetadata(add func(string, ...any)) {
+	types := map[string]string{}
+	check := func(where string, ms []MetaField) {
+		seen := map[string]bool{}
+		for _, m := range ms {
+			if !identRe.MatchString(m.Name) || !identRe.MatchString(m.Column) {
+				add("%s: metadata %+v needs lowercase identifier name and column", where, m)
+			}
+			if !metaTypes[m.Type] {
+				add("%s: metadata %s type must be text, int, float, bool, timestamp or text_array", where, m.Name)
+			}
+			if seen[m.Name] {
+				add("%s: duplicate metadata field %q", where, m.Name)
+			}
+			seen[m.Name] = true
+			if t, ok := types[m.Name]; ok && t != m.Type {
+				add("metadata field %q is %s in one pipeline and %s in another; use one type per name", m.Name, t, m.Type)
+			}
+			types[m.Name] = m.Type
+		}
+	}
+	for _, p := range c.Pipelines {
+		check(fmt.Sprintf("pipeline %q", p.Name), p.Metadata)
+	}
+	for _, v := range c.Views {
+		check(fmt.Sprintf("view %q", v.Name), v.Metadata)
+	}
+	if !identRe.MatchString(c.Search.TextConfig) {
+		add("search.text_config must be a text search configuration name (e.g. simple, english)")
+	}
+	if c.Search.RRFK < 1 || c.Search.RRFK > 1000 {
+		add("search.rrf_k must be in [1, 1000]")
+	}
+	if tf := c.Search.TenantFilter; tf != nil {
+		if tf.Header == "" {
+			add("search.tenant_filter.header is required")
+		}
+		if t, ok := types[tf.Field]; !ok {
+			add("search.tenant_filter.field %q must be a declared metadata field", tf.Field)
+		} else if t != "text" && t != "int" {
+			add("search.tenant_filter.field %q must be text or int", tf.Field)
+		}
+	}
+}
+
+// MetaSchema maps every declared metadata field name to its type.
+func (c *Config) MetaSchema() map[string]string {
+	out := map[string]string{}
+	for _, p := range c.Pipelines {
+		for _, m := range p.Metadata {
+			out[m.Name] = m.Type
+		}
+	}
+	for _, v := range c.Views {
+		for _, m := range v.Metadata {
+			out[m.Name] = m.Type
+		}
+	}
+	return out
+}
+
+// MetaFor returns the metadata declarations of a document pipeline or view.
+func (c *Config) MetaFor(name string) []MetaField {
+	if p := c.Pipe(name); p != nil {
+		return p.Metadata
+	}
+	if v := c.View(name); v != nil {
+		return v.Metadata
+	}
+	return nil
+}
+
+// SearchFingerprint hashes what the search columns of a generation depend
+// on (metadata declarations and the text search configuration); a change
+// re-scans the generation (without re-embedding).
+func (c *Config) SearchFingerprint() string {
+	type pm struct {
+		Name string      `json:"name"`
+		Meta []MetaField `json:"meta"`
+	}
+	var all []pm
+	for _, n := range c.DocNames() {
+		all = append(all, pm{n, c.MetaFor(n)})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].Name < all[j].Name })
+	b, _ := json.Marshal(struct {
+		Text string `json:"text_config"`
+		Docs []pm   `json:"docs"`
+		V    int    `json:"v"`
+	}{c.Search.TextConfig, all, 1})
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:16])
 }

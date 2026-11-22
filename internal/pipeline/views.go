@@ -348,7 +348,9 @@ func (p *Planner) renderDoc(v *Spec, key string, doc *viewdoc.Doc, lsn LSN, ct t
 	if doc == nil {
 		return &DocEffect{ID: id, Delete: true, LSN: lsn, CommitTime: ct}
 	}
-	e := &DocEffect{ID: id, LSN: lsn, CommitTime: ct}
+	// Fields carries the root row (its metadata goes onto every chunk; a
+	// view has no state of its own, so applyState skips it).
+	e := &DocEffect{ID: id, LSN: lsn, CommitTime: ct, Fields: doc.Root}
 	if name, n := doc.MaxList(); n > v.ViewDef.MaxChildren {
 		e.Poison, e.PoisonErr = "too_many_children", fmt.Sprintf("%s has %d rows; max_children=%d", name, n, v.ViewDef.MaxChildren)
 		return e

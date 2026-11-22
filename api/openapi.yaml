@@ -1,0 +1,528 @@
+openapi: 3.1.0
+info:
+  title: embedsync HTTP API
+  version: 0.6.0
+  summary: Search, status and health endpoints served by embedsync on its metrics listener.
+  description: |
+    embedsync keeps pgvector embeddings in sync with PostgreSQL and serves vector, full-text and
+    hybrid (reciprocal rank fusion) search over them. All endpoints are served on the metrics
+    listener (`metrics.listen`, default `:9187`).
+
+    **Tenant scope.** When `search.tenant_filter: {field, header}` is configured, every `/search`
+    request MUST carry the configured header (the header name is configurable; the examples use
+    `X-Tenant-ID`). The header is expected to be set by a trusted gateway in front of embedsync,
+    never by end users directly. embedsync adds `<field> eq <header value>` to both the vector and
+    the text branch, and rejects a client filter that references the tenant field.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: http://127.0.0.1:9187
+    description: Local default metrics listener
+tags:
+  - name: search
+  - name: operations
+paths:
+  /search:
+    get:
+      tags: [search]
+      operationId: searchGet
+      summary: Search (query-string form)
+      description: |
+        Legacy vector search; unchanged when only `q`, `k`, `generation` and `exact` are given.
+        Also accepts `mode`, `pipeline` (comma-separated list) and `filter` (URL-encoded JSON
+        filter, same language as the POST body).
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Query text (1..4096 bytes).
+          schema: {type: string, minLength: 1, maxLength: 4096}
+          example: how do I rotate credentials
+        - name: k
+          in: query
+          description: Number of hits (1..100).
+          schema: {type: integer, minimum: 1, maximum: 100, default: 10}
+        - name: generation
+          in: query
+          description: Generation to search (default the serving generation).
+          schema: {type: string}
+        - name: exact
+          in: query
+          description: Vector branch without the ANN index (exact scan).
+          schema: {type: boolean, default: false}
+        - name: mode
+          in: query
+          schema: {$ref: '#/components/schemas/Mode'}
+        - name: pipeline
+          in: query
+          description: Comma-separated list of document pipelines/views to search (default all).
+          style: form
+          explode: false
+          schema:
+            type: array
+            items: {type: string}
+          example: [docs, kb]
+        - name: filter
+          in: query
+          description: URL-encoded JSON filter (see `Filter`).
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Filter'}
+        - $ref: '#/components/parameters/TenantHeader'
+      responses:
+        '200':
+          description: Search results.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SearchResponse'}
+              examples:
+                legacyVector:
+                  $ref: '#/components/examples/LegacyVectorResponse'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+    post:
+      tags: [search]
+      operationId: searchPost
+      summary: Search (JSON body)
+      description: Vector, text or hybrid search with optional pipeline selection and metadata filter.
+      parameters:
+        - $ref: '#/components/parameters/TenantHeader'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/SearchRequest'}
+            examples:
+              hybridWithFilter:
+                summary: Hybrid search over two pipelines with a metadata filter
+                value:
+                  query: how do I rotate credentials
+                  k: 5
+                  mode: hybrid
+                  pipelines: [docs, kb]
+                  filter:
+                    and:
+                      - {field: lang, op: eq, value: en}
+                      - {field: year, op: range, gte: 2020, lt: 2025}
+                  rrf_k: 60
+              tenantScoped:
+                summary: Tenant-scoped request (send with header `X-Tenant-ID`, set by a trusted gateway)
+                description: |
+                  With `search.tenant_filter: {field: tenant_id, header: X-Tenant-ID}` the gateway sets
+                  `X-Tenant-ID: acme`; embedsync adds `tenant_id eq "acme"` to both branches. The body
+                  must not filter on `tenant_id` itself (`tenant_filter_forbidden`).
+                value:
+                  query: quarterly report
+                  mode: hybrid
+                  filter: {field: tags, op: contains, value: finance}
+              invalidFilter:
+                summary: A request whose filter is rejected with 400 invalid_filter
+                value:
+                  query: anything
+                  filter: {field: year, op: between, value: 2020}
+      responses:
+        '200':
+          description: Search results.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SearchResponse'}
+              examples:
+                hybrid:
+                  $ref: '#/components/examples/HybridResponse'
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+  /status:
+    get:
+      tags: [operations]
+      operationId: status
+      summary: Pipeline, replication, generation and backfill status
+      responses:
+        '200':
+          description: Status report. Fields may be added in later versions.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StatusReport'}
+        '500':
+          description: The status could not be built.
+          content:
+            text/plain:
+              schema: {type: string}
+  /healthz:
+    get:
+      tags: [operations]
+      operationId: healthz
+      summary: Liveness probe
+      responses:
+        '200':
+          description: The process is alive.
+          content:
+            text/plain:
+              schema: {type: string}
+              example: "ok\n"
+  /readyz:
+    get:
+      tags: [operations]
+      operationId: readyz
+      summary: Readiness probe
+      description: Ready when the consumer state is `idle` or `active`.
+      responses:
+        '200':
+          description: Ready; the body is the consumer state.
+          content:
+            text/plain:
+              schema: {type: string, enum: ["idle\n", "active\n"]}
+        '503':
+          description: Not ready; the body is the consumer state.
+          content:
+            text/plain:
+              schema: {type: string}
+  /metrics:
+    get:
+      tags: [operations]
+      operationId: metrics
+      summary: Prometheus metrics
+      responses:
+        '200':
+          description: Prometheus text exposition format.
+          content:
+            text/plain:
+              schema: {type: string}
+components:
+  parameters:
+    TenantHeader:
+      name: X-Tenant-ID
+      in: header
+      required: false
+      description: |
+        Tenant identifier. The header name is configurable (`search.tenant_filter.header`);
+        `X-Tenant-ID` is the documented example. Required when `search.tenant_filter` is configured
+        (otherwise 400 `tenant_required`). Must be set by a trusted gateway, not by end users.
+      schema: {type: string}
+      example: acme
+  responses:
+    BadRequest:
+      description: Invalid request or filter.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          examples:
+            invalidFilter:
+              summary: Invalid filter
+              value: {error: 'filter: unknown op "between" for field "year"', code: invalid_filter, field: year}
+            unknownField:
+              summary: Field not declared in the pipeline metadata
+              value: {error: 'filter: unknown field "colour"', code: unknown_field, field: colour}
+            tenantRequired:
+              summary: Tenant header missing
+              value: {error: 'missing tenant header X-Tenant-ID', code: tenant_required}
+    NotFound:
+      description: Unknown generation or pipeline.
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {error: 'unknown pipeline "kb2"', code: unknown_pipeline}
+    Unavailable:
+      description: Search temporarily unavailable.
+      headers:
+        Retry-After:
+          description: Seconds to wait; sent with `search_index_building`.
+          schema: {type: integer}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example: {error: 'full-text index is building', code: search_index_building}
+  examples:
+    LegacyVectorResponse:
+      summary: "GET /search?q=rotate%20credentials&k=2 (legacy vector search)"
+      value:
+        generation: v1
+        model: BAAI/bge-small-en-v1.5
+        revision: 5c38ec7c405ec4b44b94cc5a9bb96e735b38267a
+        provider: local
+        mode: vector
+        exact: false
+        hits:
+          - {pipeline: docs, key: '42', chunk_no: 0, score: 0.8123, content: 'Rotate credentials with ...'}
+          - {pipeline: docs, key: '7', chunk_no: 1, score: 0.7741, content: 'Credentials are stored ...'}
+        embed_ms: 3.1
+        query_ms: 1.2
+    HybridResponse:
+      summary: Hybrid search response
+      value:
+        generation: v1
+        model: BAAI/bge-small-en-v1.5
+        revision: 5c38ec7c405ec4b44b94cc5a9bb96e735b38267a
+        provider: local
+        mode: hybrid
+        exact: false
+        hits:
+          - pipeline: docs
+            key: '42'
+            chunk_no: 0
+            score: 0.0325
+            content: 'Rotate credentials with ...'
+            ranks: {vector: 1, text: 3}
+          - pipeline: kb
+            key: a-17
+            chunk_no: 0
+            score: 0.0161
+            content: 'Credential rotation policy ...'
+            ranks: {text: 1}
+        embed_ms: 3.1
+        query_ms: 2.4
+  schemas:
+    Mode:
+      type: string
+      enum: [vector, hybrid, text]
+      default: vector
+      description: |
+        `vector` = embedding similarity, `text` = PostgreSQL full-text (ts_rank_cd),
+        `hybrid` = reciprocal rank fusion of both branches.
+    SearchRequest:
+      type: object
+      required: [query]
+      additionalProperties: false
+      properties:
+        query:
+          type: string
+          minLength: 1
+          maxLength: 4096
+          description: Query text (1..4096 bytes).
+        k:
+          type: integer
+          minimum: 1
+          maximum: 100
+          default: 10
+        mode: {$ref: '#/components/schemas/Mode'}
+        pipelines:
+          type: array
+          items: {type: string}
+          description: Document pipelines/views to search (default all).
+        generation:
+          type: string
+          description: Generation to search (default the serving generation).
+        exact:
+          type: boolean
+          default: false
+          description: Vector branch without the ANN index.
+        filter: {$ref: '#/components/schemas/Filter'}
+        rrf_k:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          description: Hybrid only; RRF constant (default `search.rrf_k`, normally 60).
+    Filter:
+      description: |
+        Recursive metadata filter. Fields are the metadata fields declared under `metadata:` on a
+        pipeline/view, typed text, int, float, bool, timestamp (RFC3339 or YYYY-MM-DD) or text_array.
+      oneOf:
+        - $ref: '#/components/schemas/AndFilter'
+        - $ref: '#/components/schemas/OrFilter'
+        - $ref: '#/components/schemas/NotFilter'
+        - $ref: '#/components/schemas/Condition'
+    AndFilter:
+      type: object
+      required: [and]
+      additionalProperties: false
+      properties:
+        and:
+          type: array
+          minItems: 1
+          items: {$ref: '#/components/schemas/Filter'}
+    OrFilter:
+      type: object
+      required: [or]
+      additionalProperties: false
+      properties:
+        or:
+          type: array
+          minItems: 1
+          items: {$ref: '#/components/schemas/Filter'}
+    NotFilter:
+      type: object
+      required: [not]
+      additionalProperties: false
+      properties:
+        not: {$ref: '#/components/schemas/Filter'}
+    Scalar:
+      description: A text, number, bool or timestamp (RFC3339 or YYYY-MM-DD string) value.
+      type: [string, number, integer, boolean]
+    Condition:
+      oneOf:
+        - $ref: '#/components/schemas/EqCondition'
+        - $ref: '#/components/schemas/NeCondition'
+        - $ref: '#/components/schemas/InCondition'
+        - $ref: '#/components/schemas/RangeCondition'
+        - $ref: '#/components/schemas/ContainsCondition'
+        - $ref: '#/components/schemas/ExistsCondition'
+      discriminator:
+        propertyName: op
+        mapping:
+          eq: '#/components/schemas/EqCondition'
+          ne: '#/components/schemas/NeCondition'
+          in: '#/components/schemas/InCondition'
+          range: '#/components/schemas/RangeCondition'
+          contains: '#/components/schemas/ContainsCondition'
+          exists: '#/components/schemas/ExistsCondition'
+    EqCondition:
+      type: object
+      required: [field, op, value]
+      additionalProperties: false
+      properties:
+        field: {type: string}
+        op: {const: eq}
+        value: {$ref: '#/components/schemas/Scalar'}
+    NeCondition:
+      type: object
+      required: [field, op, value]
+      additionalProperties: false
+      properties:
+        field: {type: string}
+        op: {const: ne}
+        value: {$ref: '#/components/schemas/Scalar'}
+    InCondition:
+      type: object
+      required: [field, op, values]
+      additionalProperties: false
+      properties:
+        field: {type: string}
+        op: {const: in}
+        values:
+          type: array
+          minItems: 1
+          items: {$ref: '#/components/schemas/Scalar'}
+    RangeCondition:
+      type: object
+      required: [field, op]
+      minProperties: 3
+      additionalProperties: false
+      description: At least one of gt, gte, lt, lte.
+      properties:
+        field: {type: string}
+        op: {const: range}
+        gt: {$ref: '#/components/schemas/Scalar'}
+        gte: {$ref: '#/components/schemas/Scalar'}
+        lt: {$ref: '#/components/schemas/Scalar'}
+        lte: {$ref: '#/components/schemas/Scalar'}
+    ContainsCondition:
+      type: object
+      required: [field, op, value]
+      additionalProperties: false
+      description: text_array fields only; true when the array contains `value`.
+      properties:
+        field: {type: string}
+        op: {const: contains}
+        value: {type: string}
+    ExistsCondition:
+      type: object
+      required: [field, op]
+      additionalProperties: false
+      description: True when the field is present (non-null).
+      properties:
+        field: {type: string}
+        op: {const: exists}
+    Hit:
+      type: object
+      required: [pipeline, key, chunk_no, score, content]
+      properties:
+        pipeline: {type: string}
+        key: {type: string, description: Source row key (composite keys are encoded as a string).}
+        chunk_no: {type: integer, minimum: 0}
+        score:
+          type: number
+          description: |
+            vector: similarity (1 - cosine distance; -distance for l2/ip); text: ts_rank_cd;
+            hybrid: reciprocal rank fusion, sum of 1/(rrf_k + rank). Ties sort by pipeline, then key.
+        content: {type: string}
+        ranks:
+          type: object
+          description: Hybrid mode only; a branch that did not return the document is omitted.
+          additionalProperties: false
+          properties:
+            vector: {type: integer, minimum: 1}
+            text: {type: integer, minimum: 1}
+    SearchResponse:
+      type: object
+      required: [generation, model, revision, provider, exact, hits, embed_ms, query_ms]
+      description: Legacy fields are unchanged; new fields are additive.
+      properties:
+        generation: {type: string}
+        model: {type: string}
+        revision: {type: string}
+        provider: {type: string}
+        mode: {$ref: '#/components/schemas/Mode'}
+        exact: {type: boolean}
+        hits:
+          type: array
+          items: {$ref: '#/components/schemas/Hit'}
+        embed_ms: {type: number}
+        query_ms: {type: number}
+    Error:
+      type: object
+      required: [error, code]
+      properties:
+        error: {type: string, description: Human-readable message.}
+        code:
+          type: string
+          enum:
+            - invalid_filter
+            - unknown_field
+            - invalid_value
+            - unsupported_op
+            - too_complex
+            - invalid_request
+            - tenant_required
+            - tenant_filter_forbidden
+            - unknown_generation
+            - unknown_pipeline
+            - search_index_building
+            - backend
+          description: |
+            400: invalid_filter, unknown_field, invalid_value, unsupported_op, too_complex,
+            invalid_request, tenant_required, tenant_filter_forbidden.
+            404: unknown_generation, unknown_pipeline. 503: search_index_building, backend.
+        field: {type: string, description: Offending filter field, when applicable.}
+    StatusReport:
+      type: object
+      additionalProperties: true
+      description: Operational status; loosely specified, fields may be added.
+      properties:
+        pipeline:
+          type: object
+          additionalProperties: true
+          description: Overall state (`state`, `reason`, `detail`, `updated_at`, `consumer`).
+        checkpoint:
+          type: object
+          additionalProperties: true
+          description: Replication checkpoint (`lsn`, `source_wal_lsn`, `lag_bytes`, `slot`, `age_seconds`, ...).
+        slot:
+          type: object
+          additionalProperties: true
+          description: Replication slot health (`exists`, `active`, `wal_status`, `retained_wal_bytes`, ...).
+        serving:
+          type: object
+          additionalProperties: true
+          description: Serving generation (`generation`, `previous`, `rollback_until`, `switched_at`).
+        pipelines:
+          type: array
+          description: Per pipeline/view state (`name`, `kind`, `table`, `key`, `registered`, ...).
+          items: {type: object, additionalProperties: true}
+        generations:
+          type: array
+          description: Per generation (`id`, `state`, `model`, `dimension`, `documents`, `chunks`, `serving`, ...).
+          items: {type: object, additionalProperties: true}
+        backfill_jobs:
+          type: array
+          items: {type: object, additionalProperties: true}
+        migrations:
+          type: array
+          items: {type: object, additionalProperties: true}
+        unresolved_rows: {type: integer}
+        source_state_rows: {type: integer}
+        alerts:
+          type: array
+          items: {type: string}
+        freshness_note: {type: string}

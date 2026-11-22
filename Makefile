@@ -13,11 +13,15 @@ fmt:
 	gofmt -w cmd internal migrations test
 	cd embedder && uv run --frozen ruff format src tests
 	cd bench && uv run --frozen ruff format src tests
+	cd examples/langchain && uv run --frozen ruff format .
+	cd examples/llamaindex && uv run --frozen ruff format .
 
 fmt-check:
 	@test -z "$$(gofmt -l cmd internal migrations test)" || (gofmt -l cmd internal migrations test; exit 1)
 	cd embedder && uv run --frozen ruff format --check src tests
 	cd bench && uv run --frozen ruff format --check src tests
+	cd examples/langchain && uv run --frozen ruff format --check .
+	cd examples/llamaindex && uv run --frozen ruff format --check .
 
 lint:
 	$(GO) vet ./...
@@ -25,12 +29,16 @@ lint:
 	$(GO) run $(STATICCHECK) -tags integration ./...
 	cd embedder && uv run --frozen ruff check src tests
 	cd bench && uv run --frozen ruff check src tests
+	cd examples/langchain && uv run --frozen ruff check .
+	cd examples/llamaindex && uv run --frozen ruff check .
 
 # Unit tests (Go with the race detector, including the backfill interleaving
-# property test), embedder and bench harness tests.
+# property test), embedder, bench harness and integration example tests.
 test: race
 	cd embedder && uv run --frozen pytest -q
 	cd bench && uv run --frozen pytest -q
+	cd examples/langchain && uv run --frozen pytest -q
+	cd examples/llamaindex && uv run --frozen pytest -q
 
 unit:
 	$(GO) test ./...

@@ -292,7 +292,7 @@ func (r *Reader) buildRelation(m *pglogrepl.RelationMessage) *relation {
 			}
 			rel.keyIdx = append(rel.keyIdx, i)
 		}
-		for _, f := range def.Fields {
+		for _, f := range def.AllFields() {
 			if i, ok := idx[f.Column]; ok {
 				rel.fieldAt[f.Name] = i
 			}

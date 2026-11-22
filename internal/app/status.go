@@ -32,6 +32,9 @@ type GenStatus struct {
 	// Provider is the embedding provider that built the generation (and
 	// embeds its queries).
 	Provider store.ProviderIdentity `json:"provider"`
+	// Search is "ready" when filtered, text and hybrid search can use the
+	// generation, "building" while its metadata and full-text columns fill.
+	Search string `json:"search"`
 }
 
 // PipelineStatus summarises one configured pipeline.
@@ -194,7 +197,10 @@ func BuildStatus(ctx context.Context, e *Env, consumer string) (*StatusReport, e
 	for _, g := range gens {
 		gs := GenStatus{ID: g.ID, State: g.State, Model: g.ModelName, Revision: g.ModelRevision, Dimension: g.Dimension, Distance: g.Distance,
 			Index:      fmt.Sprintf("hnsw(m=%d,ef_construction=%d,ef_search=%d)", g.IndexParams.M, g.IndexParams.EFConstruction, g.IndexParams.EFSearch),
-			Unresolved: counts[g.ID], Serving: sv != nil && sv.GenerationID == g.ID, Provider: g.Provider}
+			Unresolved: counts[g.ID], Serving: sv != nil && sv.GenerationID == g.ID, Provider: g.Provider, Search: "building"}
+		if g.SearchReady(e.Cfg.SearchFingerprint()) {
+			gs.Search = "ready"
+		}
 		if g.StreamFromLSN != nil {
 			gs.StreamFrom = g.StreamFromLSN.String()
 		}
@@ -273,8 +279,8 @@ func PrintStatus(w io.Writer, r *StatusReport) {
 		if g.Provider.Name != "" && g.Provider.Name != "local" {
 			prov = " via " + g.Provider.Name + "(" + g.Provider.Kind + ")"
 		}
-		fmt.Fprintf(w, " %s %-10s %-9s docs=%-6d chunks=%-7d unresolved=%-3d %s@%s%s dim=%d %s %s\n", mark, g.ID, g.State, g.Documents, g.Chunks,
-			g.Unresolved, g.Model, shortRev(g.Revision), prov, g.Dimension, g.Distance, g.Index)
+		fmt.Fprintf(w, " %s %-10s %-9s docs=%-6d chunks=%-7d unresolved=%-3d %s@%s%s dim=%d %s %s search=%s\n", mark, g.ID, g.State, g.Documents, g.Chunks,
+			g.Unresolved, g.Model, shortRev(g.Revision), prov, g.Dimension, g.Distance, g.Index, g.Search)
 	}
 	if len(r.Backfill) > 0 {
 		fmt.Fprintln(w, "backfill jobs:")

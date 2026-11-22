@@ -1,0 +1,30 @@
+[project]
+name = "embedsync-langchain-example"
+version = "0.1.0"
+description = "LangChain retriever over the embedsync /search API"
+license = "Apache-2.0"
+requires-python = ">=3.11"
+dependencies = [
+    "langchain-core==1.7.6",
+    "httpx==0.28.1",
+]
+
+[dependency-groups]
+dev = ["pytest==9.2.0", "ruff==0.17.4"]
+
+[tool.uv]
+# Not a package: run the modules from this directory.
+package = false
+# Resolve only releases at least two weeks old for reproducible, vetted pins.
+exclude-newer = "2026-11-06T00:00:00Z"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

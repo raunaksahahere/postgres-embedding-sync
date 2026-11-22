@@ -69,12 +69,18 @@ type Generation struct {
 	TransformFingerprint string                 `json:"transform_fingerprint"`
 	Pipelines            map[string]GenPipeline `json:"pipelines"`
 	Provider             ProviderIdentity       `json:"provider"`
-	ChunkTable           string                 `json:"chunk_table"`
-	State                string                 `json:"state"`
-	StreamFromLSN        *pglogrepl.LSN         `json:"stream_from_lsn,omitempty"`
-	CreatedAt            time.Time              `json:"created_at"`
-	PromotedAt           *time.Time             `json:"promoted_at,omitempty"`
-	Extra                json.RawMessage        `json:"-"`
+	// SearchFingerprint is what the generation's search columns (metadata
+	// and full-text) are complete for; SearchTarget what they are being
+	// built for. Filtered and hybrid search need SearchFingerprint to equal
+	// the configuration's.
+	SearchFingerprint string          `json:"search_fingerprint,omitempty"`
+	SearchTarget      string          `json:"search_target,omitempty"`
+	ChunkTable        string          `json:"chunk_table"`
+	State             string          `json:"state"`
+	StreamFromLSN     *pglogrepl.LSN  `json:"stream_from_lsn,omitempty"`
+	CreatedAt         time.Time       `json:"created_at"`
+	PromotedAt        *time.Time      `json:"promoted_at,omitempty"`
+	Extra             json.RawMessage `json:"-"`
 }
 
 // ProviderIdentity is how a generation's vectors were computed: which
@@ -300,14 +306,14 @@ func (s *Store) SchemaVersion(ctx context.Context) (int, error) {
 }
 
 const genCols = `id, model_key, model_name, model_revision, dimension, distance, query_prefix, document_prefix, index_type,
-	index_params, transform_fingerprint, pipelines, chunk_table, state, stream_from_lsn::text, created_at, promoted_at, provider`
+	index_params, transform_fingerprint, pipelines, chunk_table, state, stream_from_lsn::text, created_at, promoted_at, provider, coalesce(search_fingerprint, ''), coalesce(search_target, '')`
 
 func scanGen(row pgx.Row) (*Generation, error) {
 	var g Generation
 	var params, pipes, prov []byte
 	var lsn *string
 	if err := row.Scan(&g.ID, &g.ModelKey, &g.ModelName, &g.ModelRevision, &g.Dimension, &g.Distance, &g.QueryPrefix, &g.DocumentPrefix,
-		&g.IndexType, &params, &g.TransformFingerprint, &pipes, &g.ChunkTable, &g.State, &lsn, &g.CreatedAt, &g.PromotedAt, &prov); err != nil {
+		&g.IndexType, &params, &g.TransformFingerprint, &pipes, &g.ChunkTable, &g.State, &lsn, &g.CreatedAt, &g.PromotedAt, &prov, &g.SearchFingerprint, &g.SearchTarget); err != nil {
 		return nil, err
 	}
 	if err := json.Unmarshal(prov, &g.Provider); err != nil {
@@ -368,7 +374,7 @@ func NewGeneration(id, modelKey string, m config.Model, cfg *config.Config) (*Ge
 		ID: id, ModelKey: modelKey, ModelName: m.Name, ModelRevision: m.Revision, Dimension: m.Dimension,
 		Distance: m.Distance, QueryPrefix: m.QueryPrefix, DocumentPrefix: m.DocumentPrefix, IndexType: "hnsw",
 		IndexParams: m.HNSW, TransformFingerprint: cfg.CombinedFingerprint(), Pipelines: pipes, ChunkTable: "chunks_" + id, State: StatePending,
-		Provider: NewProviderIdentity(cfg, m),
+		Provider: NewProviderIdentity(cfg, m), SearchTarget: cfg.SearchFingerprint(),
 	}, nil
 }
 
@@ -455,10 +461,10 @@ func (s *Store) CreateGeneration(ctx context.Context, g *Generation, readerRole 
 	tbl := s.T(g.ChunkTable)
 	return pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `INSERT INTO `+s.T("generations")+` (id, model_key, model_name, model_revision, dimension, distance,
-			query_prefix, document_prefix, index_type, index_params, transform_fingerprint, pipelines, chunk_table, state, provider)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+			query_prefix, document_prefix, index_type, index_params, transform_fingerprint, pipelines, chunk_table, state, provider, search_target)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 			g.ID, g.ModelKey, g.ModelName, g.ModelRevision, g.Dimension, g.Distance, g.QueryPrefix, g.DocumentPrefix,
-			g.IndexType, params, g.TransformFingerprint, pipes, g.ChunkTable, StatePending, prov); err != nil {
+			g.IndexType, params, g.TransformFingerprint, pipes, g.ChunkTable, StatePending, prov, g.SearchTarget); err != nil {
 			return fmt.Errorf("insert generation: %w", err)
 		}
 		ddl := []string{
@@ -470,11 +476,15 @@ func (s *Store) CreateGeneration(ctx context.Context, g *Generation, readerRole 
 				fingerprint        text NOT NULL,
 				content            text NOT NULL,
 				embedding          vector(%d) NOT NULL,
+				meta               jsonb NOT NULL DEFAULT '{}',
+				tsv                tsvector,
 				source_lsn         pg_lsn NOT NULL,
 				source_commit_time timestamptz,
 				updated_at         timestamptz NOT NULL DEFAULT now(),
 				PRIMARY KEY (pipeline, source_key, chunk_no))`, tbl, g.Dimension),
 			fmt.Sprintf(`CREATE INDEX %s ON %s (fingerprint)`, pgx.Identifier{g.ChunkTable + "_fp"}.Sanitize(), tbl),
+			fmt.Sprintf(`CREATE INDEX %s ON %s USING gin (meta)`, pgx.Identifier{g.ChunkTable + "_meta"}.Sanitize(), tbl),
+			fmt.Sprintf(`CREATE INDEX %s ON %s USING gin (tsv)`, pgx.Identifier{g.ChunkTable + "_tsv"}.Sanitize(), tbl),
 			fmt.Sprintf(`CREATE INDEX %s ON %s USING hnsw (embedding %s) WITH (m = %d, ef_construction = %d)`,
 				pgx.Identifier{g.ChunkTable + "_hnsw"}.Sanitize(), tbl, g.OpsClass(), g.IndexParams.M, g.IndexParams.EFConstruction),
 		}
@@ -840,4 +850,41 @@ func (s *Store) TryAdvisoryLock(ctx context.Context) (*pgxpool.Conn, error) {
 		return nil, errors.New("another embedsync run process holds the consumer lock for this sink schema")
 	}
 	return conn, nil
+}
+
+// SearchReady reports whether filtered and hybrid search may use the
+// generation for the configured search fingerprint.
+func (g *Generation) SearchReady(fp string) bool { return g.SearchFingerprint == fp }
+
+// QueueSearchRescan starts (re)building a live generation's search columns
+// for fp: it records the target and queues a re-scan of every document
+// pipeline (embed jobs, which reuse stored vectors) and view (state jobs for
+// its tables, then a render job). Returns false if fp is already built or
+// being built.
+func (s *Store) QueueSearchRescan(ctx context.Context, g *Generation, fp string, views map[string][]string) (bool, error) {
+	if g.SearchFingerprint == fp || g.SearchTarget == fp {
+		return false, nil
+	}
+	err := pgx.BeginFunc(ctx, s.Pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, `UPDATE `+s.T("generations")+` SET search_target = $2 WHERE id = $1`, g.ID, fp); err != nil {
+			return err
+		}
+		for _, p := range g.PipelineNames() {
+			kind := g.Pipelines[p].jobKind()
+			if comps, ok := views[p]; ok {
+				for _, c := range comps {
+					if _, err := tx.Exec(ctx, `INSERT INTO `+s.T("backfill_jobs")+` (generation_id, pipeline, kind, state) VALUES (NULL, $1, 'state', 'pending')
+						ON CONFLICT (pipeline) WHERE kind = 'state' AND state IN ('pending','running') DO NOTHING`, c); err != nil {
+						return err
+					}
+				}
+			}
+			if _, err := tx.Exec(ctx, `INSERT INTO `+s.T("backfill_jobs")+` (generation_id, pipeline, kind, state) VALUES ($1, $2, $3, 'pending')
+				ON CONFLICT (generation_id, pipeline) WHERE state IN ('pending','running') DO NOTHING`, g.ID, p, kind); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	return err == nil, err
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/config"
+	"github.com/raunaksahahere/postgres-embedding-sync/internal/filter"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/keys"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/metrics"
 	"github.com/raunaksahahere/postgres-embedding-sync/internal/pipeline"
@@ -83,8 +84,34 @@ func loadPipeCatalog(ctx context.Context, e *Env, p *config.PipelineDef) (*Catal
 			return nil, schemaErr(p.Name, "pipeline %s: allowlisted column %q does not exist on %s", p.Name, c, p.Table)
 		}
 	}
+	for _, m := range p.Metadata {
+		oid, ok := types[m.Column]
+		if !ok {
+			return nil, schemaErr(p.Name, "pipeline %s: metadata column %q does not exist on %s", p.Name, m.Column, p.Table)
+		}
+		if err := metaCompatible(filter.Type(m.Type), oid); err != nil {
+			return nil, fmt.Errorf("pipeline %s: metadata field %s (column %s): %w", p.Name, m.Name, m.Column, err)
+		}
+	}
 	sig := pipeline.RelationSignature(p, func(col string) (uint32, bool) { t, ok := types[col]; return t, ok })
 	return &Catalog{Codec: keys.NewCodec(kinds...), Signature: sig}, nil
+}
+
+// metaCompatible reports whether a column of type oid can carry a metadata
+// field of type t: text takes any column (its text form is stored as is),
+// float also takes integer columns, other types must match.
+func metaCompatible(t filter.Type, oid uint32) error {
+	if t == filter.Text {
+		return nil
+	}
+	have, err := filter.TypeForOID(oid)
+	if err != nil {
+		return err
+	}
+	if have == t || (t == filter.Float && have == filter.Int) {
+		return nil
+	}
+	return fmt.Errorf("declared %s but the column is %s", t, have)
 }
 
 func sameSet(a []string, b []string) bool {
@@ -537,6 +564,9 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 		return err
 	}
 	warnMovedEndpoints(e, gens)
+	if err := queueSearchRescans(ctx, e); err != nil {
+		return err
+	}
 	if gens, err = e.Store.Generations(ctx); err != nil {
 		return err
 	}
@@ -815,4 +845,40 @@ func warnMovedEndpoints(e *Env, gens []*store.Generation) {
 				"generation", g.ID, "provider", g.Provider.Name, "kind", p.Kind, "built_with", g.Provider.Endpoint, "now", now)
 		}
 	}
+}
+
+// queueSearchRescans starts building the search columns (metadata and
+// full-text) of every live generation that does not have them for the
+// current configuration: after the upgrade that adds them, and after a
+// metadata declaration or the text search configuration changes. The
+// re-scan reuses stored vectors, so nothing is re-embedded; filtered and
+// hybrid search on the generation turn on when it completes.
+func queueSearchRescans(ctx context.Context, e *Env) error {
+	gens, err := e.Store.Generations(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := e.Store.Pool.Exec(ctx, `SELECT $1::text::regconfig`, e.Cfg.Search.TextConfig); err != nil {
+		return fmt.Errorf("search.text_config %q is not a text search configuration in the sink database: %w", e.Cfg.Search.TextConfig, err)
+	}
+	fp := e.Cfg.SearchFingerprint()
+	views := map[string][]string{}
+	for _, v := range e.Cfg.Views {
+		for _, c := range v.Components() {
+			views[v.Name] = append(views[v.Name], c.Def.Name)
+		}
+	}
+	for _, g := range gens {
+		if !store.IsLive(g.State) && g.State != store.StatePending {
+			continue
+		}
+		queued, err := e.Store.QueueSearchRescan(ctx, g, fp, views)
+		if err != nil {
+			return fmt.Errorf("queue search re-scan of %s: %w", g.ID, err)
+		}
+		if queued {
+			e.Log.Info("building search columns (metadata, full text) in the background; vector search is unaffected", "generation", g.ID)
+		}
+	}
+	return nil
 }

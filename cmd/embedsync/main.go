@@ -12,6 +12,7 @@ import (
 	"os/signal"
 	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -394,7 +395,7 @@ func cmdMigrate(ctx context.Context, args []string) error {
 	}
 	defer e.Close()
 	m := &migrate.Migrator{Cfg: e.Cfg, Store: e.Store, Source: e.Source, Trs: e.Trs(), Log: e.Log, Embed: e.Providers, Out: os.Stdout,
-		Searcher: &search.Searcher{Pool: e.Store.Pool, Schema: e.Cfg.Sink.Schema, Providers: e.Providers}}
+		Searcher: app.NewSearcher(e, e.Store.Pool)}
 	if *c.json {
 		m.Out = os.Stderr
 	}
@@ -446,6 +447,10 @@ func cmdSearch(ctx context.Context, args []string) error {
 	k := c.fs.Int("k", 5, "results")
 	gen := c.fs.String("generation", "", "generation id (default: serving)")
 	exact := c.fs.Bool("exact", false, "exact search (no ANN index)")
+	mode := c.fs.String("mode", "vector", "vector, text or hybrid")
+	filt := c.fs.String("filter", "", `metadata filter as JSON, e.g. {"field":"lang","op":"eq","value":"en"}`)
+	pipes := c.fs.String("pipeline", "", "comma-separated pipelines/views to search (default all)")
+	tenant := c.fs.String("tenant", "", "tenant value (when search.tenant_filter is configured)")
 	_ = c.fs.Parse(args)
 	if c.fs.NArg() == 0 {
 		return errors.New("usage: embedsync search [flags] <query>")
@@ -466,12 +471,22 @@ func cmdSearch(ctx context.Context, args []string) error {
 			pool = rs.Pool
 		}
 	}
-	s := &search.Searcher{Pool: pool, Schema: e.Cfg.Sink.Schema, Providers: e.Providers}
+	s := app.NewSearcher(e, pool)
 	q := c.fs.Arg(0)
 	for _, a := range c.fs.Args()[1:] {
 		q += " " + a
 	}
-	res, err := s.Search(ctx, q, search.Options{K: *k, Generation: *gen, Exact: *exact})
+	o := search.Options{K: *k, Generation: *gen, Exact: *exact, Mode: search.Mode(*mode)}
+	if *filt != "" {
+		o.Filter = []byte(*filt)
+	}
+	if *pipes != "" {
+		o.Pipelines = strings.Split(*pipes, ",")
+	}
+	if *tenant != "" {
+		o.Tenant = tenant
+	}
+	res, err := s.Search(ctx, q, o)
 	if err != nil {
 		return err
 	}

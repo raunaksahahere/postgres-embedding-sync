@@ -320,7 +320,8 @@ func (b *Backfill) scan(ctx context.Context, spec *Spec, lo *string, limit int) 
 		return nil, err
 	}
 	nk := len(spec.Def.Key)
-	cols := nk + len(spec.Def.Fields)
+	fields := spec.Def.AllFields()
+	cols := nk + len(fields)
 	rs, err := b.Source.Query(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("backfill scan %s: %w", spec.Name, err)
@@ -348,7 +349,7 @@ func (b *Backfill) scan(ctx context.Context, spec *Spec, lo *string, limit int) 
 			return nil, fmt.Errorf("backfill scan %s: %w", spec.Name, err)
 		}
 		r := SnapRow{Key: key, Fields: map[string]*string{}}
-		for i, f := range spec.Def.Fields {
+		for i, f := range fields {
 			r.Fields[f.Name] = vals[nk+i]
 		}
 		out = append(out, r)
@@ -383,12 +384,13 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 func ScanQuery(def *config.PipelineDef, codec keys.Codec, lo *string, limit int) (string, []any, error) {
 	schema, table := def.SchemaTable()
 	keyCols := make([]string, len(def.Key))
-	cols := make([]string, 0, len(def.Key)+len(def.Fields))
+	fields := def.AllFields()
+	cols := make([]string, 0, len(def.Key)+len(fields))
 	for i, k := range def.Key {
 		keyCols[i] = "t." + pgx.Identifier{k}.Sanitize()
 		cols = append(cols, keyCols[i]+"::text")
 	}
-	for _, f := range def.Fields {
+	for _, f := range fields {
 		cols = append(cols, "t."+pgx.Identifier{f.Column}.Sanitize()+"::text")
 	}
 	q := `SELECT ` + strings.Join(cols, ", ") + ` FROM ` + pgx.Identifier{schema, table}.Sanitize() + ` AS t`

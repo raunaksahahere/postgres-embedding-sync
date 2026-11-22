@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -56,7 +55,7 @@ func (s *runState) ConsumerState() string {
 func Run(ctx context.Context, opts RunOptions, e *Env) error {
 	cfg := e.Cfg
 	state := &runState{}
-	searcher := &search.Searcher{Pool: e.Store.Pool, Schema: e.Cfg.Sink.Schema, Providers: e.Providers}
+	searcher := NewSearcher(e, e.Store.Pool)
 	if dsnEnv := cfg.Sink.ReaderDSNEnv; dsnEnv != "" {
 		if dsn, err := config.Env(dsnEnv); err == nil {
 			if rs, err := store.New(ctx, dsn, cfg.Sink.Schema, 8); err == nil {
@@ -248,23 +247,7 @@ func Handler(e *Env, state *runState, searcher *search.Searcher) http.Handler {
 		_ = json.NewEncoder(w).Encode(rep)
 	})
 	mux.HandleFunc("/search", func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query().Get("q")
-		if q == "" || len(q) > 4096 {
-			http.Error(w, "q is required (max 4096 bytes)", http.StatusBadRequest)
-			return
-		}
-		k, _ := strconv.Atoi(r.URL.Query().Get("k"))
-		if k <= 0 || k > 100 {
-			k = 10
-		}
-		res, err := searcher.Search(r.Context(), q, search.Options{K: k, Generation: r.URL.Query().Get("generation"), Exact: r.URL.Query().Get("exact") == "true"})
-		w.Header().Set("Content-Type", "application/json")
-		if err != nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
-			return
-		}
-		_ = json.NewEncoder(w).Encode(res)
+		serveSearch(w, r, searcher, e.Cfg.Search.TenantFilter)
 	})
 	return mux
 }
