@@ -502,12 +502,12 @@ func TestOpenAIRequestWide400IsPermanent(t *testing.T) {
 	}))
 	defer srv.Close()
 	p := NewHTTP(testCfg(srv.URL), nil)
-	// A single refused input is quarantined instead (one bad chunk must not
-	// stop the pipeline).
-	t.Run("1 input is rejected, not permanent", func(t *testing.T) {
+	// A single input refused by a provider that also refuses a known-good
+	// probe is a configuration error, never a quarantine.
+	t.Run("1 input: probe refused too, permanent", func(t *testing.T) {
 		vectors, rejected, err := p.Embed(context.Background(), Request{Model: "m", Inputs: []string{"text"}})
-		if err != nil || len(vectors) != 0 || len(rejected) != 1 {
-			t.Fatalf("single refused input: err %v vectors %v rejected %v", err, vectors, rejected)
+		if err == nil || !strings.Contains(err.Error(), "probe") || len(rejected) != 0 || len(vectors) != 0 {
+			t.Fatalf("single refused input with a broken provider: err %v vectors %v rejected %v", err, vectors, rejected)
 		}
 	})
 	for _, n := range []int{2, 9} {
@@ -785,4 +785,61 @@ func TestGeminiCodec(t *testing.T) {
 			t.Errorf("url = %s", got)
 		}
 	})
+}
+
+// A single poison input is quarantined once a probe shows the provider works.
+func TestSingleRefusedInputQuarantinedAfterProbe(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req := decodeOAI(t, r)
+		if strings.Contains(req.Input[0], "POISON") {
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"error":{"message":"input contains POISON"}}`)
+			return
+		}
+		writeOK(w, req.Input, 2, nil)
+	}))
+	defer srv.Close()
+	p := NewHTTP(testCfg(srv.URL), nil)
+	vectors, rejected, err := p.Embed(context.Background(), Request{Model: "m", Inputs: []string{"POISON row"}})
+	if err != nil || len(vectors) != 0 || len(rejected) != 1 {
+		t.Fatalf("err %v vectors %v rejected %v", err, vectors, rejected)
+	}
+}
+
+// An input the provider keeps answering with an unusable vector is isolated
+// after maxInvalid attempts; the rest of the batch is embedded. If every
+// input is affected (e.g. a wrong configured dimension) it is a permanent
+// configuration error.
+func TestPersistentlyInvalidResponses(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req := decodeOAI(t, r)
+		data := make([]oaiItem, 0, len(req.Input))
+		for i, s := range req.Input {
+			v := vecFor(s, 2)
+			if strings.Contains(s, "ZERO") {
+				v = []float32{0, 0}
+			}
+			data = append(data, oaiItem{Index: i, Embedding: v})
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"data": data})
+	}))
+	defer srv.Close()
+	p := NewHTTP(testCfg(srv.URL), nil)
+	inputs := []string{"a", "ZERO vector", "ccc", "dddd"}
+	vectors, rejected, err := p.Embed(context.Background(), Request{Model: "m", Inputs: inputs})
+	if err != nil || len(vectors) != 3 || len(rejected) != 1 || !strings.Contains(rejected[1], "invalid embedding") {
+		t.Fatalf("err %v vectors %d rejected %v", err, len(vectors), rejected)
+	}
+	_, _, err = p.Embed(context.Background(), Request{Model: "m", Inputs: []string{"x", "y", "z"}, Expect: 7})
+	if err == nil || !strings.Contains(err.Error(), "every input") {
+		t.Fatalf("a dimension mismatch on every input must be permanent: %v", err)
+	}
+}
+
+func TestParseRetryAfterClamps(t *testing.T) {
+	h := http.Header{}
+	h.Set("Retry-After", "1e30")
+	if d := parseRetryAfter(h, time.Now()); d <= 0 || d > maxRetryAfterHeader {
+		t.Fatalf("huge Retry-After must clamp, got %s", d)
+	}
 }

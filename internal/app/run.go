@@ -536,6 +536,7 @@ func pipelineRun(ctx context.Context, e *Env, opts RunOptions, state *runState) 
 	if err := ensureGenerations(ctx, e); err != nil {
 		return err
 	}
+	warnMovedEndpoints(e, gens)
 	if gens, err = e.Store.Generations(ctx); err != nil {
 		return err
 	}
@@ -793,4 +794,25 @@ func ensureGenerations(ctx context.Context, e *Env) error {
 		return e.Store.InitServing(ctx, gens[0].ID)
 	}
 	return nil
+}
+
+// warnMovedEndpoints logs when a provider that built a live generation now
+// points at another endpoint. Moving a server is legitimate, but vectors
+// from two different deployments must be the same model for the generation
+// to stay coherent; the operator is told rather than silently trusted.
+func warnMovedEndpoints(e *Env, gens []*store.Generation) {
+	for _, g := range gens {
+		if !store.IsLive(g.State) || g.Provider.Endpoint == "" {
+			continue
+		}
+		p, ok := e.Cfg.Providers[g.Provider.Name]
+		if !ok {
+			continue
+		}
+		now := store.NewProviderIdentity(e.Cfg, e.Cfg.Models[g.ModelKey]).Endpoint
+		if now != "" && now != g.Provider.Endpoint {
+			e.Log.Warn("embedding provider endpoint changed since the generation was built; make sure it serves the same model",
+				"generation", g.ID, "provider", g.Provider.Name, "kind", p.Kind, "built_with", g.Provider.Endpoint, "now", now)
+		}
+	}
 }

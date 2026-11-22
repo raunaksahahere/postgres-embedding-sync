@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -98,7 +99,17 @@ type HTTPProvider struct {
 	reqLim *rate.Limiter
 	tokLim *rate.Limiter // nil when TokensPerMinute is 0
 	tel    Telemetry
+	// healthy is set by the first valid response: from then on a refusal of
+	// a single input can be trusted to be about that input.
+	healthy atomic.Bool
 }
+
+// maxInvalid is how many consecutive invalid responses a batch gets before
+// its inputs are isolated like refused ones.
+const maxInvalid = 5
+
+// probeInput is embedded to tell a bad input from a provider-wide problem.
+const probeInput = "embedsync provider probe"
 
 var _ Provider = (*HTTPProvider)(nil)
 
@@ -494,6 +505,7 @@ func (o *HTTPProvider) EmbedOnce(ctx context.Context, req Request) (*Response, e
 		if !usage.Reported {
 			usage = Usage{Tokens: estimate}
 		}
+		o.healthy.Store(true)
 		report("ok")
 		o.tel.Embedded(o.cfg.Name, n, usage)
 		return &Response{Model: req.Model, Revision: req.Revision, Dimension: dim, Embeddings: vecs}, nil
@@ -606,12 +618,17 @@ func truncate(s string, limit int) string {
 	return s + "..."
 }
 
+// maxRetryAfterHeader bounds a parsed Retry-After before it is converted
+// (a huge value would overflow time.Duration); callers cap it further with
+// MaxRetryAfter.
+const maxRetryAfterHeader = 24 * time.Hour
+
 // parseRetryAfter reads retry-after-ms (milliseconds) or Retry-After
 // (delay-seconds or an HTTP-date). It returns 0 when neither is usable.
 func parseRetryAfter(h http.Header, now time.Time) time.Duration {
 	if v := strings.TrimSpace(h.Get("Retry-After-Ms")); v != "" {
 		if ms, err := strconv.ParseFloat(v, 64); err == nil && ms > 0 && !math.IsInf(ms, 0) {
-			return time.Duration(ms * float64(time.Millisecond))
+			return time.Duration(min(ms, float64(maxRetryAfterHeader.Milliseconds())) * float64(time.Millisecond))
 		}
 	}
 	v := strings.TrimSpace(h.Get("Retry-After"))
@@ -622,7 +639,7 @@ func parseRetryAfter(h http.Header, now time.Time) time.Duration {
 		if secs <= 0 || math.IsInf(secs, 0) || math.IsNaN(secs) {
 			return 0
 		}
-		return time.Duration(secs * float64(time.Second))
+		return time.Duration(min(secs, maxRetryAfterHeader.Seconds()) * float64(time.Second))
 	}
 	if t, err := http.ParseTime(v); err == nil {
 		if d := t.Sub(now); d > 0 {
@@ -706,11 +723,26 @@ func (o *HTTPProvider) embedBatch(ctx context.Context, req Request, idx []int, v
 	for i, at := range idx {
 		sub.Inputs[i] = req.Inputs[at]
 	}
+	invalid := 0
 	for attempt := 0; ; attempt++ {
 		resp, err := o.EmbedOnce(ctx, sub)
 		var br *batchRejected
 		var rej *RejectedError
 		var tr *TransientError
+		if errors.As(err, &tr) && failureOutcome(err) == "invalid" {
+			if invalid++; invalid >= maxInvalid {
+				// The provider keeps answering this batch with unusable
+				// vectors: isolate the inputs responsible, as for a refusal.
+				msg := fmt.Sprintf("invalid embedding %d times in a row: %v", invalid, err)
+				if len(idx) > 1 {
+					err = &batchRejected{message: msg}
+				} else {
+					err = &RejectedError{Indexes: []int{0}, Message: msg}
+				}
+			}
+		} else {
+			invalid = 0
+		}
 		switch {
 		case err == nil:
 			for i, at := range idx {
@@ -724,6 +756,18 @@ func (o *HTTPProvider) embedBatch(ctx context.Context, req Request, idx []int, v
 			}
 			return o.embedBatch(ctx, req, idx[half:], vectors, rejected)
 		case errors.As(err, &rej):
+			if !o.healthy.Load() {
+				// Nothing has worked yet: a refusal may be about the request
+				// (key, model, dimensions), not the input. Ask with a
+				// known-good input before quarantining anything.
+				if perr := o.probe(ctx, req); perr != nil {
+					var ptr *TransientError
+					if errors.As(perr, &ptr) && failureOutcome(perr) != "invalid" {
+						continue // provider unavailable or throttled: retry the input later
+					}
+					return fmt.Errorf("embedding provider %q refuses a known-good probe input too, so this is a configuration or account error, not a bad input: %w", o.cfg.Name, perr)
+				}
+			}
 			for _, i := range rej.Indexes {
 				if i < 0 || i >= len(idx) {
 					return fmt.Errorf("embedding provider %q rejected out-of-range index %d", o.cfg.Name, i)
@@ -748,6 +792,19 @@ func (o *HTTPProvider) embedBatch(ctx context.Context, req Request, idx []int, v
 			return err
 		}
 	}
+}
+
+// probe embeds a known-good input with the request's settings; success marks
+// the provider healthy.
+func (o *HTTPProvider) probe(ctx context.Context, req Request) error {
+	p := req
+	p.Inputs = []string{probeInput}
+	_, err := o.EmbedOnce(ctx, p)
+	var rej *RejectedError
+	if errors.As(err, &rej) {
+		return fmt.Errorf("probe refused: %s", rej.Message)
+	}
+	return err
 }
 
 type nopTelemetry struct{}

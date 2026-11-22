@@ -188,7 +188,7 @@ func openWith(ctx context.Context, c *common, needSource, needEmbed bool) (*app.
 		return nil, nil, err
 	}
 	var emb *local.Embedder
-	if needEmbed && cfg.Embedder.Managed {
+	if needEmbed && cfg.Embedder.Managed && len(configModels(cfg)) > 0 {
 		emb, err = local.Ensure(ctx, local.Options{Models: configModels(cfg),
 			Progress: func(m string) { log.Info("waiting for embedder", "status", m) }})
 		if err != nil {
@@ -201,10 +201,14 @@ func openWith(ctx context.Context, c *common, needSource, needEmbed bool) (*app.
 	return e, emb, err
 }
 
+// configModels lists the models the built-in embedder serves (models of
+// other providers are never loaded locally).
 func configModels(cfg *config.Config) []local.ModelRef {
 	keys := make([]string, 0, len(cfg.Models))
-	for k := range cfg.Models {
-		keys = append(keys, k)
+	for k, m := range cfg.Models {
+		if m.ProviderName() == config.LocalProvider {
+			keys = append(keys, k)
+		}
 	}
 	sort.Strings(keys)
 	out := make([]local.ModelRef, 0, len(keys))

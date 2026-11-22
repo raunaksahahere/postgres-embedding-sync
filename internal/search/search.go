@@ -120,10 +120,19 @@ func (s *Searcher) Search(ctx context.Context, query string, o Options) (res *Re
 	for attempt := 0; attempt < 3; attempt++ {
 		resp, err = prov.EmbedOnce(ctx, g.queryRequest(query))
 		var tr *embedclient.TransientError
-		if err == nil || !errors.As(err, &tr) {
+		if err == nil || !errors.As(err, &tr) || attempt == 2 {
 			break
 		}
-		time.Sleep(prov.Backoff(attempt))
+		// A throttled query waits as asked, but never longer than a
+		// search should take.
+		wait := max(prov.Backoff(attempt), min(embedclient.RetryAfterOf(err), 5*time.Second))
+		t := time.NewTimer(wait)
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			return nil, ctx.Err()
+		}
 	}
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
