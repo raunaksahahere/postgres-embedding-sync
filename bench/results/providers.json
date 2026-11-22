@@ -1,0 +1,67 @@
+{
+  "measured_at": "2026-11-22T07:03:53Z",
+  "results": [
+    {
+      "endpoint": "cpu",
+      "note": "built-in embedder (sentence-transformers all-MiniLM-L6-v2) on the CPU",
+      "real_endpoint": true,
+      "rows": 600,
+      "embeddings": 1432,
+      "seconds": 87.871582529,
+      "rows_per_second": 6.828146059643159,
+      "embeddings_per_second": 16.296508595681672,
+      "tokens": 0,
+      "token_source": "estimated",
+      "retries": 0,
+      "mean_request_seconds": 2.730463717186813
+    },
+    {
+      "endpoint": "gpu",
+      "note": "OpenAI-compatible server on a GPU (all-minilm)",
+      "real_endpoint": true,
+      "rows": 600,
+      "embeddings": 1432,
+      "seconds": 53.027634623,
+      "rows_per_second": 11.314855061246845,
+      "embeddings_per_second": 27.00478741284247,
+      "tokens": 224319,
+      "token_source": "reported",
+      "retries": 0,
+      "mean_request_seconds": 1.0484306127252745
+    },
+    {
+      "endpoint": "gemini",
+      "note": "Gemini API free tier (gemini-embedding-001, 768 dimensions, RETRIEVAL_DOCUMENT/QUERY task types); rate-limited to stay inside the free quota",
+      "real_endpoint": true,
+      "rows": 60,
+      "embeddings": 143,
+      "seconds": 90.549855631,
+      "rows_per_second": 0.6626183949371072,
+      "embeddings_per_second": 1.5792405079334388,
+      "tokens": 25106,
+      "token_source": "estimated",
+      "retries": 7,
+      "mean_request_seconds": 1.0594931499375
+    },
+    {
+      "endpoint": "mock",
+      "note": "MOCK: in-process fake OpenAI-compatible server (no model; not a real endpoint)",
+      "real_endpoint": false,
+      "rows": 600,
+      "embeddings": 1800,
+      "seconds": 6.798808125,
+      "rows_per_second": 88.25076233490557,
+      "embeddings_per_second": 264.7522870047167,
+      "tokens": 205200,
+      "token_source": "reported",
+      "retries": 0,
+      "mean_request_seconds": 0.0025839790844444446
+    }
+  ],
+  "hardware": {
+    "cpu": "AMD Ryzen (Cezanne) 12 threads, 7 GB RAM",
+    "gpu": "AMD Radeon RX 6500 (Navi 24, 4 GB), ROCm via Ollama ollama/ollama:rocm (HSA_OVERRIDE_GFX_VERSION=10.3.0)"
+  },
+  "workload": "first 600 (Gemini: 60) BEIR SciFact abstracts, chunk_words 120 / overlap 20, one generation backfilled from a cold start; rows/s = source rows made searchable per second, embeddings/s = chunk vectors per second, both end to end through embedsync on PostgreSQL 17",
+  "reproduce": "EMBEDSYNC_IT_CPU_EMBEDDER_URL=... EMBEDSYNC_IT_GPU_OPENAI_URL=.../v1 GEMINI_API_KEY=... EMBEDSYNC_IT_SCIFACT=bench/.data/scifact/corpus.jsonl.gz RUN=TestReal scripts/test-integration.sh 17"
+}

@@ -82,6 +82,7 @@ func Doctor(ctx context.Context, out io.Writer, configPath string, skipEmbedder 
 
 	if cfg != nil {
 		d.database(ctx, cfg)
+		d.providers(cfg)
 	}
 
 	if skipEmbedder {
@@ -269,4 +270,35 @@ func embedOnce(ctx context.Context, url string, m local.ModelRef) (int, error) {
 		return 0, errors.New("embed: malformed response")
 	}
 	return r.Dimension, nil
+}
+
+// providers checks every configured embedding provider a model uses: its
+// API key variable must be set (the key itself is never printed). The
+// endpoint is not called here; `embedsync run` reports request failures.
+func (d *doctor) providers(cfg *config.Config) {
+	names := make([]string, 0, len(cfg.Providers))
+	for n := range cfg.Providers {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		p := cfg.Providers[n]
+		used := false
+		for _, m := range cfg.Models {
+			used = used || m.ProviderName() == n
+		}
+		if !used {
+			d.warn("provider %s: no model uses it", n)
+			continue
+		}
+		if p.APIKeyEnv != "" && os.Getenv(p.APIKeyEnv) == "" {
+			d.fail("provider %s: environment variable %s (api_key_env) is not set; put it in the environment or in embedsync.env next to the config", n, p.APIKeyEnv)
+			continue
+		}
+		price := "no price configured"
+		if p.Pricing.USDPerMillionTokens > 0 {
+			price = fmt.Sprintf("estimated cost at $%g per million tokens (source: %s)", p.Pricing.USDPerMillionTokens, p.Pricing.Source)
+		}
+		d.ok("provider %s: kind %s, %s", n, p.Kind, price)
+	}
 }

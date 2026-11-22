@@ -388,6 +388,12 @@ type envOpts struct {
 	binary string
 	// initialGen overrides initial_generation (default v1).
 	initialGen string
+	// Real endpoints (gated tests): embedderURL replaces the fake built-in
+	// embedder; extraModels and extraProviders are appended (YAML, indented
+	// by two and four spaces as under models: / providers:).
+	embedderURL    string
+	extraModels    string
+	extraProviders string
 }
 
 func randHex(n int) string {
@@ -483,7 +489,7 @@ func (e *env) writeConfig() {
   pv2: {provider: mock, name: fake/bowalt, revision: rev1, dimension: 64, distance: cosine, query_prefix: "query: ", document_prefix: "passage: ", hnsw: {m: 16, ef_construction: 64, ef_search: 100}}
   pbad: {provider: mock, name: fake/noise, revision: rev1, dimension: 64, distance: cosine}`
 		providers = fmt.Sprintf(`
-providers:
+providers:%s
   mock:
     kind: openai
     url: %s/v1
@@ -493,7 +499,12 @@ providers:
     concurrency: 2
     retry: {initial_backoff: 20ms, max_backoff: 300ms}
     max_retry_after: 3s
-    pricing: {usd_per_million_tokens: 0.02, source: "integration test fixture (not a real price)"}`, e.emb.srv.URL)
+    pricing: {usd_per_million_tokens: 0.02, source: "integration test fixture (not a real price)"}`, o.extraProviders, e.emb.srv.URL)
+		models += o.extraModels
+	}
+	embURL := e.emb.srv.URL
+	if o.embedderURL != "" {
+		embURL = o.embedderURL
 	}
 	eval := ""
 	if o.evalQueries != "" {
@@ -551,7 +562,7 @@ migration:
   catchup_timeout: 60s%s
   gates: {min_ann_recall_at_10: 0.9, noninferiority_margin_ndcg: 0.02, noninferiority_margin_recall: 0.02, bootstrap_samples: 1000, seed: 7, require_zero_unresolved: true}
 metrics: {listen: "127.0.0.1:%d"}
-`, tables, e.slot, pipes, o.chunkWords, o.chunkOverlap, e.emb.srv.URL, embedBatch, models, providers, initialGen, o.onPoison, o.batch, eval, e.port)
+`, tables, e.slot, pipes, o.chunkWords, o.chunkOverlap, embURL, embedBatch, models, providers, initialGen, o.onPoison, o.batch, eval, e.port)
 	e.cfgPath = filepath.Join(e.dir, "embedsync.yaml")
 	if err := os.WriteFile(e.cfgPath, []byte(cfg), 0o600); err != nil {
 		e.t.Fatal(err)
