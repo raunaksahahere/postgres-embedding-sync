@@ -63,5 +63,52 @@
     "gpu": "AMD Radeon RX 6500 (Navi 24, 4 GB), ROCm via Ollama ollama/ollama:rocm (HSA_OVERRIDE_GFX_VERSION=10.3.0)"
   },
   "workload": "first 600 (Gemini: 60) BEIR SciFact abstracts, chunk_words 120 / overlap 20, one generation backfilled from a cold start; rows/s = source rows made searchable per second, embeddings/s = chunk vectors per second, both end to end through embedsync on PostgreSQL 17",
-  "reproduce": "EMBEDSYNC_IT_CPU_EMBEDDER_URL=... EMBEDSYNC_IT_GPU_OPENAI_URL=.../v1 GEMINI_API_KEY=... EMBEDSYNC_IT_SCIFACT=bench/.data/scifact/corpus.jsonl.gz RUN=TestReal scripts/test-integration.sh 17"
+  "reproduce": "EMBEDSYNC_IT_CPU_EMBEDDER_URL=... EMBEDSYNC_IT_GPU_OPENAI_URL=.../v1 GEMINI_API_KEY=... EMBEDSYNC_IT_SCIFACT=bench/.data/scifact/corpus.jsonl.gz RUN=TestReal scripts/test-integration.sh 17",
+  "quality_gate_real": {
+    "fixture": "eval/fixtures/ci (synthetic, 24 judged queries over the 48-document demo corpus)",
+    "cpu_to_gpu_same_model": {
+      "cpu_minilm": {
+        "recall@10": 0.9792,
+        "ndcg@10": 0.9743
+      },
+      "gpu_minilm": {
+        "recall@10": 0.9792,
+        "ndcg@10": 0.9743
+      },
+      "delta_ndcg@10": [
+        0.0,
+        0.0,
+        0.0
+      ],
+      "verdict": "PASS",
+      "rolled_back": true
+    },
+    "cpu_to_gemini": {
+      "cpu_minilm": {
+        "recall@10": 0.9792,
+        "ndcg@10": 0.9743
+      },
+      "gemini768": {
+        "recall@10": 1.0,
+        "ndcg@10": 0.9904
+      },
+      "delta_ndcg@10": [
+        0.0161,
+        0.0,
+        0.0397
+      ],
+      "delta_recall@10": [
+        0.0208,
+        0.0,
+        0.0625
+      ],
+      "verdict": "PASS",
+      "rolled_back": true
+    },
+    "rejection": "proven with the mock provider (TestCrossProviderMigrationGate), not on a real endpoint"
+  },
+  "gemini_task_types": {
+    "note": "same text embedded as RETRIEVAL_DOCUMENT vs RETRIEVAL_QUERY via batchEmbedContents (768 dims)",
+    "cosine": 0.7591
+  }
 }

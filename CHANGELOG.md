@@ -1,5 +1,53 @@
 # Changelog
 
+## v0.5.0
+
+Embedding providers: a model can be embedded by an OpenAI-compatible endpoint or the
+Gemini API, not only by the built-in embedder.
+
+* **Providers**: `providers:` names extra endpoints. `kind: openai` speaks the
+  OpenAI-compatible `/embeddings` API (Ollama, vLLM, HF TEI, OpenAI, NVIDIA's API catalog);
+  `kind: gemini` speaks Gemini's `batchEmbedContents`, which sends document and query task
+  types. A model selects one with `provider:`, and `request_dimensions` asks for shorter
+  vectors. The built-in embedder remains the default: existing configurations do not
+  change. See `examples/embedsync-providers.yaml`.
+* **Routing**: each generation records its provider (name, kind, endpoint without
+  credentials, request settings). Queries are embedded by the searched generation's
+  provider with the same settings, so promotion and rollback switch providers together
+  with the index. Search results report `provider`; `status` names the provider of
+  non-local generations.
+* **Limits and faults**: requests per second with a burst, tokens per minute and a
+  concurrency bound per provider; batches cut by inputs and estimated tokens. HTTP 429 is
+  retried and `Retry-After` is honoured up to `max_retry_after`. Outages and malformed
+  responses are retried and never acknowledged. A batch the provider refuses (400, 413,
+  422) is bisected, so only the inputs it will never accept are quarantined; a refusal of
+  every input is a permanent error. API keys come only from environment variables and are
+  redacted from errors.
+* **Fingerprints**: a non-local generation's chunk fingerprints include its provider name,
+  kind, request dimensions and document input type. Local fingerprints are unchanged.
+* **Metrics and cost**: `embedsync_provider_*` series labelled by provider (requests,
+  latency, retries, retry wait, inputs, tokens by source). The cost series
+  `embedsync_provider_estimated_cost_usd_total{provider,pricing_source}` is an estimate:
+  tokens times the configured price, labelled with the configured pricing source.
+  embedsync ships no price list.
+* **Migrations**: a provider model is migrated like any model, through the same quality
+  gates.
+* **Upgrade**: stop `embedsync run`, install the new version, run
+  `embedsync init --admin-url <admin URL>`, then start `run`. It applies
+  `sink/0004_providers.sql` (adds `generations.provider`; additive). Existing generations
+  are recorded as built by the built-in embedder and keep serving; nothing is re-embedded.
+  Downgrading after `init` is not supported.
+* **Verification**: integration tests with a fault-injecting fake provider (429 with
+  `Retry-After`, outage, malformed batches, crashes around the sink commit, a cross-provider
+  migration with a continuous reader). Gated real-endpoint tests ran against Ollama on an AMD
+  GPU (ROCm) and the Gemini free tier; measurements are in `bench/results/providers.json`.
+  Not verified: OpenAI itself, NVIDIA, CUDA GPUs and paid tiers.
+* **Failure handling**: a single input refused by a provider is quarantined only once the
+  provider is known to work (an earlier valid response or a known-good probe); otherwise
+  the refusal is a configuration or account error and nothing is quarantined. Five
+  invalid responses in a row isolate the inputs responsible; a wrong configured
+  dimension stops with an error instead of retrying silently.
+
 ## v0.4.0
 
 Document views: one document assembled from related tables.

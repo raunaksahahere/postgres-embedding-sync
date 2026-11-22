@@ -182,6 +182,14 @@ a failover without synced slots, treat it as slot loss.
   key and run `embedsync migrate --to <key>`. Revisions are commit SHAs, so a model
   repository update cannot silently change vectors.
 
+* **From v0.4.0 to providers** (v0.5.0): stop `run`, install the new version, run
+  `embedsync init --admin-url <admin URL>` (or the admin DSN variables), then start `run`.
+  `init` applies `sink/0004_providers.sql`: it adds `generations.provider` (default
+  `{"name": "local", "kind": "local"}`) and changes nothing else. Existing generations are
+  recorded as built by the built-in embedder and keep serving; nothing is re-embedded. Until
+  `init` runs, every command says the sink needs it. Downgrading after `init` is not
+  supported.
+
 ## Models: download, cache, offline
 
 The embedder downloads each `name@revision` in `EMBEDDER_MODELS` from Hugging Face on
@@ -195,6 +203,52 @@ HF_HUB_OFFLINE=1 docker compose up -d
 
 To pre-seed an air-gapped host, copy the populated volume (or a host directory mounted at
 `/models`) from a machine that ran it once.
+
+## Embedding providers
+
+### Configure a provider
+
+1. Put the API key in the environment, or in `embedsync.env` next to the config (written
+   by `embedsync setup`, mode 0600). Name only the variable in the config (`api_key_env`).
+2. Add the `providers:` entry and a model with `provider:`. `dimension` is the size the
+   model returns, and `request_dimensions` (optional) must equal it.
+3. Run `embedsync doctor`. It checks that each used provider's key variable is set and
+   prints its kind and estimated price. It does not call the endpoint.
+4. Run `embedsync migrate --to <model>` and read the gate report. A new generation serves
+   only after it passes.
+
+### Switch a model to a provider
+
+A generation keeps the provider and settings it was built with, so a model key is never
+moved to another provider in place. Add a new key (for example `gemini768`), then
+`embedsync migrate --to gemini768`. The report names the active and candidate providers.
+`embedsync migrate rollback` returns searches to the previous generation and its provider.
+`Set` refuses to serve a generation whose provider was removed or changed kind, so
+restore the old definition before rolling back to it.
+
+### Metrics to watch
+
+| metric | what it tells you |
+|---|---|
+| `embedsync_provider_retries_total{provider,reason}` | `throttled` (429), `unavailable` (outage, 5xx, connection), `invalid` (malformed response). Sustained `throttled` means the configured limits are above the quota. |
+| `embedsync_provider_retry_wait_seconds_total{provider}` | time spent waiting before retries, including `Retry-After` |
+| `embedsync_provider_requests_total{provider,outcome}` and `embedsync_provider_request_seconds` | request outcomes and latency per provider |
+| `embedsync_provider_inputs_total{provider}` | inputs embedded per provider |
+| `embedsync_provider_tokens_total{provider,source}` | tokens; `source="estimated"` means the provider reported no usage |
+| `embedsync_provider_estimated_cost_usd_total{provider,pricing_source}` | an estimate: tokens times the configured price. Check spend against the provider's own billing. |
+
+The freshness alerts in `deploy/prometheus/alerts.yml` apply to providers as they do to the
+built-in embedder.
+
+### GPU embeddings with Ollama on AMD (ROCm)
+
+The measured GPU run used Ollama's ROCm image (`ollama/ollama:rocm`) on an AMD Radeon RX 6500
+(4 GB, Navi 24). That card is not in ROCm's supported list, so the container needs
+`HSA_OVERRIDE_GFX_VERSION=10.3.0`. With it, all 7 of 7 layers of `all-minilm` were offloaded to
+the GPU, and the OpenAI-compatible `/v1/embeddings` endpoint reported token usage.
+Point a provider at it with `kind: openai` and `url: http://127.0.0.1:11434/v1`, and set the
+model's `dimension: 384`. Pin `revision` to the Ollama model digest. Other AMD cards, CUDA GPUs
+and NVIDIA's catalog were not verified.
 
 ## PostgreSQL images
 

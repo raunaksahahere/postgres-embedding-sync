@@ -376,3 +376,24 @@ func TestComponentValue(t *testing.T) {
 		t.Error("Value of an unknown column must report ok=false")
 	}
 }
+
+func TestProvidersExampleParses(t *testing.T) {
+	b, err := os.ReadFile("../../examples/embedsync-providers.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := Parse(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Providers["gemini"].Kind != "gemini" || c.Providers["gpu"].Kind != "openai" {
+		t.Fatalf("providers %+v", c.Providers)
+	}
+	for _, m := range c.Models {
+		if m.ProviderName() != LocalProvider {
+			if _, ok := c.Providers[m.ProviderName()]; !ok {
+				t.Fatalf("model uses unknown provider %s", m.ProviderName())
+			}
+		}
+	}
+}

@@ -37,8 +37,9 @@ while serving searches.
 
 * Go service (pgx, pglogrepl), a local CPU embedding service (sentence-transformers, pinned
   revisions, no API key), PostgreSQL 16, 17 or 18 with pgvector.
-* Status: **v0.4.0**: document views from related tables, several tables per process
-  (pipelines), composite primary keys, single process. See [limitations](#limitations).
+* Status: **v0.5.0**: embedding providers (OpenAI-compatible and Gemini endpoints, routed per
+  generation), document views from related tables, several tables per process (pipelines),
+  composite primary keys, single process. See [limitations](#limitations).
 
 ```mermaid
 flowchart LR
@@ -315,6 +316,33 @@ Writer errors were 0 in every run, and the concurrent reader never returned a wr
 
 Details: [docs/guarantees.md](docs/guarantees.md).
 
+### Embedding providers
+
+The same workload through each endpoint, end to end through embedsync on PostgreSQL 17:
+the first 600 BEIR SciFact abstracts (Gemini: 60), chunked at 120 words with 20 words of
+overlap, one generation backfilled from a cold start. rows/s counts source rows made
+searchable; embeddings/s counts chunk vectors. One machine: AMD Ryzen (12 threads, 7 GB RAM)
+with an AMD Radeon RX 6500 (4 GB) used through Ollama's ROCm image for the GPU run. Raw data: [`bench/results/providers.json`](bench/results/providers.json).
+
+| endpoint | real | model | rows | rows/s | embeddings/s | tokens (source) | retries |
+|---|---|---|---|---|---|---|---|
+| built-in CPU embedder | yes | all-MiniLM-L6-v2, 384 | 600 | 6.83 | 16.30 | none reported | 0 |
+| GPU, Ollama ROCm (OpenAI-compatible) | yes | `all-minilm`, 384 | 600 | 11.31 | 27.00 | 224,319 (reported) | 0 |
+| Gemini API, free tier (native) | yes | gemini-embedding-001, 768 | 60 | 0.66 | 1.58 | 25,106 (estimated) | 7 |
+| mock (in-process fake, **not a real endpoint**) | no | none | 600 | 88.25 | 264.75 | 205,200 (reported) | 0 |
+
+* The Gemini client was rate-limited to stay inside the free quota (0.5 requests/s,
+  20,000 tokens/min, one request at a time) and only 60 rows were run, so its rate
+  measures the configured limiter, not Gemini's capacity.
+* The GPU run offloaded all 7 of 7 layers of the model to the GPU, and the server reported
+  token usage.
+* Real checks on the CI retrieval fixture (cross-provider migrations through the quality
+  gate, from the same real-endpoint run; these reports are not in `providers.json`): CPU to
+  GPU with the same model passed with identical metrics; CPU to Gemini (768 dimensions)
+  passed with Δ nDCG@10 +0.0161 [+0.0000, +0.0397]. Both were rolled back afterwards.
+* Not verified: OpenAI itself, NVIDIA's API catalog, CUDA GPUs (only AMD ROCm), and paid
+  Gemini tiers.
+
 ### Model migration on SciFact
 
 500 judged queries sampled with a fixed seed from BEIR SciFact (5,183 abstracts),
@@ -434,6 +462,92 @@ views:
 Full example: [`examples/embedsync-views.yaml`](examples/embedsync-views.yaml) (demo
 data in `examples/seed-views.sql`). Design: [architecture](docs/architecture.md#document-views).
 
+## Embedding providers
+
+By default every model is embedded by the built-in CPU embedder, and an existing
+configuration does not change. A model can instead name a *provider*: an
+OpenAI-compatible embeddings endpoint (a GPU server such as Ollama, vLLM, HF TEI, OpenAI
+or NVIDIA's API catalog) or Google's native Gemini API.
+
+```yaml
+providers:
+  gpu:
+    kind: openai                       # POST {url}/embeddings
+    url: http://127.0.0.1:11434/v1     # Ollama on a GPU
+    batch_size: 64
+    concurrency: 2
+  gemini:
+    kind: gemini                       # batchEmbedContents, RETRIEVAL_DOCUMENT / RETRIEVAL_QUERY
+    api_key_env: GEMINI_API_KEY        # the key is read from this variable only
+    requests_per_second: 0.5
+    burst: 1
+    tokens_per_minute: 20000
+    pricing: {usd_per_million_tokens: 0, source: "Gemini API free tier (no charge for this run)"}
+
+models:
+  gpu_minilm:
+    provider: gpu
+    name: all-minilm
+    revision: <ollama-digest>          # pin the vectors to one model build
+    dimension: 384
+    distance: cosine
+  gemini768:
+    provider: gemini
+    name: gemini-embedding-001
+    revision: gemini-embedding-001
+    dimension: 768
+    request_dimensions: 768            # shorter vectors; must equal dimension
+    distance: cosine
+```
+
+Full example with the embedder, sources and gates: [`examples/embedsync-providers.yaml`](examples/embedsync-providers.yaml).
+Design: [architecture](docs/architecture.md#embedding-providers). Operations: [configuring a provider, upgrades, metrics](docs/operations.md#embedding-providers).
+
+* **Why `kind: gemini`**: Gemini's OpenAI-compatible endpoint accepts `dimensions` but
+  rejects `input_type` (HTTP 400), returns no per-item index and no usage, and so cannot
+  tell a document from a query. In a real check the same text embedded as
+  `RETRIEVAL_DOCUMENT` and as `RETRIEVAL_QUERY` had cosine 0.76, so the two must not be
+  mixed; `kind: gemini` sends the right task type for each.
+* **Routing per generation**: a generation records the provider that built it (name,
+  kind, endpoint without credentials, request dimensions, input types). Queries against it
+  are embedded by that provider with the same settings. After `embedsync migrate --to
+  gemini768` promotes the candidate, searches use Gemini; `embedsync migrate rollback`
+  switches back to the built-in embedder with the index. Search results report
+  `provider`, and `embedsync status` names the provider of each generation built by one.
+* **Gated like any model**: a provider model is a new model key. Its backfill runs under
+  the usual gates (ANN recall, paired-bootstrap non-inferiority on nDCG and recall), and a
+  candidate that fails them is rejected while the current generation keeps serving.
+* **Vectors never mix**: a non-local generation's chunk fingerprints include its provider
+  name, kind, request dimensions and document input type. The built-in embedder's
+  fingerprints are unchanged.
+* **Batching and limits**: requests are cut by `batch_size` inputs and `max_batch_tokens`
+  (estimated as bytes / 4 per input). Each provider has requests-per-second with a burst,
+  an optional tokens-per-minute budget and a concurrency bound.
+* **Throttling**: HTTP 429 is retried. A `Retry-After` (or `retry-after-ms`) is honoured up
+  to `max_retry_after` (default 60 s); otherwise waits use full-jitter exponential backoff.
+* **Outages and bad responses**: connection errors, timeouts, 5xx, wrong embedding counts,
+  out-of-range or duplicate indexes, non-finite or all-zero vectors, and wrong dimensions
+  are retried. Nothing is acknowledged, and nothing is quarantined.
+* **Refused inputs**: a batch refused with 400, 413 or 422 is bisected, so only inputs the
+  provider will never accept are quarantined. A refusal of every input (for example an
+  unsupported model, dimension or input type) is a permanent error that stops the pipeline
+  with its message, instead of quarantining the corpus.
+* **Credentials**: keys come only from the environment variable named by `api_key_env`.
+  They are never written to the config, logs, metrics, errors or the generation record.
+* **Cost is an estimate**: `embedsync_provider_estimated_cost_usd_total{provider,pricing_source}`
+  is tokens times the configured price per million tokens, labelled with the configured
+  `pricing.source`. Tokens are the provider's reported usage when it sends any, otherwise
+  input bytes / 4. embedsync ships no price list: you enter the price and where it came
+  from. The runs above used a price of 0, so the cost series stays at 0. The built-in
+  embedder reports no token counts.
+
+Metrics: `embedsync_provider_requests_total`, `embedsync_provider_request_seconds`,
+`embedsync_provider_retries_total{provider,reason}`,
+`embedsync_provider_retry_wait_seconds_total`, `embedsync_provider_inputs_total`,
+`embedsync_provider_tokens_total{provider,source}` and the estimated cost above. The
+`embedsync doctor` check reports each provider's kind, its estimated price, and whether its
+API key variable is set (the endpoint itself is not called).
+
 ## Commands
 
 
@@ -500,9 +614,15 @@ Postgres tables into pgvector with transactional guarantees.
   tenants, no table shared by two pipelines or views, no arbitrary SQL joins. No hybrid
   (lexical) search, no external vector stores. A pipeline's table
   and key cannot change in place, and removing a pipeline needs a new sink schema.
-* Throughput is bounded by the CPU embedding model (~70 short documents/s for
-  all-MiniLM-L6-v2 on the benchmark laptop); sustained writes above that grow the
-  backlog (freshness alerts fire, WAL is retained up to `max_slot_wal_keep_size`).
+* Throughput is bounded by the embedding model (~70 short documents/s for
+  all-MiniLM-L6-v2 on the benchmark laptop with the built-in embedder; measured GPU and
+  hosted rates are in [Embedding providers](#embedding-providers)); sustained writes above
+  that grow the backlog (freshness alerts fire, WAL is retained up to
+  `max_slot_wal_keep_size`).
+* Provider support is verified only for an OpenAI-compatible server (Ollama on an AMD GPU
+  with ROCm) and the Gemini API on the free tier. OpenAI itself, NVIDIA, CUDA GPUs and paid
+  tiers were not run. The Gemini run was rate-limited to the free quota (60 rows), and every
+  cost figure is an estimate from the prices you configure.
 * A pause (schema change, `on_poison: pause`, unresolvable TOAST) stops freshness for
   every synced table (they share one stream) until an operator acts.
 * Search is eventually consistent with the source (see the measured latency).

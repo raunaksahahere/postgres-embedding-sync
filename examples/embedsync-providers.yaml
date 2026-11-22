@@ -1,0 +1,155 @@
+# embedsync with embedding providers (v0.5.0).
+#
+# The built-in embedder (the embedder block) stays the default: a model without
+# `provider:` is embedded by it, and `initial_generation` below is still the
+# built-in model. Each entry under `providers:` is an extra endpoint that a model
+# can name with `provider:`. A model's vectors come from one provider for the
+# life of its generation; queries are embedded by the provider of the generation
+# they search, so promotion and rollback switch providers together with the index.
+#
+# Credentials never appear here: every *_env field names an environment variable.
+# Put the variables in the environment, or in embedsync.env next to this file
+# (written by `embedsync setup`, mode 0600).
+#
+#   GEMINI_API_KEY   read by providers.gemini (api_key_env)
+
+source:
+  dsn_env: EMBEDSYNC_SOURCE_DSN          # replicator role: SELECT on allowlisted columns + marker writes
+  replication_dsn_env: EMBEDSYNC_SOURCE_DSN
+  table: public.documents
+  key: id
+  fields:                                # the allowlist; only these columns are published and rendered
+    - { name: title, column: title }
+    - { name: body,  column: body }
+  publication: embedsync_pub
+  slot: embedsync_slot
+  control_schema: embedsync_control
+
+sink:
+  dsn_env: EMBEDSYNC_SINK_DSN            # sink role: owns schema embedsync
+  reader_dsn_env: EMBEDSYNC_READER_DSN   # reader role: SELECT on serving catalog and chunk tables
+  schema: embedsync
+  reader_role: embedsync_reader
+
+transform:
+  template: "{{.title}}\n\n{{.body}}"
+  chunk_words: 160
+  chunk_overlap: 24
+
+# The built-in embedder. Required while any model has no provider.
+embedder:
+  url: http://embedder:8000
+  url_env: EMBEDSYNC_EMBEDDER_URL
+  timeout: 60s
+  batch_size: 32
+  concurrency: 2
+  requests_per_second: 40
+  burst: 4
+  retry: { initial_backoff: 200ms, max_backoff: 10s }
+
+# Extra embedding endpoints. Names: lowercase letters, digits and underscores (start with a letter, at most 31 characters), not "local".
+providers:
+  # A GPU server with an OpenAI-compatible embeddings API. Here Ollama on an AMD
+  # GPU (ollama/ollama:rocm). kind "openai" also covers OpenAI, vLLM, TEI and
+  # NVIDIA's API catalog: set url (the API root, ending in /v1) and api_key_env
+  # if the server needs a key.
+  gpu:
+    kind: openai
+    url: http://127.0.0.1:11434/v1
+    timeout: 60s
+    batch_size: 64                       # inputs per request
+    concurrency: 2                       # requests in flight to this provider
+    retry: { initial_backoff: 500ms, max_backoff: 30s }
+    max_retry_after: 60s                 # longest Retry-After honoured on a 429
+    pricing:                             # the cost metric is tokens x this price
+      usd_per_million_tokens: 0
+      source: "self-hosted GPU (no per-token charge)"
+
+  # Google's native Gemini API (batchEmbedContents). kind "gemini" is required
+  # for documents and queries to get different task types: the OpenAI-compatible
+  # endpoint cannot express them. url may be omitted (public API).
+  # The limits below are the free-tier settings used for the measured run; check
+  # them against your own quota before raising them.
+  gemini:
+    kind: gemini
+    api_key_env: GEMINI_API_KEY
+    timeout: 60s
+    batch_size: 100                      # Gemini accepts at most 100 requests per call
+    concurrency: 1
+    requests_per_second: 0.5
+    burst: 1
+    tokens_per_minute: 20000
+    retry: { initial_backoff: 2s, max_backoff: 60s }
+    max_retry_after: 65s
+    pricing:
+      usd_per_million_tokens: 0          # free tier: no charge for the measured run
+      source: "Gemini API free tier (no charge for this run)"
+
+# Each key can become a generation. Revisions are Hugging Face commit SHAs for
+# local models; hosted models have no commit SHA, so their name is recorded.
+models:
+  minilm:                                # built-in embedder (no provider)
+    name: sentence-transformers/all-MiniLM-L6-v2
+    revision: 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+    dimension: 384
+    distance: cosine
+    hnsw: { m: 16, ef_construction: 64, ef_search: 100 }
+  gpu_minilm:                            # the same model served by the GPU provider
+    provider: gpu
+    name: all-minilm                     # Ollama model name
+    revision: ollama-all-minilm-1b226e2802db   # the Ollama model digest (`ollama list`), pins the vectors
+    dimension: 384
+    distance: cosine
+    hnsw: { m: 16, ef_construction: 64, ef_search: 100 }
+  gemini768:                             # Gemini embeddings, shortened to 768 dimensions
+    provider: gemini
+    name: gemini-embedding-001
+    revision: gemini-embedding-001
+    dimension: 768
+    request_dimensions: 768              # must equal dimension when set
+    distance: cosine
+    hnsw: { m: 16, ef_construction: 64, ef_search: 100 }
+
+initial_generation: minilm
+
+pipeline:
+  tx_queue: 64
+  max_inflight_units: 8
+  max_batch_txns: 256
+  max_batch_docs: 256
+  max_transaction_changes: 100000
+  max_document_bytes: 262144
+  on_poison: quarantine
+  idle_checkpoint_interval: 10s
+  standby_interval: 5s
+  shutdown_timeout: 30s
+  stall_after: 60s
+
+backfill:
+  batch_size: 500
+
+# Moving a model to a provider is a migration like any other model change:
+#   embedsync migrate --to gpu_minilm     (or gemini768)
+# The candidate is backfilled, checked by the gates below, and promoted only if
+# they pass. `embedsync migrate rollback` returns to the previous generation.
+migration:
+  rollback_window: 30m
+  catchup_timeout: 10m
+  eval_queries: /etc/embedsync/eval/queries.jsonl
+  eval_qrels: /etc/embedsync/eval/qrels.tsv
+  gates:                                  # declared before any evaluation is run
+    min_ann_recall_at_10: 0.95
+    noninferiority_margin_ndcg: 0.01
+    noninferiority_margin_recall: 0.01
+    bootstrap_samples: 2000
+    confidence_level: 0.95
+    seed: 20261120
+    require_zero_unresolved: true
+
+metrics:
+  listen: ":9187"                        # embedsync_provider_* series are labelled by provider
+
+alerts:
+  freshness_seconds: 10
+  retained_wal_warning_bytes: 512MiB
+  retained_wal_critical_bytes: 1536MiB

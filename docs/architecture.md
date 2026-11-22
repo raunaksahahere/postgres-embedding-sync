@@ -216,6 +216,63 @@ rollback target and retires the older one. Retiring a generation cancels its bac
 jobs. `--gate-only` evaluates and records the report but never promotes or rejects.
 Every step is persisted, so an interrupted migration resumes.
 
+## Embedding providers
+
+Ingestion, search and migration evaluation embed through one interface,
+`embedclient.Provider` (`internal/embedclient/provider.go`). The built-in embedder
+(`Client`, name `local`) and the HTTP providers (`httpprovider.go`, kinds `openai` and
+`gemini`) implement it. `embedclient.Set` holds every configured provider. A generation is
+resolved to its provider by the name and kind recorded with it (`Set.For`): a provider that
+was removed, or re-configured with another kind, is an error, never a silent fallback.
+
+**Interface.** `Name`, `Embed` (splits into batches, retries transient failures, returns
+vectors by input index and the inputs it rejected), `EmbedOnce` (one rate-limited request,
+no retry), `Backoff` and `MaxBatch`. Telemetry receives each HTTP attempt with its outcome
+(`ok`, `rejected`, `throttled`, `unavailable`, `invalid`, `error`), each retry with its
+reason and wait, and each success with its usage (reported by the provider, or estimated).
+`internal/app/providers.go` maps these to the `embedsync_provider_*` metrics.
+
+**Error contract.**
+* `TransientError`: retried by `Embed` with jittered backoff. Connection errors, timeouts,
+  408, 429, 5xx, and malformed or invalid responses. On 429 the `Retry-After` (or
+  `retry-after-ms`) is the minimum wait, capped by `max_retry_after`.
+* `RejectedError`: specific inputs will never be accepted. The caller quarantines them.
+  Only a one-input request produces one.
+* Anything else (401, 403, 404, unknown kind, configuration) is permanent for the request.
+  The pipeline stops and nothing is acknowledged.
+
+**Batching and limits.** Inputs are cut into requests by `batch_size` (default 64; gemini
+is capped at its limit of 100) and by `max_batch_tokens`, using an estimate of ceil(bytes/4)
+per input. An input over the token limit is sent alone. Requests pass three gates before
+they are sent: a requests-per-second limiter with a burst, an optional tokens-per-minute
+bucket (one minute of tokens; a larger request waits for a full bucket), and a per-provider
+concurrency slot in `Set.Slot`.
+
+**Validation.** A response must carry exactly one embedding per input. For `openai`, each
+`index` must be in range and appear once; if no item carries a non-zero index (the
+array-ordered answer of Gemini's compatibility endpoint), array order is used. Every vector
+must be non-empty, of one length (equal to the requested dimension when one is set), finite,
+and not all zero. A failed check is a transient `invalid` response.
+
+**Bisection.** A multi-input batch refused with 400, 413 or 422 is split in halves and each
+half retried, until the refused inputs are isolated. A single refused input is a
+`RejectedError` and is quarantined. If every input of a multi-input batch is refused, or
+every input of the request, `Embed` returns a permanent request-wide error instead, so a bad
+model, dimension or `input_type` cannot quarantine the corpus.
+
+**Identity.** `embedsync.generations.provider` (jsonb) stores the generation's
+`store.ProviderIdentity`: name, kind, endpoint (the URL without credentials or query),
+request dimensions, query input type and document input type. It is written when the
+generation is registered; existing rows default to `local`. Search loads it and embeds
+queries with the same provider, dimensions, input type and prompt as the documents.
+
+**Fingerprints.** A chunk fingerprint hashes the transform fingerprint, model name, revision,
+document prompt and text. For a non-local generation it also hashes
+`name|kind|request_dimensions|document_input_type` (`transform.ModelIdentity.Provider`,
+set by `Generation.Encoder`). Local generations hash exactly as before, so existing chunks
+keep their fingerprints. The endpoint is not in the fingerprint, so a URL change does not
+re-embed, and no credential enters any fingerprint or record.
+
 ## Failure handling
 
 | failure | behaviour |
